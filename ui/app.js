@@ -1000,6 +1000,20 @@ function renderSettingsPage(root) {
           </label>
         </div>
       </div>
+      <div class="row-divider"></div>
+      <div class="setting-row">
+        <div class="setting-left">
+          <div class="setting-icon">🔑</div>
+          <div>
+            <div class="setting-title" style="display:flex;align-items:center;gap:8px">
+              <span>${escapeHtml(t('settings.oauth.title', null, '后台自动续期凭据 (Google OAuth)'))}</span>
+              <span class="pill ${state.statusPayload?.status?.oauthClientConfigured ? 'pill-green' : 'pill-amber'}">${escapeHtml(state.statusPayload?.status?.oauthClientConfigured ? t('settings.oauth.configured', null, '已配置') : t('settings.oauth.unconfigured', null, '未配置'))}</span>
+            </div>
+            <div class="setting-sub">${escapeHtml(t('settings.oauth.subtitle', null, '可选配置 · 用于备用账号过期后后台自动刷新 Token 及浏览器授权登录'))}</div>
+          </div>
+        </div>
+        <button class="btn btn-sm" id="btn-config-oauth">${escapeHtml(t('settings.oauth.config_btn', null, '配置…'))}</button>
+      </div>
     </div>
 
     <div class="section-label">${escapeHtml(t('settings.section.system_storage', null, '系统与存储'))}</div>
@@ -1097,6 +1111,58 @@ function renderSettingsPage(root) {
   });
 
   document.getElementById('btn-manage-storage')?.addEventListener('click', openMaintenanceModal);
+  document.getElementById('btn-config-oauth')?.addEventListener('click', openOAuthClientModal);
+}
+
+async function openOAuthClientModal() {
+  const info = await window.gravitybox.rpc('oauth_client_get');
+  const { body, footer } = showModal({
+    title: t('settings.oauth.title', null, '后台自动续期凭据 (Google OAuth)'),
+    bodyHtml: `
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <div class="muted small">${escapeHtml(t('settings.oauth.subtitle', null, '可选配置 · 用于备用账号过期后后台自动刷新 Token 及浏览器授权登录'))}</div>
+        <div>
+          <label class="small" style="display:block;margin-bottom:4px;font-weight:600">Client ID (GRAVITYBOX_GOOGLE_CLIENT_ID)</label>
+          <input id="m-oauth-cid" type="text" style="width:100%" value="${escapeHtml(info?.clientId || '')}" placeholder="xxxx.apps.googleusercontent.com" />
+        </div>
+        <div>
+          <label class="small" style="display:block;margin-bottom:4px;font-weight:600">Client Secret (GRAVITYBOX_GOOGLE_CLIENT_SECRET)</label>
+          <input id="m-oauth-csec" type="password" style="width:100%" value="" placeholder="${escapeHtml(info?.hasSecret ? '••••••••（如需修改请重新输入）' : 'GOCSPX-...')}" />
+        </div>
+        ${info?.envPath ? `<div class="muted xs" style="word-break:break-all">配置文件：${escapeHtml(info.envPath)}</div>` : ''}
+      </div>
+    `,
+    footerHtml: `
+      ${info?.configured ? `<button class="btn btn-danger" id="m-oauth-clear">${escapeHtml(t('settings.oauth.clear_btn', null, '清除'))}</button>` : ''}
+      <button class="btn" id="m-oauth-cancel">${escapeHtml(t('common.cancel', null, '取消'))}</button>
+      <button class="btn btn-primary" id="m-oauth-save">${escapeHtml(t('settings.oauth.save_btn', null, '保存配置'))}</button>
+    `,
+  });
+  footer.querySelector('#m-oauth-cancel')?.addEventListener('click', closeModal);
+  footer.querySelector('#m-oauth-clear')?.addEventListener('click', async () => {
+    const res = await window.gravitybox.rpc('oauth_client_set', { clientId: '', clientSecret: '' });
+    if (res?.ok) {
+      if (state.statusPayload?.status) state.statusPayload.status.oauthClientConfigured = false;
+      closeModal();
+      toast(t('settings.oauth.cleared', null, 'OAuth 凭据已清除'));
+      renderCurrentPage();
+    } else {
+      toast(res?.error || 'Failed', true);
+    }
+  });
+  footer.querySelector('#m-oauth-save')?.addEventListener('click', async () => {
+    const clientId = body.querySelector('#m-oauth-cid')?.value?.trim() || '';
+    const clientSecret = body.querySelector('#m-oauth-csec')?.value?.trim() || '';
+    const res = await window.gravitybox.rpc('oauth_client_set', { clientId, clientSecret });
+    if (res?.ok) {
+      if (state.statusPayload?.status) state.statusPayload.status.oauthClientConfigured = Boolean(res.configured);
+      closeModal();
+      toast(t('settings.oauth.saved', null, 'OAuth 凭据已保存并生效'));
+      renderCurrentPage();
+    } else {
+      toast(res?.error || 'Failed', true);
+    }
+  });
 }
 
 async function openMaintenanceModal() {

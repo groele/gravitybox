@@ -1132,22 +1132,19 @@ export class AccountsManager {
   }
 
   /**
-   * 提取当前系统/IDE真实登录态并存入账号池
+   * 从本机 Antigravity 会话文件、系统钥匙串与 state.vscdb 提取当前登录凭据
    */
-  async saveCurrentAccount(options?: {
+  private async extractLocalAntigravityAuth(options?: {
     keychain?: KeychainAdapter;
     homeDir?: string;
     appSupportDir?: string;
-  }): Promise<Account> {
+  }): Promise<{ token: TokenData | null; email: string | null }> {
     const homeDir = options?.homeDir ?? homedir();
     const appSupportDir = options?.appSupportDir ?? getDefaultAppSupportDir();
     const keychain = options?.keychain ?? new SystemKeychainAdapter();
-
     const isSandboxHome = homeDir !== homedir();
     let extractedToken: TokenData | null = null;
     let extractedEmail: string | null = null;
-    let extractedName: string | null = null;
-    let liveQuota: QuotaData | null = null;
 
     const readSessionToken = async () => {
       const candidates = [
@@ -1279,6 +1276,79 @@ export class AccountsManager {
         }
       }
     }
+
+    return { token: extractedToken, email: extractedEmail };
+  }
+
+  private lastLocalTokenSyncAt = new Map<string, number>();
+
+  /**
+   * 当 Antigravity 客户端已在本地自动续期当前账号的 access_token 时，同步更新账号池中的凭据，
+   * 避免当前运行账号因本地副本过期而误报「登录凭据已过期」。
+   */
+  async syncAccountTokenFromLocalState(
+    account: Account,
+    options?: { knownLiveEmail?: string | null; persist?: boolean; force?: boolean }
+  ): Promise<boolean> {
+    const isDefaultStateDir = normalizePathForCompare(this.stateDir) === normalizePathForCompare(getDefaultStateDir());
+    if (!isDefaultStateDir && !options?.force) return false;
+    const nowMs = Date.now();
+    const lastTry = this.lastLocalTokenSyncAt.get(account.id) ?? 0;
+    if (!options?.force && nowMs - lastTry < 15_000) return false;
+    this.lastLocalTokenSyncAt.set(account.id, nowMs);
+
+    const local = await this.extractLocalAntigravityAuth().catch(() => ({ token: null, email: null }));
+    if (!local.token?.access_token) return false;
+    const localEmail = (local.email || options?.knownLiveEmail || local.token.email || '').trim().toLowerCase();
+    if (!localEmail || localEmail !== account.email.trim().toLowerCase()) return false;
+
+    const nowSec = Math.floor(nowMs / 1000);
+    const localExpiry = Number(local.token.expiry_timestamp) || 0;
+    const currentExpiry = Number(account.token?.expiry_timestamp) || 0;
+    const currentStale =
+      !account.token?.access_token ||
+      account.token.access_token === 'pending_refresh' ||
+      currentExpiry <= nowSec + 300;
+    const isFresher =
+      localExpiry > currentExpiry ||
+      (currentStale && local.token.access_token !== account.token?.access_token && localExpiry > nowSec + 30);
+    if (!isFresher) return false;
+
+    const previousRefresh = account.token.refresh_token;
+    account.token = {
+      ...account.token,
+      access_token: local.token.access_token,
+      refresh_token: local.token.refresh_token || account.token.refresh_token,
+      expires_in: Math.max(60, localExpiry - nowSec),
+      expiry_timestamp: localExpiry,
+      id_token: local.token.id_token ?? account.token.id_token,
+      project_id: local.token.project_id ?? account.token.project_id,
+    };
+    if (account.quota_refresh_error_code === 'missing_oauth_client' || account.quota_refresh_error_code === 'refresh_failed') {
+      account.quota_refresh_error = null;
+      account.quota_refresh_error_code = null;
+    }
+    if (options?.persist !== false) {
+      await this.saveRefreshedAccount(account, previousRefresh).catch(() => {});
+    }
+    return true;
+  }
+
+  /**
+   * 提取当前系统/IDE真实登录态并存入账号池
+   */
+  async saveCurrentAccount(options?: {
+    keychain?: KeychainAdapter;
+    homeDir?: string;
+    appSupportDir?: string;
+  }): Promise<Account> {
+    const homeDir = options?.homeDir ?? homedir();
+    const isSandboxHome = homeDir !== homedir();
+    const extracted = await this.extractLocalAntigravityAuth(options);
+    const extractedToken = extracted.token;
+    let extractedEmail = extracted.email;
+    let extractedName: string | null = null;
+    let liveQuota: QuotaData | null = null;
 
     // A live identity may enrich the same account, or provide the email for the active local session when state.vscdb is absent.
     if (!isSandboxHome && (extractedEmail || extractedToken)) {
@@ -1478,11 +1548,19 @@ export class AccountsManager {
     const account = await this.getAccount(targetId);
     if (!account) throw new Error(bt('accounts.err.not_found_by_id', { id: targetId }));
 
+    // 0) 若当前账号在 Antigravity 本地状态中已有更新的 access_token，先同步到内存对象，避免误报过期
+    if (fetchImpl === globalThis.fetch) {
+      await this.syncAccountTokenFromLocalState(account, { persist: false, force: true }).catch(() => false);
+    }
+
     // 1) 本机 live 优先：仅当邮箱严格匹配且返回模型记录时采用（不跨账号借数据）。
     // 若 RetrieveUserQuotaSummary 超时/失败导致 quota_groups 为空，且账号具备 refresh_token，则回退云端接口补全分组。
     signal?.throwIfAborted();
     const lsStatus = await this.probeLiveLanguageServer(fetchImpl, {forceRefresh:true});
     signal?.throwIfAborted();
+    if (fetchImpl === globalThis.fetch && lsStatus?.email) {
+      await this.syncAccountTokenFromLocalState(account, { knownLiveEmail: lsStatus.email, persist: false }).catch(() => false);
+    }
     const liveSummaryFailed = lsStatus?.quota?.refresh_state?.endpointsAttempted?.includes('live:RetrieveUserQuotaSummary') === true
       && lsStatus.quota.refresh_state?.endpointsSucceeded?.includes('live:RetrieveUserQuotaSummary') !== true
       && (lsStatus.quota.quota_groups?.length ?? 0) === 0;
@@ -1663,7 +1741,26 @@ export class AccountsManager {
       const matched = index.accounts.find(a => a.email.toLowerCase() === detectedEmail.toLowerCase());
       effectiveActiveId = matched?.id ?? null;
     }
-    const activeEntry = effectiveActiveId ? await this.peekAccountEntry(effectiveActiveId) : null;
+    let activeEntry = effectiveActiveId ? await this.peekAccountEntry(effectiveActiveId) : null;
+    if (activeEntry) {
+      const acc = activeEntry.account;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const tokenStale =
+        !acc.token?.access_token ||
+        acc.token.access_token === 'pending_refresh' ||
+        !Number.isFinite(acc.token.expiry_timestamp) ||
+        acc.token.expiry_timestamp <= nowSec + 300 ||
+        acc.quota_refresh_error_code === 'missing_oauth_client';
+      if (tokenStale) {
+        const synced = await this.syncAccountTokenFromLocalState(structuredClone(acc), {
+          knownLiveEmail: detectedEmail,
+          persist: true,
+        }).catch(() => false);
+        if (synced) {
+          activeEntry = await this.peekAccountEntry(effectiveActiveId!);
+        }
+      }
+    }
     const activeAccount = activeEntry ? structuredClone(activeEntry.account) : null;
     const accountsWithRevision = await Promise.all(index.accounts.map(async acc => {
       const entry = await this.peekAccountEntry(acc.id);
@@ -1694,5 +1791,21 @@ export class AccountsManager {
       total: index.accounts.length,
       revision: createHash('sha256').update(activeRevision + ':' + poolRevision).digest('hex'),
     };
+  }
+
+  /**
+   * 当用户新配置了 Google OAuth 凭据后，清除各账号此前因缺少凭据记录的 missing_oauth_client 错误提示
+   */
+  async clearMissingOAuthClientErrors(): Promise<void> {
+    await this.init();
+    const index = await this.loadIndex();
+    for (const meta of index.accounts) {
+      const account = await this.getAccount(meta.id);
+      if (account && account.quota_refresh_error_code === 'missing_oauth_client') {
+        account.quota_refresh_error = null;
+        account.quota_refresh_error_code = null;
+        await this.saveRefreshedAccount(account, account.token.refresh_token).catch(() => {});
+      }
+    }
   }
 }

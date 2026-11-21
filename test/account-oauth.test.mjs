@@ -125,3 +125,70 @@ test('P1-18: CodedAccountError 保留业务错误语义，中英文凭据就绪�
     );
   }
 });
+
+test('Switch allows expired access_token with valid refresh_token when OAuth client is unconfigured, and syncAccountTokenFromLocalState heals active account', async t => {
+  const { mkdtemp, rm, mkdir, writeFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { AccountsManager } = await import('../dist/accounts.js');
+  const { AccountSwitchService } = await import('../dist/account-switch.js');
+  const { bt } = await import('../dist/i18n.js');
+
+  const dir = await mkdtemp(join(tmpdir(), 'gb-oauth-switch-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const stateDir = join(dir, 'state');
+  const profileDir = join(dir, 'profile');
+  await mkdir(join(profileDir, 'User', 'globalStorage'), { recursive: true });
+
+  const mgr = new AccountsManager(stateDir);
+  const acc = await mgr.upsertAccount({
+    email: 'standby@example.invalid',
+    name: 'Standby',
+    accessToken: 'expired-access-token',
+    refreshToken: '1//valid-refresh-token',
+    expiresIn: -3600,
+  });
+  acc.quota_refresh_error_code = 'missing_oauth_client';
+  acc.quota_refresh_error = bt('account_cloud.err.missing_oauth_client');
+  await mgr.saveAccount(acc);
+
+  const prevCid = process.env.GRAVITYBOX_GOOGLE_CLIENT_ID;
+  const prevSec = process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET;
+  delete process.env.GRAVITYBOX_GOOGLE_CLIENT_ID;
+  delete process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET;
+  t.after(() => {
+    if (prevCid !== undefined) process.env.GRAVITYBOX_GOOGLE_CLIENT_ID = prevCid;
+    if (prevSec !== undefined) process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET = prevSec;
+  });
+
+  const memKeychain = {
+    val: null,
+    async readPassword() { return this.val; },
+    async writePassword(_s, _a, v) { this.val = v; },
+    async deletePassword() { this.val = null; },
+  };
+  const svc = new AccountSwitchService(mgr, {
+    stateDir,
+    profile: profileDir,
+    isRunning: async () => false,
+    keychain: memKeychain,
+  });
+
+  // 1) Switching must succeed when OAuth client is unconfigured and refresh_token is valid
+  const switched = await svc.switchAccount(acc.id);
+  assert.equal(switched.switchedTo, acc.email);
+  assert.ok(typeof memKeychain.val === 'string' && memKeychain.val.length > 0);
+
+  // 2) Switching must still fail if refresh_token is missing or account needs_authorization
+  const revoked = await mgr.upsertAccount({
+    email: 'revoked@example.invalid',
+    name: 'Revoked',
+    accessToken: 'expired-access-token',
+    refreshToken: '1//revoked-refresh-token',
+    expiresIn: -3600,
+  });
+  revoked.quota_refresh_error_code = 'refresh_failed';
+  revoked.quota_refresh_error = bt('account_cloud.err.refresh_failed');
+  await mgr.saveAccount(revoked);
+  await assert.rejects(svc.switchAccount(revoked.id), new RegExp(bt('switch.err.refresh_credentials_first')));
+});

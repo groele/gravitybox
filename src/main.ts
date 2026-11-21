@@ -1233,6 +1233,42 @@ async function run() {
               staleAccounts: accounts.filter((account: any) => (account?.quota?.stale_groups?.length ?? 0) > 0).length });
             return;
           }
+          if (command === 'oauth_client_get') {
+            const cid = getGoogleClientId();
+            const sec = getGoogleClientSecret();
+            reply({ ok: true, configured: Boolean(cid && sec), clientId: cid, hasSecret: Boolean(sec), envPath });
+            return;
+          }
+          if (command === 'oauth_client_set') {
+            const clientId = typeof parsed.clientId === 'string' ? parsed.clientId.trim() : '';
+            const clientSecret = typeof parsed.clientSecret === 'string' ? parsed.clientSecret.trim() : '';
+            if ((clientId && !clientSecret) || (!clientId && clientSecret)) {
+              throw new Error(bt('settings.oauth.err_incomplete'));
+            }
+            if (/[\r\n\x00]/.test(clientId) || /[\r\n\x00]/.test(clientSecret)) {
+              throw new Error(bt('settings.oauth.err_invalid'));
+            }
+            const existingRaw = await readFile(envPath, 'utf8').catch(() => '');
+            const preserved = existingRaw
+              .split(/\r?\n/)
+              .filter(line => !/^\s*(?:GRAVITYBOX_GOOGLE_CLIENT_ID|GRAVITYBOX_GOOGLE_CLIENT_SECRET|GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET)\s*=/.test(line))
+              .filter((line, idx, arr) => line.trim() !== '' || (idx < arr.length - 1 && arr[idx + 1]?.trim() !== ''));
+            if (clientId && clientSecret) {
+              preserved.push(`GRAVITYBOX_GOOGLE_CLIENT_ID=${JSON.stringify(clientId)}`);
+              preserved.push(`GRAVITYBOX_GOOGLE_CLIENT_SECRET=${JSON.stringify(clientSecret)}`);
+              process.env.GRAVITYBOX_GOOGLE_CLIENT_ID = clientId;
+              process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET = clientSecret;
+              await accountsManager.clearMissingOAuthClientErrors();
+            } else {
+              delete process.env.GRAVITYBOX_GOOGLE_CLIENT_ID;
+              delete process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET;
+            }
+            const nextEnv = preserved.length ? preserved.join('\n') + '\n' : '';
+            await writeFile(envPath, nextEnv, { encoding: 'utf8', mode: 0o600 });
+            await chmod(envPath, 0o600).catch(() => {});
+            reply({ ok: true, configured: Boolean(clientId && clientSecret), clientId, hasSecret: Boolean(clientSecret), envPath, status: controller.snapshot() });
+            return;
+          }
           if (command === 'asar_zh_apply') {
             const result = await applyDeepAsarLocalization(appPath, stateDir, assetsDir, {
               devToolsPort: controller.getActivePort(),

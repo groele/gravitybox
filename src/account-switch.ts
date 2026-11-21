@@ -7,7 +7,8 @@ import { join, sep } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { atomicJson, atomicText } from './files.js';
 import { withProcessLease } from './process-lock.js';
-import { AccountsManager, SystemKeychainAdapter, syncAccountToKeychain, type KeychainAdapter, type Account } from './accounts.js';
+import { AccountsManager, SystemKeychainAdapter, getGoogleClientId, getGoogleClientSecret, syncAccountToKeychain, type KeychainAdapter, type Account } from './accounts.js';
+import { accountCredentialReadiness } from './account-quota.js';
 import { ProtobufWriter as Writer } from './protobuf.js';
 import { replaceTopicRow } from './account-state.js';
 export { replaceTopicRow } from './account-state.js';
@@ -404,7 +405,14 @@ export class AccountSwitchService {
       if (previous && !['complete', 'rolled-back', 'cleared'].includes(previous.status)) throw new Error(bt('switch.err.previous_incomplete'));
       const acc = await this.manager.getAccount(id);
       if (!acc || acc.disabled || acc.validation_blocked) throw new Error(bt('switch.err.account_unavailable'));
-      if (!acc.token.access_token || acc.token.access_token === 'pending_refresh' || acc.token.expiry_timestamp <= Date.now() / 1000 + 30) throw new Error(bt('switch.err.refresh_credentials_first'));
+      const readiness = accountCredentialReadiness(acc);
+      if (!acc.token.refresh_token || readiness.state === 'needs_authorization') {
+        throw new Error(bt('switch.err.refresh_credentials_first'));
+      }
+      const oauthClientConfigured = Boolean(getGoogleClientId() && getGoogleClientSecret());
+      if (oauthClientConfigured && (!acc.token.access_token || acc.token.access_token === 'pending_refresh' || acc.token.expiry_timestamp <= Date.now() / 1000 + 30)) {
+        throw new Error(bt('switch.err.refresh_credentials_first'));
+      }
       const db = join(this.options.profile, 'User', 'globalStorage', 'state.vscdb');
       const hasDb = await this.optionalRegular(db);
       const transaction = hasDb ? this.database(db) : undefined;
