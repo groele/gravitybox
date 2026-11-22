@@ -1,6 +1,6 @@
 {
   "name": "gravitybox",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "type": "module",
   "description": "GravityBox: Antigravity Companion for Windows & macOS · Antigravity 全功能增强伴侣（Windows Rust + WebView2 轻量原生桌面端）",
