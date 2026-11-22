@@ -80,7 +80,7 @@ const INIT_BRIDGE_JS: &str = r#"
     setConfig: (patch) => invoke('setConfig', patch || {}),
     rpc: (command, payload) => invoke('rpc', { command, payload: payload || {} }),
     getLogs: () => invoke('getLogs'),
-    openAntigravity: () => invoke('openAntigravity'),
+    openAntigravity: (opts) => invoke('openAntigravity', opts || {}),
     safeRelaunchAntigravity: () => invoke('safeRelaunchAntigravity'),
     closeAntigravityGracefully: () => invoke('closeAntigravityGracefully'),
     setLoginItem: (enabled) => invoke('setLoginItem', { enabled: Boolean(enabled) }),
@@ -665,10 +665,16 @@ fn execute_bg_command(
             }
         }
         "getLogs" => (true, json!({ "ok": true, "text": shared.backend.read_recent_logs() })),
-        "openAntigravity" => match win32::open_antigravity(false) {
-            Ok(()) => (true, json!({ "ok": true })),
-            Err(e) => (true, json!({ "ok": false, "error": e })),
-        },
+        "openAntigravity" => {
+            let remote_debug = payload
+                .get("remoteDebug")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match win32::open_antigravity(remote_debug) {
+                Ok(()) => (true, json!({ "ok": true })),
+                Err(e) => (true, json!({ "ok": false, "error": e })),
+            }
+        }
         "safeRelaunchAntigravity" => match win32::safe_relaunch_antigravity() {
             Ok(()) => (true, json!({ "ok": true })),
             Err(e) => (true, json!({ "ok": false, "error": e })),

@@ -42,9 +42,9 @@ SetCompressorDictSize 32
 Section "GravityBox" SecMain
   SetOutPath "$INSTDIR"
 
-  ; Stop running instance before overwriting files during upgrade
-  nsExec::ExecToLog 'taskkill /IM GravityBox.exe /F'
-  Sleep 400
+  ; Stop running instance (and child node.exe) before overwriting files during upgrade
+  nsExec::ExecToLog 'taskkill /IM GravityBox.exe /T /F'
+  Sleep 600
 
   File /r "${SRCDIR}\*.*"
 
@@ -67,8 +67,8 @@ Section "GravityBox" SecMain
 SectionEnd
 
 Section "Uninstall"
-  nsExec::ExecToLog 'taskkill /IM GravityBox.exe /F'
-  Sleep 400
+  nsExec::ExecToLog 'taskkill /IM GravityBox.exe /T /F'
+  Sleep 600
 
   Delete "$DESKTOP\GravityBox.lnk"
   RMDir /r "$SMPROGRAMS\GravityBox"

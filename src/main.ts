@@ -1166,14 +1166,43 @@ async function run() {
               }
             }
             await usageManager.captureCurrentActiveSessions().catch(() => {});
-            const result = await switchService.switchAccount(targetId, parsed.target || 'all');
+            const runWithExitGrace = async <T>(fn: () => Promise<T>): Promise<T> => {
+              const maxAttempts = parsed.waitForExit === true ? 10 : 1;
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  return await fn();
+                } catch (err) {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  if (attempt < maxAttempts && msg === bt('switch.err.stop_app_first')) {
+                    await new Promise(r => setTimeout(r, 300));
+                    continue;
+                  }
+                  throw err;
+                }
+              }
+            };
+            const result = await runWithExitGrace(() => switchService.switchAccount(targetId, parsed.target || 'all'));
             await syncActiveAccountToUsageManager(true).catch(() => {});
             usageManager.invalidateCache();
             reply({ ok: true, ...result }); return;
           }
           if(command==='account_recovery_clear'){if(parsed.confirm!==true)throw new Error(bt('main.recovery_clear_confirm'));reply({ok:true,...await switchService.clearRecovery(String(parsed.digest))});return;}
           if (command === 'account_switch_rollback') {
-            const result = await switchService.rollback();
+            const maxAttempts = parsed.waitForExit === true ? 10 : 1;
+            let result: Awaited<ReturnType<typeof switchService.rollback>>;
+            for (let attempt = 1; ; attempt++) {
+              try {
+                result = await switchService.rollback();
+                break;
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (attempt < maxAttempts && msg === bt('switch.err.stop_app_first')) {
+                  await new Promise(r => setTimeout(r, 300));
+                  continue;
+                }
+                throw err;
+              }
+            }
             await syncActiveAccountToUsageManager(true).catch(() => {});
             usageManager.invalidateCache();
             reply({ ok: true, ...result }); return;

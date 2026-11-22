@@ -440,31 +440,59 @@ function renderAccountsPage(root) {
   });
   document.getElementById('btn-config-policy')?.addEventListener('click', openPolicyModal);
   document.getElementById('btn-rollback-switch')?.addEventListener('click', async () => {
+    if (state.switchingAccount) return;
     const pre = await window.gravitybox.rpc('account_switch_preflight');
     if (pre?.appRunning) {
       const { body, footer } = showModal({
         title: t('accounts.rollback_btn', null, '撤销切换'),
-        bodyHtml: `<p class="small">${escapeHtml(t('accounts.stop_app_before_switch', null, 'Antigravity 正在运行。切换/回滚账号需要先温和关闭 Antigravity，并在完成后自动重新打开。'))}</p>`,
+        bodyHtml: `
+          <p class="small">${escapeHtml(t('accounts.stop_app_before_switch', null, 'Antigravity 正在运行。切换/回滚账号需要先温和关闭 Antigravity，并在完成后自动重新打开。'))}</p>
+          <div id="m-switch-progress" class="muted small" style="margin-top:8px;display:none"></div>
+        `,
         footerHtml: `<button class="btn" id="m-cancel">取消</button><button class="btn btn-primary" id="m-go">关闭 Antigravity 并回滚</button>`,
       });
-      body.querySelector;
-      footer.querySelector('#m-cancel')?.addEventListener('click', closeModal);
-      footer.querySelector('#m-go')?.addEventListener('click', async () => {
-        closeModal();
-        const closed = await window.gravitybox.closeAntigravityGracefully();
-        if (!closed?.ok) return toast(t('assistant.safe_relaunch_timeout'), true);
-        const res = await window.gravitybox.rpc('account_switch_rollback');
-        if (res?.ok) {
-          toast(res.message || 'OK');
-          await window.gravitybox.openAntigravity();
-          await loadAccounts();
-        } else toast(res?.error || 'Failed', true);
+      const cancelBtn = footer.querySelector('#m-cancel');
+      const goBtn = footer.querySelector('#m-go');
+      const prog = body.querySelector('#m-switch-progress');
+      cancelBtn?.addEventListener('click', () => { if (!state.switchingAccount) closeModal(); });
+      goBtn?.addEventListener('click', async () => {
+        if (state.switchingAccount) return;
+        state.switchingAccount = true;
+        if (cancelBtn) cancelBtn.disabled = true;
+        if (goBtn) { goBtn.disabled = true; goBtn.textContent = '正在回滚…'; }
+        if (prog) { prog.style.display = 'block'; prog.textContent = '1/3 正在温和关闭 Antigravity…'; }
+        try {
+          const closed = await window.gravitybox.closeAntigravityGracefully();
+          if (!closed?.ok) {
+            toast(t('assistant.safe_relaunch_timeout'), true);
+            return;
+          }
+          if (prog) prog.textContent = '2/3 正在恢复上一账号凭据…';
+          const res = await window.gravitybox.rpc('account_switch_rollback', { waitForExit: true });
+          if (res?.ok) {
+            if (prog) prog.textContent = '3/3 正在重新打开 Antigravity（开启调试端口）…';
+            await window.gravitybox.openAntigravity({ remoteDebug: true });
+            closeModal();
+            toast(res.message || 'OK');
+            await loadAccounts();
+            void loadOverview();
+          } else toast(res?.error || 'Failed', true);
+        } finally {
+          state.switchingAccount = false;
+          if (cancelBtn) cancelBtn.disabled = false;
+          if (goBtn) { goBtn.disabled = false; goBtn.textContent = '关闭 Antigravity 并回滚'; }
+        }
       });
       return;
     }
-    const res = await window.gravitybox.rpc('account_switch_rollback');
-    if (res?.ok) { toast(res.message || 'OK'); await loadAccounts(); }
-    else toast(res?.error || 'Failed', true);
+    state.switchingAccount = true;
+    try {
+      const res = await window.gravitybox.rpc('account_switch_rollback');
+      if (res?.ok) { toast(res.message || 'OK'); await loadAccounts(); void loadOverview(); }
+      else toast(res?.error || 'Failed', true);
+    } finally {
+      state.switchingAccount = false;
+    }
   });
   document.getElementById('btn-clear-recovery')?.addEventListener('click', async () => {
     const res = await window.gravitybox.rpc('account_recovery_clear', { confirm: true, digest: recovery.digest });
@@ -528,38 +556,70 @@ function renderAccountsPage(root) {
 }
 
 async function performAccountSwitch(id, email) {
-  const pre = await window.gravitybox.rpc('account_switch_preflight', { id });
-  if (pre?.appRunning) {
-    const { footer } = showModal({
-      title: t('accounts.switch_btn', null, '切换账号'),
-      bodyHtml: `
-        <p class="small">${escapeHtml(`即将切换至 ${email}。`)}</p>
-        <p class="muted small" style="margin-top:8px">${pre.hasRunningTask ? `⚠ 检测到 Antigravity 正在运行推理任务（${escapeHtml(pre.taskReason || '')}），建议等待任务结束后再切换。` : '需要先温和关闭 Antigravity，切换凭据后自动重新打开（开启调试端口）。'}</p>
-      `,
-      footerHtml: `<button class="btn" id="m-cancel">取消</button><button class="btn btn-primary" id="m-go">关闭 Antigravity 并切换</button>`,
-    });
-    footer.querySelector('#m-cancel').addEventListener('click', closeModal);
-    footer.querySelector('#m-go').addEventListener('click', async () => {
-      closeModal();
-      const closed = await window.gravitybox.closeAntigravityGracefully();
-      if (!closed?.ok) return toast(t('assistant.safe_relaunch_timeout'), true);
-      const res = await window.gravitybox.rpc('account_switch', { id, autoRefreshToken: true });
-      if (res?.ok) {
-        toast(res.message || `已切换至 ${email}`);
-        await window.gravitybox.openAntigravity();
-        await loadAccounts();
-      } else {
-        toast(res?.error || 'Switch failed', true);
-      }
-    });
-    return;
-  }
-  const res = await window.gravitybox.rpc('account_switch', { id, autoRefreshToken: true });
-  if (res?.ok) {
-    toast(res.message || `已切换至 ${email}`);
-    await loadAccounts();
-  } else {
-    toast(res?.error || 'Switch failed', true);
+  if (state.switchingAccount) return;
+  state.switchingAccount = true;
+  try {
+    const pre = await window.gravitybox.rpc('account_switch_preflight', { id });
+    if (pre?.appRunning) {
+      const { body, footer } = showModal({
+        title: t('accounts.switch_btn', null, '切换账号'),
+        bodyHtml: `
+          <p class="small">${escapeHtml(`即将切换至 ${email}。`)}</p>
+          <p class="muted small" style="margin-top:8px">${pre.hasRunningTask ? `⚠ 检测到 Antigravity 正在运行推理任务（${escapeHtml(pre.taskReason || '')}），建议等待任务结束后再切换。` : '需要先温和关闭 Antigravity，切换凭据后自动重新打开（开启调试端口）。'}</p>
+          <div id="m-switch-progress" class="muted small" style="margin-top:10px;display:none"></div>
+        `,
+        footerHtml: `<button class="btn" id="m-cancel">取消</button><button class="btn btn-primary" id="m-go">关闭 Antigravity 并切换</button>`,
+      });
+      const cancelBtn = footer.querySelector('#m-cancel');
+      const goBtn = footer.querySelector('#m-go');
+      const prog = body.querySelector('#m-switch-progress');
+      state.switchingAccount = false;
+      cancelBtn.addEventListener('click', () => { if (!state.switchingAccount) closeModal(); });
+      goBtn.addEventListener('click', async () => {
+        if (state.switchingAccount) return;
+        state.switchingAccount = true;
+        cancelBtn.disabled = true;
+        goBtn.disabled = true;
+        goBtn.textContent = '正在切换…';
+        if (prog) { prog.style.display = 'block'; prog.textContent = '1/3 正在温和关闭 Antigravity…'; }
+        try {
+          const closed = await window.gravitybox.closeAntigravityGracefully();
+          if (!closed?.ok) {
+            toast(t('assistant.safe_relaunch_timeout'), true);
+            return;
+          }
+          if (prog) prog.textContent = '2/3 正在写入账号凭据…';
+          const res = await window.gravitybox.rpc('account_switch', { id, autoRefreshToken: true, waitForExit: true });
+          if (res?.ok) {
+            if (prog) prog.textContent = '3/3 正在重新打开 Antigravity（开启调试端口）…';
+            await window.gravitybox.openAntigravity({ remoteDebug: true });
+            closeModal();
+            toast(res.message || `已切换至 ${email}`);
+            await loadAccounts();
+            void loadOverview();
+          } else {
+            toast(res?.error || 'Switch failed', true);
+          }
+        } finally {
+          state.switchingAccount = false;
+          cancelBtn.disabled = false;
+          goBtn.disabled = false;
+          goBtn.textContent = '关闭 Antigravity 并切换';
+        }
+      });
+      return;
+    }
+    toast(`正在切换至 ${email}…`);
+    const res = await window.gravitybox.rpc('account_switch', { id, autoRefreshToken: true });
+    if (res?.ok) {
+      toast(res.message || `已切换至 ${email}`);
+      await loadAccounts();
+      void loadOverview();
+    } else {
+      toast(res?.error || 'Switch failed', true);
+    }
+  } finally {
+    state.switchingAccount = false;
   }
 }
 
