@@ -1,12 +1,14 @@
 import { ALLOWED_DATA_DIRECTORY_NAMES, applicationChannel, savedApplicationChannel, applicationTarget, detectInstalledChannels, type ApplicationChannel, type ApplicationTarget } from './application-target.js';
 import { GoogleAccountLogin } from './account-oauth.js';
 import { AccountSwitchService } from './account-switch.js';
-import { AccountsManager, cleanAndLocalizeRefreshError, getGoogleClientId, getGoogleClientSecret, mergeSubscriptionTier, type Account, type QuotaData } from './accounts.js';
+import { AccountsManager, accountCredentialReadiness, accountErrorCode, cleanAndLocalizeRefreshError, computeStandbyRefreshStatus, getGoogleClientId, getGoogleClientSecret, hasExpiredQuotaWindow, mergeSubscriptionTier, type Account, type QuotaBucket, type QuotaData, type QuotaGroup } from './accounts.js';
+import { classifyFamily, classifyWindow, normalizeResetTime } from './quota.js';
 import { UsageStatsManager } from './usage.js';
 import {
   buildPricingCatalogPayloadSnapshot,
   readInstalledAppBundleVersion,
   readValidLiveIdeModelsSnapshot,
+  registerObservedModelsFromSource,
   sanitizeLiveIdeModelsSnapshot,
   type LiveIdeModelSnapshotEntry,
   type LiveIdeModelsSnapshot,
@@ -90,24 +92,96 @@ function formatResetTime(resetTime: number | null | undefined): string {
   return !isNaN(date.getTime()) ? `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}` : String(resetTime);
 }
 
-/** 合并本机实时语言服务配额与已保存账号配额：当实时探测未返回分组/已知配额（如企业 Vertex AI）或套餐回退 FREE 时，保留已存分组、模型配额与真实高级套餐。 */
-function mergeLiveQuotaWithSaved(
+function isFutureResetIso(resetTime: unknown, nowMs: number): boolean {
+  const iso = normalizeResetTime(resetTime);
+  if (!iso) return false;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) && ms > nowMs;
+}
+
+function isExpiredResetIso(resetTime: unknown, nowMs: number): boolean {
+  const iso = normalizeResetTime(resetTime);
+  if (!iso) return false;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) && ms <= nowMs;
+}
+
+/**
+ * 合并本机实时语言服务配额与已保存账号配额：
+ * - 当实时探测未返回分组时，保留已存分组及真实 `last_updated`（避免把旧数据伪标为刚刚刷新）；
+ * - 若实时缓存返回了已过期窗口（reset_time <= nowMs），而已存配额对应语义窗口已有未过期的更新周期，则保留未过期窗口；
+ * - 实时探测未返回有效模型或套餐降级 FREE 时，保留已存模型与真实高级套餐。
+ */
+export function mergeLiveQuotaWithSaved(
   savedQuota: QuotaData | null | undefined,
-  liveQuota: QuotaData | null | undefined
+  liveQuota: QuotaData | null | undefined,
+  nowMs: number = Date.now(),
 ): QuotaData | null | undefined {
   if (!liveQuota) return savedQuota;
   if (!savedQuota) return liveQuota;
-  const hasLiveGroups = Array.isArray(liveQuota.quota_groups) && liveQuota.quota_groups.length > 0;
+  const savedGroups = savedQuota.quota_groups ?? [];
+  const liveGroups = liveQuota.quota_groups ?? [];
+  const hasLiveGroups = liveGroups.length > 0;
+  const hasSavedGroups = savedGroups.length > 0;
   const hasKnownLiveModels = Array.isArray(liveQuota.models) && liveQuota.models.some(m => m?.percentage_known || m?.own_percentage_known);
   const hasSavedModels = Array.isArray(savedQuota.models) && savedQuota.models.length > 0;
   const liveComplete = liveQuota.refresh_state?.complete === true;
   const mergedStaleGroups = liveQuota.stale_groups?.length
     ? liveQuota.stale_groups
     : (hasLiveGroups && liveComplete ? undefined : savedQuota.stale_groups);
+
+  let mergedGroups: QuotaGroup[];
+  if (!hasLiveGroups) {
+    mergedGroups = savedGroups;
+  } else if (!hasSavedGroups) {
+    mergedGroups = liveGroups;
+  } else {
+    const savedBucketsBySemantic = new Map<string, QuotaBucket>();
+    for (const sg of savedGroups) {
+      const fam = sg.family ?? classifyFamily({
+        groupName: sg.display_name,
+        description: sg.description,
+        bucketId: sg.buckets?.[0]?.bucket_id,
+      });
+      for (const sb of sg.buckets ?? []) {
+        if (sb.stale === true || sb.remaining_fraction_known === false) continue;
+        const win = sb.window ?? classifyWindow(undefined, sb.bucket_id, sb.display_name);
+        if (win === 'unspecified') continue;
+        if (isFutureResetIso(sb.reset_time, nowMs)) {
+          savedBucketsBySemantic.set(`${fam}:${win}`, sb);
+        }
+      }
+    }
+    mergedGroups = liveGroups.map(lg => {
+      const fam = lg.family ?? classifyFamily({
+        groupName: lg.display_name,
+        description: lg.description,
+        bucketId: lg.buckets?.[0]?.bucket_id,
+      });
+      const nextBuckets = (lg.buckets ?? []).map(lb => {
+        const win = lb.window ?? classifyWindow(undefined, lb.bucket_id, lb.display_name);
+        if (win !== 'unspecified' && isExpiredResetIso(lb.reset_time, nowMs)) {
+          const fresherSaved = savedBucketsBySemantic.get(`${fam}:${win}`);
+          if (fresherSaved) {
+            return { ...fresherSaved };
+          }
+        }
+        return lb;
+      });
+      return { ...lg, buckets: nextBuckets };
+    });
+  }
+
+  const effectiveLastUpdated =
+    !hasLiveGroups && hasSavedGroups && typeof savedQuota.last_updated === 'number' && savedQuota.last_updated > 0
+      ? savedQuota.last_updated
+      : liveQuota.last_updated;
+
   const merged: QuotaData = {
     ...savedQuota,
     ...liveQuota,
-    quota_groups: hasLiveGroups ? liveQuota.quota_groups : (savedQuota.quota_groups ?? []),
+    last_updated: effectiveLastUpdated,
+    quota_groups: mergedGroups,
     models: (hasLiveGroups || hasKnownLiveModels || !hasSavedModels) ? liveQuota.models : savedQuota.models,
     subscription_tier: mergeSubscriptionTier(liveQuota.subscription_tier, savedQuota.subscription_tier, {
       allowFreeDowngrade: hasLiveGroups || liveComplete || !savedQuota.subscription_tier,
@@ -116,6 +190,26 @@ function mergeLiveQuotaWithSaved(
   if (mergedStaleGroups?.length) merged.stale_groups = mergedStaleGroups;
   else delete merged.stale_groups;
   return merged;
+}
+
+export function resolveUnsavedLiveSubscriptionTier(
+  liveLs: { tier?: string | null; accountType?: 'consumer' | 'enterprise_vertex' | 'unknown' | null } | null | undefined,
+  quotaOverview: { subscriptionTier?: string | null; models?: unknown[] | null } | null | undefined
+): string {
+  if (liveLs?.tier && !/starter|free/i.test(liveLs.tier)) {
+    return normalizeSubscriptionTier(liveLs.tier);
+  }
+  if (quotaOverview?.subscriptionTier && quotaOverview.subscriptionTier !== 'FREE') {
+    return normalizeSubscriptionTier(quotaOverview.subscriptionTier);
+  }
+  if (
+    liveLs?.accountType !== 'enterprise_vertex' &&
+    quotaOverview?.subscriptionTier === 'FREE' &&
+    (quotaOverview.models?.length ?? 0) > 0
+  ) {
+    return 'FREE';
+  }
+  return normalizeSubscriptionTier(bt('quota.tier.pending'));
 }
 
 export type DashboardAggregateDeps = {
@@ -155,11 +249,13 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
         let isLiveVerified = false;
         let quotaRefreshError = cleanAndLocalizeRefreshError((activeAcc as any)?.quota_refresh_error) ?? '';
 
+        // 同一载荷的顶层/模型/分组/英文描述倒计时统一由 reset_time 按同一参考时刻现算。
+        const dashboardNowMs = Date.now();
         if (liveAccountEmail) {
           const matchedSummary = listRes.accounts.find((a: any) => a.email.toLowerCase() === liveAccountEmail.toLowerCase());
           const matchedSaved = matchedSummary ? await deps.getAccount(matchedSummary.id) : null;
           if (matchedSaved) {
-            const mergedQuota = mergeLiveQuotaWithSaved(matchedSaved.quota, liveLs?.quota);
+            const mergedQuota = mergeLiveQuotaWithSaved(matchedSaved.quota, liveLs?.quota, dashboardNowMs);
             sourceAcc = { ...matchedSaved, ...(mergedQuota ? { quota: mergedQuota } : {}) };
             currentAccountId = matchedSaved.id;
             activeEmail = matchedSaved.email;
@@ -181,12 +277,10 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
           }
         }
 
-        // 同一载荷的顶层/模型/分组/英文描述倒计时统一由 reset_time 按同一参考时刻现算。
-        const dashboardNowMs = Date.now();
         const quotaOverview = sourceAcc ? deps.getAccountQuotaOverview(sourceAcc, { nowMs: dashboardNowMs }) : null;
         // 有账号但套餐缺失/空串时回落到“待确认”；完全无账号时才保留 FREE 的既有语义。
         const activeTier = (!isLiveVerified && liveAccountEmail && !currentAccountId)
-          ? normalizeSubscriptionTier((liveLs?.tier && !/starter|free/i.test(liveLs.tier)) ? liveLs.tier : (quotaOverview?.subscriptionTier || bt('quota.tier.pending')))
+          ? resolveUnsavedLiveSubscriptionTier(liveLs, quotaOverview)
           : (quotaOverview ? normalizeSubscriptionTier(quotaOverview.subscriptionTier) : 'FREE');
 
         const resetTimeStr = formatResetTime(quotaOverview?.resetTime);
@@ -386,6 +480,7 @@ async function run() {
   let lastLiveSnapshotDedupKey = '';
   async function persistLiveIdeModelsIfPresent(live: Parameters<typeof sanitizeLiveIdeModelsSnapshot>[0]): Promise<void> {
     if (!live?.quota?.models?.length) return;
+    registerObservedModelsFromSource(live.quota.models);
     const appVersion = await readInstalledAppBundleVersion(target.appPath);
     const snapshot = sanitizeLiveIdeModelsSnapshot(live, appVersion);
     if (!snapshot) return;
@@ -411,7 +506,7 @@ async function run() {
   const homeDir = option('--home-dir', process.env.GRAVITYBOX_HOME_DIR || homedir())!;
   const appSupportDir = option('--app-support-dir', process.env.GRAVITYBOX_APP_SUPPORT_DIR || getDefaultAppSupportDir())!;
   const assetsDir = resolve(fileURLToPath(new URL('../assets', import.meta.url)));
-  const switchService = new AccountSwitchService(accountsManager, { stateDir, profile, channel });
+  const switchService = new AccountSwitchService(accountsManager, { stateDir, profile, channel, homeDir, geminiDir });
   const usageManager = new UsageStatsManager({ stateDir, geminiDir });
   cacheMaintenance.setHooks({
     archiveDatabases: dbPaths => usageManager.archiveDatabasesBeforeClear(dbPaths),
@@ -458,14 +553,34 @@ async function run() {
       accountsManager,
     });
 
+  let lastAutoSyncUnpricedSignature = '';
+  let maybeScheduleAutoPricingSync: (reason: 'startup' | 'timer' | 'unpriced' | 'enabled', unpricedKeys?: string[]) => void = () => {};
+
   async function syncActiveOfficialModelsToUsageManager(): Promise<void> {
     try {
-      await buildPricingCatalogPayload();
+      const payload = await buildPricingCatalogPayload();
+      if (payload.unpricedLiveModels.length > 0) {
+        maybeScheduleAutoPricingSync('unpriced', payload.unpricedLiveModels.map((m) => m.key));
+      }
     } catch {}
   }
   const pricePrefs = await readOptionalJson<{ enabled?: boolean }>(join(stateDir, 'pricing-preferences.json'), 'pricing-preferences.json');
   if (pricePrefs) usageManager.setAutoRemotePricingSync(pricePrefs.enabled === true);
   else if (typeof configuredAutoPricingSync === 'boolean') usageManager.setAutoRemotePricingSync(configuredAutoPricingSync);
+  await usageManager.hydratePricingCatalog().catch(() => {});
+  await (async () => {
+    const listRes = await accountsManager.listAccounts().catch(() => null);
+    for (const acc of listRes?.accounts ?? []) {
+      if (acc.quota?.models?.length) {
+        registerObservedModelsFromSource(acc.quota.models);
+      }
+    }
+    const installedVer = await readInstalledAppBundleVersion(target.appPath).catch(() => '');
+    const snap = installedVer ? await readValidLiveIdeModelsSnapshot(liveIdeModelsPath, installedVer).catch(() => null) : null;
+    if (snap?.models?.length) {
+      registerObservedModelsFromSource(snap.models);
+    }
+  })().catch(() => {});
   const idempotencyStore = new IdempotencyStore();
   let backendLease: ProcessLease | undefined;
 
@@ -475,6 +590,18 @@ async function run() {
   ): Record<string, unknown> | null {
     return projectAccountNormalizedWithManager(account, accountsManager, options);
   }
+  const hasLocalOAuthClientConfigured = () => Boolean(getGoogleClientId() && getGoogleClientSecret());
+  const resolveActiveIdentityForIpc = async (): Promise<{ activeId: string | null; activeEmailLower: string | null }> => {
+    const live = await probeLiveCached().catch(() => null);
+    const detectedEmail = live?.email ?? await accountsManager.detectCurrentAntigravityEmail({ liveEmailHint: null }).catch(() => null);
+    const index = await accountsManager.loadIndex().catch(() => null);
+    const activeEmailLower = detectedEmail?.trim().toLowerCase() ?? null;
+    let activeId = index?.current_account_id ?? null;
+    if (activeEmailLower && index) {
+      activeId = index.accounts.find(a => a.email.trim().toLowerCase() === activeEmailLower)?.id ?? null;
+    }
+    return { activeId, activeEmailLower };
+  };
   backendLease = await acquireProcessLease(join(stateDir, 'backend.lock'), 0);
   const earlySignalExit = () => { backendLease?.releaseSync(); process.exit(0); };
   process.once('exit', () => backendLease?.releaseSync());
@@ -564,7 +691,7 @@ async function run() {
   const onStatus = (status: AssistantStatus) => {
     const installState = detectInstalledChannels(channel);
     const oauthClientConfigured = Boolean(getGoogleClientId() && getGoogleClientSecret());
-    const snapshot = { ...status, oauthClientConfigured, applicationChannel: channel, applicationLabel: target.label, accountSwitchSupported: target.supportsAccountSwitch, bothApplicationsInstalled: installState.bothInstalled, availableChannels: installState.channels, taskRevision:statusTasks?.revision??0,runningTasks:statusTasks?.list().filter(t=>t.state==='running').length??0 };
+    const snapshot = { ...status, oauthClientConfigured, applicationChannel: channel, applicationLabel: target.label, accountSwitchSupported: target.supportsAccountSwitch, bothApplicationsInstalled: installState.bothInstalled, availableChannels: installState.channels, pricingRevision: usageManager.getPricingRevision(), taskRevision:statusTasks?.revision??0,runningTasks:statusTasks?.list().filter(t=>t.state==='running').length??0 };
     const {updatedAt,rssMB,...meaningful}=snapshot;const key=JSON.stringify(meaningful);
     if(key===lastStatusKey&&Date.now()-lastStatusWrite<30000)return;
     lastStatusKey=key;lastStatusWrite=Date.now();pendingStatus=snapshot;
@@ -620,6 +747,10 @@ async function run() {
     onStatus,
   });
   const tasks = new Tasks(stateDir, () => onStatus(controller.snapshot()));statusTasks=tasks; await tasks.start();
+  usageManager.setOnPricingUpdated(() => {
+    onStatus(controller.snapshot());
+    void controller.refreshHudForPricingChange().catch(() => {});
+  });
   const cancelRunningDeepScan = () => {
     const deepScan = tasks.list().find(t => t.kind === 'deep-scan' && t.state === 'running');
     if (deepScan) tasks.cancel(deepScan.id);
@@ -646,6 +777,53 @@ async function run() {
   store.on('invalid', message => controller.dictionaryError(String(message)));
   store.on('valid', () => controller.dictionaryError());
   let commandChain = Promise.resolve(); let stopping = false; const ipcMetrics = { statusRequests: 0, taskPayloadReplies: 0 };
+  const expiredWindowRefreshAt = new Map<string, number>();
+  function scheduleExpiredQuotaCorrection(targetId: string | null, quota: QuotaData | null | undefined, nowMs: number = Date.now()): void {
+    if (stopping || fixture) return;
+    if (!hasExpiredQuotaWindow(quota, nowMs)) return;
+    const key = targetId || '__live_unsaved__';
+    const lastAttempt = expiredWindowRefreshAt.get(key) ?? 0;
+    if (nowMs - lastAttempt < 60_000) return;
+    expiredWindowRefreshAt.set(key, nowMs);
+    if (targetId) {
+      void accountsManager.refreshQuota(targetId).catch(() => {});
+    } else {
+      void accountsManager.probeLiveLanguageServer(globalThis.fetch, { forceRefresh: true })
+        .then(res => persistLiveIdeModelsIfPresent(res))
+        .catch(() => {});
+    }
+  }
+  const startQuotaRefreshTask = () => tasks.begin('quota-refresh', bt('main.task.quota_refresh_title'), async (signal, progress, _commit) => {
+    const result = await accountsManager.refreshAllQuotas(globalThis.fetch, {
+      signal,
+      onAccountUpdated: (account, done, total) => {
+        if (account?.quota?.models?.length) {
+          registerObservedModelsFromSource(account.quota.models);
+        }
+        progress(done, total);
+      },
+    });
+    const skippedStandby = (result as { skippedStandby?: number }).skippedStandby ?? 0;
+    const incomplete = result.accounts.filter(a => a.quota?.refresh_state?.complete === false).length;
+    const warnings = result.accounts.filter(a => a.quota_refresh_error || a.quota?.refresh_state?.complete === false).length;
+    const staleAccounts = result.accounts.filter(a => (a.quota?.stale_groups?.length ?? 0) > 0).length;
+    const staleGroups = result.accounts.reduce((total, a) => total + (a.quota?.stale_groups?.length ?? 0), 0);
+    const incompletePart = incomplete ? bt('main.task.quota_refresh_incomplete_part', { count: incomplete }) : '';
+    const stalePart = staleAccounts ? bt('main.task.quota_refresh_stale_part', { accounts: staleAccounts, groups: staleGroups }) : '';
+    const hasFailures = result.failures.length > 0;
+    const message = hasFailures
+      ? bt('main.task.quota_refresh_failures', { total: result.accounts.length, failed: result.failures.length })
+      : result.accounts.length === 0 && skippedStandby > 0
+      ? bt('main.task.quota_refresh_standby_only', { skipped: skippedStandby })
+      : skippedStandby > 0
+      ? bt('main.task.quota_refresh_ok_with_standby', { updated: result.accounts.length, skipped: skippedStandby })
+      : bt('main.task.quota_refresh_ok', { total: result.accounts.length, incompletePart, stalePart });
+    const ok = !hasFailures && incomplete === 0;
+    const partial = (hasFailures || incomplete > 0) && result.accounts.length > 0;
+    return { ok, partial,
+      incomplete, updated: result.accounts.length, failed: result.failures.length, skippedStandby, warnings, staleAccounts, staleGroups,
+      message };
+  });
   async function recommendationPreview(config: any, cached: boolean) {
     const live = await (cached ? probeLiveCached() : accountsManager.probeLiveLanguageServer()).catch(() => null);
     const detectedEmail = live?.email ?? await accountsManager.detectCurrentAntigravityEmail({ liveEmailHint: null }).catch(() => null);
@@ -729,14 +907,17 @@ async function run() {
                 if (matchedSaved) {
                   activeAccountEmail = matchedSaved.email;
                   const liveQuotaForMatched = liveLs?.email?.toLowerCase() === detectedEmail.toLowerCase() ? liveLs.quota : null;
-                  const q = accountsManager.getAccountQuotaOverview({ ...matchedSaved, quota: mergeLiveQuotaWithSaved(matchedSaved.quota, liveQuotaForMatched) });
+                  const statusNowMs = Date.now();
+                  scheduleExpiredQuotaCorrection(matchedSaved.id, liveQuotaForMatched, statusNowMs);
+                  const q = accountsManager.getAccountQuotaOverview({ ...matchedSaved, quota: mergeLiveQuotaWithSaved(matchedSaved.quota, liveQuotaForMatched, statusNowMs) }, { nowMs: statusNowMs });
                   activeFiveHourQuota = q.fiveHourRemaining;
                   activeSubscriptionTier = normalizeSubscriptionTier(q.subscriptionTier);
                 } else if (liveLs?.email) {
                   activeAccountEmail = liveLs.email;
+                  scheduleExpiredQuotaCorrection(null, liveLs.quota);
                   const q = accountsManager.getAccountQuotaOverview({ quota: liveLs.quota });
                   activeFiveHourQuota = q.fiveHourRemaining;
-                  activeSubscriptionTier = normalizeSubscriptionTier((liveLs.tier && !/starter|free/i.test(liveLs.tier)) ? liveLs.tier : (q.subscriptionTier !== 'FREE' ? q.subscriptionTier : bt('quota.tier.pending')));
+                  activeSubscriptionTier = resolveUnsavedLiveSubscriptionTier(liveLs, q);
                 }
               } else if (listRes.active_account) {
                 usageManager.setCurrentAccountContext(undefined);
@@ -757,6 +938,7 @@ async function run() {
               oauthClientConfigured: Boolean(getGoogleClientId() && getGoogleClientSecret()),
               applicationChannel: channel, applicationLabel: target.label, accountSwitchSupported: target.supportsAccountSwitch,
               bothApplicationsInstalled: installState.bothInstalled, availableChannels: installState.channels,
+              pricingRevision: usageManager.getPricingRevision(),
               ...(parsed.includeAccounts === false ? {} : { activeAccountEmail, activeFiveHourQuota, activeSubscriptionTier, liveAccountEmail, accountsRevision }),
             },
             ipc: { ...ipcMetrics },
@@ -853,12 +1035,17 @@ async function run() {
                 quota: null, quota_refresh_error: bt('main.account_missing'),
                 credentialReadiness: { state: 'needs_authorization', message: bt('main.account_check_files') } };
               const isLiveMatched = live?.email?.toLowerCase() === summary.email.toLowerCase() && live.quota;
+              if (isLiveMatched) {
+                scheduleExpiredQuotaCorrection(summary.id, live.quota, listNowMs);
+              }
               const acc: Account = {
                 ...saved,
-                quota: isLiveMatched ? mergeLiveQuotaWithSaved(saved.quota, live.quota) : saved.quota,
+                quota: isLiveMatched ? mergeLiveQuotaWithSaved(saved.quota, live.quota, listNowMs) : saved.quota,
               };
               const projected = projectAccountForIpcNormalized(acc, {
                 nowMs: listNowMs,
+                isActive: acc.id === effectiveActiveId,
+                hasLocalOAuthClient: hasLocalOAuthClientConfigured(),
                 includeOverviewFields: true,
                 formatResetTime,
                 revisionWithReadiness: true,
@@ -886,7 +1073,18 @@ async function run() {
           }
           if (command === 'account_get') {
             const acc = await accountsManager.getAccount(parsed.id);
-            reply({ ok: !!acc, account: projectAccountForIpcNormalized(acc) });
+            const identity = await resolveActiveIdentityForIpc();
+            const isActive = Boolean(acc && (
+              (identity.activeEmailLower && acc.email.trim().toLowerCase() === identity.activeEmailLower)
+              || (!identity.activeEmailLower && identity.activeId === acc.id)
+            ));
+            reply({
+              ok: !!acc,
+              account: projectAccountForIpcNormalized(acc, {
+                isActive,
+                hasLocalOAuthClient: hasLocalOAuthClientConfigured(),
+              }),
+            });
             return;
           }
         })().catch(error => reply({ ok: false, error: sanitizeErrorMessage(error) }));
@@ -899,6 +1097,7 @@ async function run() {
           let insidersRunning = false;
           let hasRunningTask = false;
           let taskReason = '';
+          let maxLsCpu = 0;
           const insidersPrefix = '/Applications/Antigravity - Insiders.app/Contents/';
           const stablePrefix = `${target.appPath}/Contents/`;
           try {
@@ -935,54 +1134,40 @@ async function run() {
                 } else {
                   continue;
                 }
-                if (/language_server/i.test(args) && cpu >= 3.0) {
-                  hasRunningTask = true;
-                  taskReason = bt('main.task.active_inference');
-                } else if (/Helper \((?:Plugin|Renderer)\)/i.test(args) && cpu >= 15.0) {
-                  hasRunningTask = true;
-                  taskReason = bt('main.task.active_inference');
+                if (/language_server/i.test(args) && cpu > maxLsCpu) {
+                  maxLsCpu = cpu;
                 }
               }
             }
           } catch {}
-          if (appRunning && !hasRunningTask) {
-            const cdpState = await controller.hasRunningAgentTask().catch(() => ({ busy: false, reason: '' }));
+          let cdpChecked = false;
+          if (appRunning) {
+            const cdpState = await controller.hasRunningAgentTask().catch(() => ({ busy: false, checked: false, reason: '' }));
+            cdpChecked = cdpState.checked === true;
             if (cdpState.busy) {
               hasRunningTask = true;
               taskReason = cdpState.reason || bt('main.task.active_inference');
             }
           }
-          if (appRunning && !hasRunningTask) {
+          // Only fall back to active trajectory write + high LS CPU when CDP is not connected to any page.
+          if (appRunning && !cdpChecked && !hasRunningTask && maxLsCpu >= 20.0) {
             try {
               const nowMs = Date.now();
               const allowedDataDirs = new Set<string>(ALLOWED_DATA_DIRECTORY_NAMES);
               const entries = await readdir(geminiDir, { withFileTypes: true }).catch(() => [] as any[]);
               for (const entry of entries) {
                 if (!entry.isDirectory() || !allowedDataDirs.has(entry.name)) continue;
-                const summariesDb = join(geminiDir, entry.name, 'conversation_summaries.db');
-                const [sumSt, sumWalSt] = await Promise.all([
-                  lstat(summariesDb).catch(() => null),
-                  lstat(`${summariesDb}-wal`).catch(() => null),
-                ]);
-                if ((sumSt && nowMs - sumSt.mtimeMs < 15000) || (sumWalSt && nowMs - sumWalSt.mtimeMs < 15000)) {
-                  hasRunningTask = true;
-                  taskReason = bt('main.task.active_session');
-                  break;
-                }
-                for (const sub of ['conversations', 'brain']) {
-                  const subDir = join(geminiDir, entry.name, sub);
-                  const dirSt = await lstat(subDir).catch(() => null);
-                  if (!dirSt) continue;
-                  const files = await readdir(subDir).catch(() => [] as string[]);
-                  for (let i = 0; i < files.length; i += 32) {
-                    const stats = await Promise.all(files.slice(i, i + 32).map(f => lstat(join(subDir, f)).catch(() => null)));
-                    if (stats.some(st => st && nowMs - st.mtimeMs < 15000)) {
-                      hasRunningTask = true;
-                      taskReason = bt('main.task.active_session');
-                      break;
-                    }
+                const convDir = join(geminiDir, entry.name, 'conversations');
+                const dirSt = await lstat(convDir).catch(() => null);
+                if (!dirSt) continue;
+                const files = (await readdir(convDir).catch(() => [] as string[])).filter(f => f.endsWith('.pb'));
+                for (let i = 0; i < files.length; i += 32) {
+                  const stats = await Promise.all(files.slice(i, i + 32).map(f => lstat(join(convDir, f)).catch(() => null)));
+                  if (stats.some(st => st && nowMs - st.mtimeMs < 3000)) {
+                    hasRunningTask = true;
+                    taskReason = bt('main.task.active_session');
+                    break;
                   }
-                  if (hasRunningTask) break;
                 }
                 if (hasRunningTask) break;
               }
@@ -1018,43 +1203,72 @@ async function run() {
             return;
           }
           if (command === 'quota_refresh_start') {
-            const taskId = tasks.begin('quota-refresh', bt('main.task.quota_refresh_title'), async (signal, progress, _commit) => {
-              const result = await accountsManager.refreshAllQuotas(globalThis.fetch, {
-                signal,
-                onAccountUpdated: (_account, done, total) => {
-                  progress(done, total);
-                },
-              });
-              const incomplete = result.accounts.filter(a => a.quota?.refresh_state?.complete === false).length;
-              const warnings = result.accounts.filter(a => a.quota_refresh_error || a.quota?.refresh_state?.complete === false).length;
-              const staleAccounts = result.accounts.filter(a => (a.quota?.stale_groups?.length ?? 0) > 0).length;
-              const staleGroups = result.accounts.reduce((total, a) => total + (a.quota?.stale_groups?.length ?? 0), 0);
-              const incompletePart = incomplete ? bt('main.task.quota_refresh_incomplete_part', { count: incomplete }) : '';
-              const stalePart = staleAccounts ? bt('main.task.quota_refresh_stale_part', { accounts: staleAccounts, groups: staleGroups }) : '';
-              return { ok: result.failures.length === 0 && incomplete === 0, partial: (result.failures.length > 0 || incomplete > 0) && result.accounts.length > 0,
-                incomplete, updated: result.accounts.length, failed: result.failures.length, warnings, staleAccounts, staleGroups,
-                message: result.failures.length
-                  ? bt('main.task.quota_refresh_failures', { total: result.accounts.length, failed: result.failures.length })
-                  : bt('main.task.quota_refresh_ok', { total: result.accounts.length, incompletePart, stalePart }) };
-            });
+            const taskId = startQuotaRefreshTask();
             reply({ ok: true, taskId });
             return;
           }
           if (command === 'quota_refresh') {
-            const acc = await accountsManager.refreshQuota(parsed.id);
             const refreshNowMs = Date.now();
-            const overview = accountsManager.getAccountQuotaOverview(acc, { nowMs: refreshNowMs });
-            const projected = projectAccountForIpcNormalized(acc, {
-              overview,
-              nowMs: refreshNowMs,
-              includeOverviewFields: true,
-              formatResetTime,
-              revisionWithReadiness: true,
-            });
-            const partial = acc.quota?.refresh_state?.complete === false || !!projected?.quota_refresh_error;
-            reply({ ok: true, partial, message: partial ? bt('main.quota.read_partial') : bt('main.quota.read_ok'),
-              quota: acc.quota ? (projected?.quota ?? null) : acc.quota, account: projected, subscription_tier: normalizeSubscriptionTier(projected?.subscription_tier) });
-            return;
+            const hasLocalOAuthClient = hasLocalOAuthClientConfigured();
+            const identity = await resolveActiveIdentityForIpc();
+            const index = await accountsManager.loadIndex().catch(() => null);
+            const targetId = typeof parsed.id === 'string' && parsed.id ? parsed.id : (index?.current_account_id ?? null);
+            const isTargetActive = (accEmail: string | null | undefined, accId: string | null | undefined): boolean => {
+              if (identity.activeEmailLower && accEmail) {
+                return accEmail.trim().toLowerCase() === identity.activeEmailLower;
+              }
+              return Boolean(accId && identity.activeId && accId === identity.activeId);
+            };
+            try {
+              const acc = await accountsManager.refreshQuota(parsed.id);
+              if (acc.quota?.models?.length) {
+                registerObservedModelsFromSource(acc.quota.models);
+              }
+              const overview = accountsManager.getAccountQuotaOverview(acc, { nowMs: refreshNowMs });
+              const projected = projectAccountForIpcNormalized(acc, {
+                overview,
+                nowMs: refreshNowMs,
+                isActive: isTargetActive(acc.email, acc.id),
+                hasLocalOAuthClient,
+                includeOverviewFields: true,
+                formatResetTime,
+                revisionWithReadiness: true,
+              });
+              const partial = acc.quota?.refresh_state?.complete === false || !!projected?.quota_refresh_error;
+              reply({ ok: true, partial, message: partial ? bt('main.quota.read_partial') : bt('main.quota.read_ok'),
+                quota: acc.quota ? (projected?.quota ?? null) : acc.quota, account: projected, subscription_tier: normalizeSubscriptionTier(projected?.subscription_tier) });
+              return;
+            } catch (err) {
+              if (
+                accountErrorCode(err) === 'missing_oauth_client'
+                && err instanceof Error
+                && err.message !== bt('account_cloud.err.missing_oauth_client_active_live')
+              ) {
+                const acc = targetId ? await accountsManager.getAccount(targetId).catch(() => null) : null;
+                const overview = acc ? accountsManager.getAccountQuotaOverview(acc, { nowMs: refreshNowMs }) : undefined;
+                const projected = acc ? projectAccountForIpcNormalized(acc, {
+                  overview,
+                  nowMs: refreshNowMs,
+                  isActive: false,
+                  hasLocalOAuthClient,
+                  includeOverviewFields: true,
+                  formatResetTime,
+                  revisionWithReadiness: true,
+                }) : null;
+                reply({
+                  ok: true,
+                  partial: false,
+                  standbyDeferred: true,
+                  notice: err.message,
+                  message: err.message,
+                  quota: acc?.quota ? (projected?.quota ?? null) : (acc?.quota ?? null),
+                  account: projected,
+                  subscription_tier: normalizeSubscriptionTier(projected?.subscription_tier),
+                });
+                return;
+              }
+              throw err;
+            }
           }
           if (command === 'pricing_sync_status') { await syncActiveOfficialModelsToUsageManager(); reply({ ok: true, status: await usageManager.getPricingSyncStatus() }); return; }
           if (command === 'usage_ledger_review') { reply({ ok: true, review: await usageManager.ledgerReview() }); return; }
@@ -1065,9 +1279,11 @@ async function run() {
           if (isReadOnlyAutoSwitch) {
             const best = await recommendationPreview(parsed.config, true);
             if (!best) { reply({ ok: true, currentAccount: null, bestCandidate: null, account: null, shouldSwitch: false, executed: false, preview: true, reason: bt('main.auto_switch.save_current_first') }); return; }
+            const hasLocalOAuthClient = hasLocalOAuthClientConfigured();
+            const previewNowMs = Date.now();
             const projected = {
-              currentAccount: projectAccountForIpcNormalized(best.currentAccount),
-              bestCandidate: projectAccountForIpcNormalized(best.bestCandidate),
+              currentAccount: projectAccountForIpcNormalized(best.currentAccount, { isActive: true, hasLocalOAuthClient, nowMs: previewNowMs }),
+              bestCandidate: projectAccountForIpcNormalized(best.bestCandidate, { isActive: false, hasLocalOAuthClient, nowMs: previewNowMs }),
               shouldSwitch: best.shouldSwitch,
               reason: best.reason,
             };
@@ -1112,7 +1328,7 @@ async function run() {
           if(command==='api_pricing_revalue_preview'){reply({ok:true,preview:await usageManager.previewRevalueHistory(parsed.mode === 'unpriced_only' ? 'unpriced_only' : 'force_all')});return;}
           if(command==='api_pricing_revalue'){const mode = parsed.mode === 'unpriced_only' ? 'unpriced_only' : 'force_all';reply({ok:true,...await usageManager.revalueHistory(parsed.confirm===true, { mode, previewId: typeof parsed.previewId === 'string' ? parsed.previewId : undefined })});return;}
           if(command==='api_pricing_revalue_rollback'){reply({ok:true,...await usageManager.restoreRevalueHistory(String(parsed.previewId ?? ''),parsed.confirm===true)});return;}
-          if(command==='pricing_sync_set'){await atomicJson(join(stateDir, 'pricing-preferences.json'), {enabled:parsed.enabled===true});usageManager.setAutoRemotePricingSync(parsed.enabled===true);reply({ok:true});return;}
+          if(command==='pricing_sync_set'){await atomicJson(join(stateDir, 'pricing-preferences.json'), {enabled:parsed.enabled===true});usageManager.setAutoRemotePricingSync(parsed.enabled===true);if(parsed.enabled===true)maybeScheduleAutoPricingSync('enabled');reply({ok:true});return;}
           if(command==='pricing_sync_check'){
             if(parsed.feedUrl!==undefined&&typeof parsed.feedUrl!=='string')throw new Error(bt('main.pricing_feed_invalid'));
             const res=await usageManager.syncRemotePricing(parsed.feedUrl,true);
@@ -1128,17 +1344,62 @@ async function run() {
           if(command==='metadata_scan_start'){const taskId=tasks.begin('deep-scan',bt('main.task.deep_scan_title'),async(signal,_progress,commit)=>controller.metadataScan(signal,parsed.nativeMenus,commit));reply({ok:true,taskId});return;}
           if (command === 'account_save_current') {
             const acc = await accountsManager.saveCurrentAccount({ homeDir, appSupportDir });
-            reply({ ok: true, account: projectAccountForIpcNormalized(acc) });
+            reply({
+              ok: true,
+              account: projectAccountForIpcNormalized(acc, {
+                isActive: true,
+                hasLocalOAuthClient: hasLocalOAuthClientConfigured(),
+              }),
+            });
+            return;
+          }
+          if (command === 'account_import_json') {
+            const res = await accountsManager.importAccountsFromJson(parsed.paths ?? parsed.files);
+            await syncActiveAccountToUsageManager(true).catch(() => {});
+            reply({
+              ok: true,
+              imported: res.imported,
+              updated: res.updated,
+              skipped: res.skipped,
+              expiredWithoutRefreshConfig: res.expiredWithoutRefreshConfig,
+            });
+            return;
+          }
+          if (command === 'account_export_backup') {
+            const res = await accountsManager.exportAccountsBackup(String(parsed.path ?? ''), parsed.confirmed === true);
+            reply({ ok: true, path: res.path, count: res.count });
             return;
           }
           if (command === 'account_upsert') {
             const acc = await accountsManager.upsertAccount(parsed.data ?? parsed.account ?? parsed);
-            reply({ ok: true, account: projectAccountForIpcNormalized(acc) });
+            const identity = await resolveActiveIdentityForIpc();
+            const isActive = Boolean(
+              (identity.activeEmailLower && acc.email.trim().toLowerCase() === identity.activeEmailLower)
+              || (!identity.activeEmailLower && identity.activeId === acc.id),
+            );
+            reply({
+              ok: true,
+              account: projectAccountForIpcNormalized(acc, {
+                isActive,
+                hasLocalOAuthClient: hasLocalOAuthClientConfigured(),
+              }),
+            });
             return;
           }
           if (command === 'account_rename') {
             const acc = await accountsManager.renameAccount(String(parsed.id ?? ''), parsed.name);
-            reply({ ok: true, account: projectAccountForIpcNormalized(acc) }); return;
+            const identity = await resolveActiveIdentityForIpc();
+            const isActive = Boolean(
+              (identity.activeEmailLower && acc.email.trim().toLowerCase() === identity.activeEmailLower)
+              || (!identity.activeEmailLower && identity.activeId === acc.id),
+            );
+            reply({
+              ok: true,
+              account: projectAccountForIpcNormalized(acc, {
+                isActive,
+                hasLocalOAuthClient: hasLocalOAuthClientConfigured(),
+              }),
+            }); return;
           }
           if (command === 'account_delete') {
             await accountsManager.deleteAccount(parsed.id);
@@ -1147,9 +1408,16 @@ async function run() {
           }
           if (command === 'account_reorder') {
             const index = await accountsManager.reorderAccounts(parsed.ids);
+            const identity = await resolveActiveIdentityForIpc();
+            const hasLocalOAuthClient = hasLocalOAuthClientConfigured();
             const reordered = await Promise.all(index.accounts.map(async summary => {
               const saved = await accountsManager.getAccount(summary.id).catch(() => null);
-              return projectAccountForIpcNormalized(saved ?? summary);
+              const targetAcc = saved ?? summary;
+              const isActive = Boolean(
+                (identity.activeEmailLower && targetAcc.email.trim().toLowerCase() === identity.activeEmailLower)
+                || (!identity.activeEmailLower && identity.activeId === targetAcc.id),
+              );
+              return projectAccountForIpcNormalized(targetAcc, { isActive, hasLocalOAuthClient });
             }));
             reply({ ok: true, accounts: reordered });
             return;
@@ -1232,9 +1500,11 @@ async function run() {
             if (wantsExecute && !confirmed) throw new Error(bt('main.auto_switch.confirm_required'));
             const best = await recommendationPreview(parsed.config, false);
             if (!best) { reply({ ok: true, currentAccount: null, bestCandidate: null, account: null, shouldSwitch: false, executed: false, preview: true, reason: bt('main.auto_switch.save_current_first') }); return; }
+            const hasLocalOAuthClient = hasLocalOAuthClientConfigured();
+            const autoNowMs = Date.now();
             const projected = {
-              currentAccount: projectAccountForIpcNormalized(best.currentAccount),
-              bestCandidate: projectAccountForIpcNormalized(best.bestCandidate),
+              currentAccount: projectAccountForIpcNormalized(best.currentAccount, { isActive: true, hasLocalOAuthClient, nowMs: autoNowMs }),
+              bestCandidate: projectAccountForIpcNormalized(best.bestCandidate, { isActive: false, hasLocalOAuthClient, nowMs: autoNowMs }),
               shouldSwitch: best.shouldSwitch,
               reason: best.reason,
             };
@@ -1254,10 +1524,25 @@ async function run() {
 
           if (command === 'quota_refresh_all') {
             const result = await accountsManager.refreshAllQuotas();
-            const accounts = result.accounts.map(account => projectAccountForIpcNormalized(account));
+            for (const refreshed of result.accounts) {
+              if (refreshed.quota?.models?.length) {
+                registerObservedModelsFromSource(refreshed.quota.models);
+              }
+            }
+            const identity = await resolveActiveIdentityForIpc();
+            const hasLocalOAuthClient = hasLocalOAuthClientConfigured();
+            const allNowMs = Date.now();
+            const accounts = result.accounts.map(account => {
+              const isActive = Boolean(
+                (identity.activeEmailLower && account.email.trim().toLowerCase() === identity.activeEmailLower)
+                || (!identity.activeEmailLower && identity.activeId === account.id),
+              );
+              return projectAccountForIpcNormalized(account, { isActive, hasLocalOAuthClient, nowMs: allNowMs });
+            });
             reply({ ok: result.failures.length === 0,
               accounts,
               failures: result.failures,
+              skippedStandby: (result as { skippedStandby?: number }).skippedStandby ?? 0,
               partial: (result.failures.length > 0 || accounts.some((account: any) => account?.refreshState?.complete === false)) && accounts.length > 0,
               staleAccounts: accounts.filter((account: any) => (account?.quota?.stale_groups?.length ?? 0) > 0).length });
             return;
@@ -1341,7 +1626,7 @@ async function run() {
           }
           else if (command === 'toggle') {if(!fixture)throw new Error(bt('main.shortcut_removed'));await controller.toggleLanguage();}
           else if (command === 'reload') await store.reload();
-          else if (command === 'stop') { stopping = true; server.close(); await accountLogin.close(); await tasks.stop(); store.close(); await controller.stop(); }
+          else if (command === 'stop') { stopping = true; clearTimeout(startupPricingSyncTimer); clearInterval(periodicPricingSyncTimer); clearTimeout(startupQuotaRefreshTimer); clearInterval(periodicQuotaRefreshTimer); server.close(); await accountLogin.close(); await tasks.stop(); store.close(); await controller.stop(); }
           else throw new Error(bt('main.unknown_command'));
           await writeChain; await cacheChain.catch(() => {});
           reply({ ok: true, status: controller.snapshot() });
@@ -1354,6 +1639,107 @@ async function run() {
       });
     });
   });
+  let autoPricingSyncInFlight: Promise<void> | null = null;
+  maybeScheduleAutoPricingSync = (reason, unpricedKeys) => {
+    if (stopping || !usageManager.isAutoRemotePricingSyncEnabled()) return;
+    if (process.env.GRAVITYBOX_DISABLE_AUTO_PRICING_NETWORK === '1') return;
+    if (autoPricingSyncInFlight) return;
+    autoPricingSyncInFlight = (async () => {
+      try {
+        let forceForNewUnpriced = false;
+        if (reason === 'unpriced' && Array.isArray(unpricedKeys) && unpricedKeys.length > 0) {
+          const sig = [...new Set(unpricedKeys)].sort().join(',');
+          const elapsedSinceCheck = Date.now() - usageManager.getLastPricingCheckAt();
+          if (sig !== lastAutoSyncUnpricedSignature && elapsedSinceCheck >= 300_000) {
+            lastAutoSyncUnpricedSignature = sig;
+            forceForNewUnpriced = true;
+          }
+        }
+        if (!forceForNewUnpriced && !(await usageManager.isAutoPricingSyncDue())) {
+          return;
+        }
+        await usageManager.syncRemotePricing(undefined, forceForNewUnpriced);
+      } catch {}
+    })().finally(() => {
+      autoPricingSyncInFlight = null;
+    });
+  };
+  const startupPricingSyncTimer = setTimeout(() => maybeScheduleAutoPricingSync('startup'), 3_000);
+  startupPricingSyncTimer.unref();
+  const periodicPricingSyncTimer = setInterval(() => maybeScheduleAutoPricingSync('timer'), 3_600_000);
+  periodicPricingSyncTimer.unref();
+  let autoQuotaRefreshCheckInFlight = false;
+  let lastAutoQuotaRefreshStartAt = 0;
+  let lastAutoQuotaRefreshIntervalMinutes = 0;
+  const preExpirySnapFired = new Set<string>();
+  const maybeScheduleAutoQuotaRefresh = () => {
+    if (stopping || fixture || process.env.GRAVITYBOX_DISABLE_AUTO_QUOTA_REFRESH === '1') return;
+    if (autoQuotaRefreshCheckInFlight) return;
+    const hasLocalOAuthClient = hasLocalOAuthClientConfigured();
+    const minutes = accountsManager.getConfiguredQuotaRefreshMinutes();
+    const validInterval = [5, 10, 15, 30, 60].includes(minutes);
+    const cooldownMs = minutes * 60_000;
+    const autoIntervalDue = validInterval && !(lastAutoQuotaRefreshIntervalMinutes === minutes && Date.now() - lastAutoQuotaRefreshStartAt < cooldownMs);
+    if (!autoIntervalDue && hasLocalOAuthClient) return;
+    if (autoIntervalDue && tasks.list().some(t => t.state === 'running')) return;
+    autoQuotaRefreshCheckInFlight = true;
+    void (async () => {
+      try {
+        const index = await accountsManager.loadIndex();
+        const enabledSummaries = index.accounts.filter(acc => !acc.disabled);
+        if (enabledSummaries.length === 0) return;
+        const nowMs = Date.now();
+        const nowSec = nowMs / 1000;
+        const intervalSec = minutes * 60;
+        const identity = await resolveActiveIdentityForIpc();
+        let hasOverdueAccount = false;
+        for (const summary of enabledSummaries) {
+          const saved = await accountsManager.getAccount(summary.id).catch(() => null);
+          if (!saved || saved.disabled || saved.validation_blocked) continue;
+          if (accountCredentialReadiness(saved, nowSec).state === 'needs_authorization') continue;
+          const isActive = identity.activeEmailLower
+            ? saved.email.trim().toLowerCase() === identity.activeEmailLower
+            : saved.id === index.current_account_id;
+          const standbyStatus = computeStandbyRefreshStatus(saved, {
+            isActive,
+            hasLocalOAuthClient,
+            nowMs,
+          });
+          const lastUpdated = saved.quota?.last_updated ?? 0;
+
+          // Pre-expiry Last-Mile Snap: refresh standby account silently shortly before its harvested access token expires.
+          if (!hasLocalOAuthClient && !isActive) {
+            const exp = saved.token?.expiry_timestamp;
+            const hasValidAccess = Boolean(saved.token?.access_token && saved.token.access_token !== 'pending_refresh');
+            const ttl = typeof exp === 'number' && Number.isFinite(exp) ? exp - nowSec : -1;
+            const snapKey = `${saved.id}:${exp}`;
+            if (hasValidAccess && ttl >= 315 && ttl <= 420 && nowSec - lastUpdated >= 300 && !preExpirySnapFired.has(snapKey)) {
+              if (preExpirySnapFired.size > 500) preExpirySnapFired.clear();
+              preExpirySnapFired.add(snapKey);
+              void accountsManager.refreshQuota(saved.id).catch(() => {});
+            }
+          }
+
+          if (autoIntervalDue && standbyStatus.canBackgroundRefresh) {
+            if (!lastUpdated || nowSec - lastUpdated >= intervalSec) {
+              hasOverdueAccount = true;
+            }
+          }
+        }
+        if (!autoIntervalDue || !hasOverdueAccount || stopping) return;
+        if (tasks.list().some(t => t.state === 'running')) return;
+        lastAutoQuotaRefreshStartAt = Date.now();
+        lastAutoQuotaRefreshIntervalMinutes = minutes;
+        startQuotaRefreshTask();
+      } catch {}
+    })().finally(() => {
+      autoQuotaRefreshCheckInFlight = false;
+    });
+  };
+  const startupQuotaRefreshTimer = setTimeout(() => maybeScheduleAutoQuotaRefresh(), 5_000);
+  startupQuotaRefreshTimer.unref();
+  const periodicQuotaRefreshTimer = setInterval(() => maybeScheduleAutoQuotaRefresh(), 30_000);
+  periodicQuotaRefreshTimer.unref();
   server.maxConnections = 64;
   if (isNamedPipeEndpoint(socketPath)) {
     await new Promise<void>((resolveListen, reject) => { server.once('error', reject); server.listen(socketPath, resolveListen); });
@@ -1368,6 +1754,10 @@ async function run() {
   }
   const stop = async (code = 0) => {
     if (stopping) return; stopping = true;
+    clearTimeout(startupPricingSyncTimer);
+    clearInterval(periodicPricingSyncTimer);
+    clearTimeout(startupQuotaRefreshTimer);
+    clearInterval(periodicQuotaRefreshTimer);
     server.close();
     await commandChain.catch(() => {});
     await accountLogin.close(); await tasks.stop(); store.close(); await controller.stop(); await writeChain; await cacheChain.catch(() => {});

@@ -267,7 +267,7 @@ enum Design {
 
     static func fittedPopUpWidth(_ popup: NSPopUpButton, minimum: CGFloat? = nil) -> CGFloat {
         let isSmall = popup.controlSize == .small
-        let fontSize: CGFloat = isSmall ? 11 : 12
+        let fontSize: CGFloat = isSmall ? 11.5 : 12
         let drawFont = NSFont.systemFont(ofSize: fontSize, weight: .medium)
         let itemTitles = popup.pullsDown
             ? [popup.title]
@@ -276,10 +276,11 @@ enum Design {
         let maxTitleW = candidates.reduce(CGFloat(0)) { acc, item in
             max(acc, ceil((item as NSString).size(withAttributes: [.font: drawFont]).width))
         }
-        // DesignPopUpCell draws text at x = minX + 10 with chevron centered at maxX - 13 (non-text zone = 32pt for regular, 30pt for small).
-        // Adding 4pt breathing buffer (chrome = 36pt regular, 34pt small) guarantees 0% truncation on the longest option and zero excess bloat.
-        let chrome: CGFloat = isSmall ? 34 : 36
-        let floorWidth: CGFloat = minimum ?? (isSmall ? 78 : 84)
+        let hasSymbol = ((popup.cell as? DesignPopUpCell)?.leadingSymbolName?.isEmpty == false)
+        let iconExtra: CGFloat = hasSymbol ? 18 : 0
+        // DesignPopUpCell draws text at x = minX + 10 (+ iconExtra) with chevron centered at maxX - 13.
+        let chrome: CGFloat = (isSmall ? 34 : 38) + iconExtra
+        let floorWidth: CGFloat = minimum ?? (isSmall ? 78 : 88)
         let raw = max(floorWidth, maxTitleW + chrome)
         return popup.pullsDown ? min(150, raw) : raw
     }
@@ -302,20 +303,35 @@ enum Design {
     static func applyControls(_ view: NSView) {
         if let popup = view as? NSPopUpButton {
             let origControlSize = popup.controlSize
+            let prevSymbol = (popup.cell as? DesignPopUpCell)?.leadingSymbolName
             if !(popup.cell is DesignPopUpCell) {
                 let menu = popup.menu, selected = popup.indexOfSelectedItem, target = popup.target, action = popup.action, enabled = popup.isEnabled
                 let cell = DesignPopUpCell(textCell: "", pullsDown: popup.pullsDown)
                 cell.controlSize = origControlSize
+                cell.leadingSymbolName = prevSymbol
                 cell.menu = menu; popup.cell = cell; popup.selectItem(at: max(0, selected)); popup.target = target; popup.action = action; popup.isEnabled = enabled
                 popup.controlSize = origControlSize
                 popup.invalidateIntrinsicContentSize()
             } else if let cell = popup.cell as? DesignPopUpCell {
                 cell.controlSize = origControlSize
             }
+            if !popup.subviews.contains(where: { $0 is DesignPopUpHoverOverlay }) {
+                let overlay = DesignPopUpHoverOverlay()
+                overlay.translatesAutoresizingMaskIntoConstraints = false
+                popup.addSubview(overlay)
+                NSLayoutConstraint.activate([
+                    overlay.leadingAnchor.constraint(equalTo: popup.leadingAnchor),
+                    overlay.trailingAnchor.constraint(equalTo: popup.trailingAnchor),
+                    overlay.topAnchor.constraint(equalTo: popup.topAnchor),
+                    overlay.bottomAnchor.constraint(equalTo: popup.bottomAnchor)
+                ])
+            }
             let isSmall = origControlSize == .small
-            popup.font = .systemFont(ofSize: isSmall ? 11 : 12, weight: .medium); popup.isBordered = false
+            popup.font = .systemFont(ofSize: isSmall ? 11.5 : 12, weight: .medium); popup.isBordered = false
             popup.translatesAutoresizingMaskIntoConstraints = false
-            if !popup.constraints.contains(where: { $0.identifier == "design-control-height" }) {
+            if let existingH = popup.constraints.first(where: { $0.identifier == "design-control-height" }) {
+                existingH.constant = isSmall ? 26 : 28
+            } else {
                 let height = popup.heightAnchor.constraint(equalToConstant: isSmall ? 26 : 28); height.identifier = "design-control-height"; height.isActive = true
             }
             syncPopUpWidth(popup)

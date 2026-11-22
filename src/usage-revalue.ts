@@ -14,6 +14,25 @@ function feesDigest(db: DatabaseSync): string {
     return hash.digest('hex');
 }
 function revision(db: DatabaseSync): number { return Number(db.prepare('SELECT COALESCE(MAX(seq),0) AS n FROM event_revisions').get()?.n); }
+export function writeRateLocksJsonMirror(db: DatabaseSync, ratesPath: string): void {
+    const profiles: unknown[] = [];
+    const profileMap = new Map<string, number>();
+    const entries: Record<string, { usd: number; p: number }> = Object.create(null);
+    for (const row of db.prepare('SELECT event_key, unit_price, usd FROM rate_locks ORDER BY event_key').iterate() as Iterable<any>) {
+        const unitRaw = String(row.unit_price);
+        let idx = profileMap.get(unitRaw);
+        if (idx === undefined) {
+            idx = profiles.length;
+            profileMap.set(unitRaw, idx);
+            profiles.push(JSON.parse(unitRaw));
+        }
+        entries[String(row.event_key)] = { usd: Number(row.usd), p: idx };
+    }
+    const tmpRates = `${ratesPath}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmpRates, JSON.stringify({ version: 1, profiles, entries }) + '\n', { mode: 0o600 });
+    chmodSync(tmpRates, 0o600);
+    renameSync(tmpRates, ratesPath);
+}
 export function revalueLedger(db: DatabaseSync, path: string, options: AggregateOptions & {
     action: 'preview' | 'apply' | 'restore';
     mode?: 'force_all' | 'unpriced_only';
@@ -215,22 +234,7 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
             unlinkSync(ratesPath);
         }
     } else if (existsSync(ratesPath)) {
-        const profiles: unknown[] = [];
-        const profileMap = new Map<string, number>();
-        const entries: Record<string, { usd: number; p: number }> = Object.create(null);
-        for (const row of db.prepare('SELECT event_key, unit_price, usd FROM rate_locks').iterate() as Iterable<any>) {
-            const unitRaw = String(row.unit_price);
-            let idx = profileMap.get(unitRaw);
-            if (idx === undefined) {
-                idx = profiles.length;
-                profileMap.set(unitRaw, idx);
-                profiles.push(JSON.parse(unitRaw));
-            }
-            entries[String(row.event_key)] = { usd: Number(row.usd), p: idx };
-        }
-        const tmpRates = `${ratesPath}.${process.pid}.${randomUUID()}.tmp`;
-        writeFileSync(tmpRates, JSON.stringify({ version: 1, profiles, entries }) + '\n', { mode: 0o600 });
-        renameSync(tmpRates, ratesPath);
+        writeRateLocksJsonMirror(db, ratesPath);
     }
     writeFileSync(receiptPath, JSON.stringify({ ...receipt, phase: options.action === 'restore' ? 'restored' : 'applied', appliedFeesDigest: feesDigest(db), completedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
     return { before: receipt.before, after: options.action === 'restore' ? receipt.before : receipt.after, previewId: receipt.previewId, backupPath: receipt.backup,

@@ -38,7 +38,13 @@ extension CachePage {
         activePopoverKind = kind
         syncPopoverActiveStates()
 
-        if let hostWindow = anchor.window,
+        #if NATIVE_UI_TEST
+        let allowPopoverDisplay = !Assistant.headlessOffscreenUI
+        #else
+        let allowPopoverDisplay = true
+        #endif
+        if allowPopoverDisplay,
+           let hostWindow = anchor.window,
            hostWindow.isVisible,
            anchor.bounds.width > 0,
            anchor.bounds.height > 0 {

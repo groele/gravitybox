@@ -6,9 +6,13 @@ import { join, dirname } from 'node:path';
 import type { LedgerEvent } from './usage-ledger.js';
 import { aggregateLedger, ledgerEventPage } from './usage-aggregate.js';
 import { revalueLedger } from './usage-revalue.js';
-import { resetAndRegisterRemoteModelMetadata } from './model-catalog.js';
+import {
+    registerObservedIdeModels,
+    resetAndRegisterRemoteModelMetadata,
+    type ObservedIdeModelEntry,
+} from './model-catalog.js';
 import { PRICING_METADATA } from './pricing.js';
-import { compareDatedFeedVersion } from './usage-pricing.js';
+import { compareFeedFreshness } from './usage-pricing.js';
 import { bt, setActiveLocale } from './i18n.js';
 import { isOwnedByCurrentUser } from './platform.js';
 export function validLedgerEvent(event: unknown): event is LedgerEvent {
@@ -56,6 +60,86 @@ let cachedWorkerRemoteMeta: {
     mtimeMs: number;
 } | null = null;
 
+let cachedWorkerObservedIdeModels: {
+    path: string;
+    dev: number;
+    ino: number;
+    size: number;
+    mtimeMs: number;
+} | null = null;
+
+function syncWorkerObservedIdeModels(ledgerPath: string): void {
+    const ideModelsPath = join(dirname(ledgerPath), 'live-ide-models.json');
+    if (!existsSync(ideModelsPath)) {
+        return;
+    }
+    try {
+        regular(ideModelsPath);
+        const stat = lstatSync(ideModelsPath);
+        if (stat.size > 2 * 1024 * 1024) return;
+        if (
+            cachedWorkerObservedIdeModels &&
+            cachedWorkerObservedIdeModels.path === ideModelsPath &&
+            cachedWorkerObservedIdeModels.dev === stat.dev &&
+            cachedWorkerObservedIdeModels.ino === stat.ino &&
+            cachedWorkerObservedIdeModels.size === stat.size &&
+            cachedWorkerObservedIdeModels.mtimeMs === stat.mtimeMs
+        ) {
+            return;
+        }
+        const parsed = JSON.parse(readFileSync(ideModelsPath, 'utf8'));
+        if (!parsed || typeof parsed !== 'object' || (parsed.schema !== 1 && parsed.schema !== 2) || !Array.isArray(parsed.models)) {
+            return;
+        }
+        const entries: ObservedIdeModelEntry[] = [];
+        for (const raw of parsed.models.slice(0, 256)) {
+            if (!raw || typeof raw !== 'object') continue;
+            const m = raw as Record<string, unknown>;
+            const modelId = typeof m.id === 'string'
+                ? m.id.trim()
+                : (typeof m.model_id === 'string' ? m.model_id.trim() : '');
+            const modelOrAlias = typeof m.modelOrAlias === 'string' && m.modelOrAlias.trim()
+                ? m.modelOrAlias.trim()
+                : (typeof m.model_or_alias === 'string' && m.model_or_alias.trim() ? m.model_or_alias.trim() : null);
+            if (!modelId && !modelOrAlias) continue;
+            const displayName = typeof m.displayName === 'string' && m.displayName.trim()
+                ? m.displayName.trim()
+                : (typeof m.display_name === 'string' && m.display_name.trim() ? m.display_name.trim() : null);
+            const rawMaxTokens = m.maxTokens ?? m.max_tokens;
+            const rawMaxOut = m.maxOutputTokens ?? m.max_output_tokens;
+            const rawProvider = m.modelProvider ?? m.model_provider;
+            const rawIsInternal = m.isInternal ?? m.is_internal;
+            const rawDeprecated = m.deprecated;
+            const rawNonChat = m.nonChatSpecialized ?? m.non_chat_specialized;
+            const rawInSelector = m.inModelSelector ?? m.in_model_selector;
+            entries.push({
+                modelId: modelId || modelOrAlias!,
+                displayName,
+                modelOrAlias,
+                ...(typeof rawMaxTokens === 'number' && Number.isFinite(rawMaxTokens) ? { maxTokens: Math.trunc(rawMaxTokens) } : {}),
+                ...(typeof rawMaxOut === 'number' && Number.isFinite(rawMaxOut) ? { maxOutputTokens: Math.trunc(rawMaxOut) } : {}),
+                ...(typeof rawProvider === 'string' && rawProvider.trim() ? { modelProvider: rawProvider.trim() } : {}),
+                ...(typeof rawIsInternal === 'boolean' ? { isInternal: rawIsInternal } : {}),
+                ...(typeof rawDeprecated === 'boolean' ? { deprecated: rawDeprecated } : {}),
+                ...(typeof rawNonChat === 'boolean' ? { nonChatSpecialized: rawNonChat } : {}),
+                ...(typeof rawInSelector === 'boolean' || rawInSelector === null ? { inModelSelector: rawInSelector } : {}),
+            });
+        }
+        if (entries.length > 0) {
+            registerObservedIdeModels(entries);
+        }
+        cachedWorkerObservedIdeModels = {
+            path: ideModelsPath,
+            dev: stat.dev,
+            ino: stat.ino,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs,
+        };
+    } catch {
+        // live-ide-models.json 可读性异常时降级保留已有元数据
+    }
+}
+
 function syncWorkerRemoteMetadata(ledgerPath: string): void {
     const remotePath = join(dirname(ledgerPath), 'remote_pricing.json');
     if (!existsSync(remotePath)) {
@@ -81,9 +165,18 @@ function syncWorkerRemoteMetadata(ledgerPath: string): void {
         }
         const parsed = JSON.parse(readFileSync(remotePath, 'utf8'));
         const remoteVer = typeof parsed?.feedVersion === 'string' ? parsed.feedVersion.trim() : '';
-        const verCmp = compareDatedFeedVersion(remoteVer, PRICING_METADATA.version);
+        const remoteUpdatedAt = typeof parsed?.feedUpdatedAt === 'string'
+          ? parsed.feedUpdatedAt.trim()
+          : (typeof parsed?.updatedAt === 'string' ? parsed.updatedAt.trim() : '');
+        const verCmp = compareFeedFreshness(
+          { version: remoteVer, updatedAt: remoteUpdatedAt },
+          { version: PRICING_METADATA.version, updatedAt: PRICING_METADATA.updatedAt }
+        );
         const isOlderDatedFeed = verCmp !== null && verCmp < 0;
-        resetAndRegisterRemoteModelMetadata(parsed, { onlyNewEntries: isOlderDatedFeed });
+        resetAndRegisterRemoteModelMetadata(parsed, {
+          onlyNewEntries: isOlderDatedFeed,
+          authoritativeSnapshot: !isOlderDatedFeed,
+        });
         cachedWorkerRemoteMeta = {
             path: remotePath,
             dev: stat.dev,
@@ -402,6 +495,7 @@ function runRequest(payload: {
     }
     const { path, legacyPath, operation, events, options } = payload;
     syncWorkerRemoteMetadata(path);
+    syncWorkerObservedIdeModels(path);
     const result = new Map<string, LedgerEvent>();
     // Validate before opening a writable database. Never overwrite or "repair" a damaged baseline.
     const legacyEvents = readValidatedLegacyEvents(legacyPath);

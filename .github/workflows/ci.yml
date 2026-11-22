@@ -68,8 +68,8 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
-      - name: Build TypeScript & Runtime
-        run: npm run build
+      - name: Native UI Harness Typecheck
+        run: node tools/native-build.mjs --typecheck --ui-test
 
       - name: Run Windows Core Tests
         shell: pwsh

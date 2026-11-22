@@ -330,4 +330,111 @@ describeContractGroup("连接与控制 · debug-port-missing", { concurrency: fa
       await rm(profileDir, { recursive: true, force: true });
     }
   });
+
+  test('hasRunningAgentTask 返回 checked 标记，仅认准真实生成/流式信号并排除弹窗 Cancel、后台行 Stop 与残留 codicon-loading', async () => {
+    const ctrl = new Controller({
+      appPath: '/Applications/Antigravity.app',
+      profile: '/tmp/unused',
+      dictionary: dictionaryFromEntries({ Settings: '设置' }),
+      hudEnabled: false,
+      onStatus: () => {},
+    });
+    // 无已连接页面时返回 { busy: false, checked: false }
+    const noPageRes = await ctrl.hasRunningAgentTask();
+    assert.deepEqual(noPageRes, { busy: false, checked: false });
+
+    let evaluatedExpr = '';
+    ctrl.pages.set('mock-page', {
+      targetId: 'mock-page',
+      contextId: 1,
+      cdp: {
+        evaluate: async (expr) => {
+          evaluatedExpr = expr;
+          return { busy: false, checked: true };
+        },
+      },
+    });
+    const idleRes = await ctrl.hasRunningAgentTask();
+    assert.deepEqual(idleRes, { busy: false, checked: true });
+    assert.equal(evaluatedExpr.includes('.codicon-loading'), false, '不得再将历史残留 .codicon-loading 判为运行中');
+    assert.equal(evaluatedExpr.includes('input-cancel-button'), true, '必须认准输入框取消按钮 input-cancel-button');
+    assert.equal(evaluatedExpr.includes('running-row'), true, '必须排除后台任务行 running-row 中的普通 Stop 按钮');
+  });
+
+  test('自适应全量翻译在词典 reload(update) 变更版本号后仍保持全量翻译而不降级为保守模式', async () => {
+    const entries = {};
+    for (let i = 1; i <= 15; i += 1) entries[`Label ${i}`] = `标签 ${i}`;
+    const bundleSource = Array.from({ length: 15 }, (_, i) => `React.createElement("button", null, "Label ${i + 1}")`).join(';\n');
+
+    const ctrl = new Controller({
+      appPath: '/Applications/Antigravity.app',
+      profile: '/tmp/unused',
+      dictionary: { version: 'dict-v1', entries },
+      hudEnabled: false,
+      onStatus: () => {},
+    });
+    ctrl.verifiedBundle = () => false;
+    ctrl.refreshRegistration = async () => {};
+    let dictVersion = 'dict-v1';
+    let lastBootSource = '';
+    let updateCalls = 0;
+    const mockSession = {
+      targetId: 'page-1',
+      url: 'https://127.0.0.1:9000/c/_new',
+      contextId: 42,
+      domContractPassed: true,
+      bootedConservative: false,
+      bundleSha256: 'adaptive-sha-1',
+      updateChain: Promise.resolve(),
+      cdp: {
+        evaluate: async (expr) => {
+          if (typeof expr === 'string') {
+            if (expr.includes('document.querySelector')) return true;
+            if (expr.includes('__GRAVITYBOX_ENGINE_V1__?.state()')) {
+              return { active: true, runtimeId: ctrl.runtimeId, version: dictVersion, languageMode: 'zh' };
+            }
+            if (expr.includes('__GRAVITYBOX_ENGINE_V1__.update(')) {
+              updateCalls += 1;
+              dictVersion = 'dict-v2';
+            }
+            if (expr.includes('__GRAVITYBOX_BOOT__')) {
+              lastBootSource = expr;
+            }
+          }
+          return undefined;
+        },
+        send: async (method, params) => {
+          if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'f1', url: 'https://127.0.0.1:9000/c/_new' } } };
+          if (method === 'Page.createIsolatedWorld') return { executionContextId: 42 };
+          if (method === 'Runtime.evaluate' && typeof params?.expression === 'string') {
+            const expr = params.expression;
+            if (expr.includes('__GRAVITYBOX_ENGINE_V1__?.state()')) {
+              return { result: { value: { active: true, runtimeId: ctrl.runtimeId, version: dictVersion, languageMode: 'zh' } } };
+            }
+            if (expr.includes('__GRAVITYBOX_ENGINE_V1__.update(')) {
+              updateCalls += 1;
+              dictVersion = 'dict-v2';
+            }
+            if (expr.includes('__GRAVITYBOX_BOOT__')) {
+              lastBootSource = expr;
+            }
+          }
+          return { result: { value: undefined } };
+        },
+      },
+    };
+    ctrl.pages.set('page-1', mockSession);
+
+    await ctrl.inspectBundleInBackground('https://127.0.0.1:9000', '2.34.0', bundleSource);
+    const actualSha = ctrl.status.bundleSha256;
+    mockSession.bundleSha256 = actualSha;
+    assert.equal(ctrl.shouldUseFullTranslation(mockSession), true, '首次自适应分析应开启全量翻译');
+
+    await ctrl.update({ version: 'dict-v2', entries: { ...entries, 'Label Extra': '额外标签' } });
+    assert.equal(ctrl.shouldUseFullTranslation(mockSession), true, '词典重载升级版本号后必须继续保持全量翻译');
+    assert.equal(mockSession.bootedConservative, false, '重载后不得降级为 conservative 模式');
+    assert.equal(updateCalls, 1, '保持全量翻译时应热更新词典而非销毁重建为保守模式');
+    assert.equal(lastBootSource, '', '未切换保守模式时不应触发重引导降级');
+  });
 });
+

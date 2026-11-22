@@ -10,21 +10,142 @@ enum QuotaPresentation {
     static var staleResetText: String {
         L10n.t("quota.stale_data", fallback: "数据已过期")
     }
-    private static let extraStandaloneGeminiRegex = try? NSRegularExpression(
-        pattern: "^gemini-[4-9](?:\\.[0-9]+)?-([a-z][a-z0-9]*?)(?:-(?:trial|preview|exp|disabled))?$",
+    static var overdueResetText: String {
+        L10n.t("quota.countdown.overdue", fallback: L10n.shared.isEnglish ? "Reset overdue" : "重置时间已过")
+    }
+    private static let isoFormatterWithFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoFormatterStandard: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    static func parseResetDate(_ raw: String?) -> Date? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let d = isoFormatterWithFractional.date(from: trimmed) ?? isoFormatterStandard.date(from: trimmed) {
+            return d
+        }
+        if let ts = Double(trimmed), ts.isFinite, ts > 0 {
+            return Date(timeIntervalSince1970: ts < 1e11 ? ts : ts / 1000.0)
+        }
+        return nil
+    }
+    static func formatLocalCountdown(to resetDate: Date, now: Date = Date()) -> String {
+        let diff = resetDate.timeIntervalSince(now)
+        if diff <= 0 {
+            return overdueResetText
+        }
+        if diff <= 60 {
+            return L10n.t("quota.countdown.soon", fallback: L10n.shared.isEnglish ? "Resetting soon" : "即将重置")
+        }
+        let totalMin = Int(floor(diff / 60.0))
+        let days = totalMin / (24 * 60)
+        let hours = (totalMin % (24 * 60)) / 60
+        let mins = totalMin % 60
+        if days > 0 {
+            return L10n.t(
+                "quota.countdown.days_hours",
+                ["days": days, "hours": hours],
+                fallback: L10n.shared.isEnglish ? "Resets in \(days)d \(hours)h" : "\(days)天 \(hours)小时后重置"
+            )
+        }
+        if hours > 0 {
+            return L10n.t(
+                "quota.countdown.hours_mins",
+                ["hours": hours, "mins": mins],
+                fallback: L10n.shared.isEnglish ? "Resets in \(hours)h \(mins)m" : "\(hours)小时 \(mins)分后重置"
+            )
+        }
+        return L10n.t(
+            "quota.countdown.mins",
+            ["mins": mins],
+            fallback: L10n.shared.isEnglish ? "Resets in \(mins)m" : "\(mins)分钟后重置"
+        )
+    }
+    private static let orchestratorDisplayRegex = try? NSRegularExpression(
+        pattern: "^orchestrator(?:[-_].+|\\s*\\([^)]*\\)|\\s+.+)?$",
         options: [.caseInsensitive]
     )
+    private static let geminiVersionedNameRegex = try? NSRegularExpression(
+        pattern: "^gemini\\s+[0-9]+(?:\\.[0-9]+)?\\s+(.+)$",
+        options: [.caseInsensitive]
+    )
+    private static let groupMemberListRegex = try? NSRegularExpression(
+        pattern: "models?\\s+(?:within|in)\\s+this\\s+group\\s*:\\s*([^\\n\\r]+)",
+        options: [.caseInsensitive]
+    )
+    private static let genericGeminiTierTokens: Set<String> = [
+        "pro", "flash", "ultra", "nano", "lite", "default", "exp", "preview", "trial"
+    ]
+
+    /// Recognizes Antigravity orchestrator meta-models (e.g. `gemini-pro-coordinator`,
+    /// `gemini-pro-orchestrator`, `gemini-pro-orchestrator-*`, `Orchestrator (Neon)`).
+    /// These are composite agent modes, never independent quota pools.
+    static func isOrchestratorMetaModel(id: String? = nil, displayName: String? = nil) -> Bool {
+        if let rawId = id?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !rawId.isEmpty {
+            if rawId == "gemini-pro-coordinator"
+                || rawId == "gemini-pro-orchestrator"
+                || rawId.hasPrefix("gemini-pro-orchestrator-") {
+                return true
+            }
+            if let regex = orchestratorDisplayRegex,
+               regex.firstMatch(in: rawId, range: NSRange(location: 0, length: (rawId as NSString).length)) != nil {
+                return true
+            }
+        }
+        if let rawDisplay = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !rawDisplay.isEmpty {
+            if let regex = orchestratorDisplayRegex,
+               regex.firstMatch(in: rawDisplay, range: NSRange(location: 0, length: (rawDisplay as NSString).length)) != nil {
+                return true
+            }
+        }
+        return false
+    }
 
     struct Window {
         var percentage: Int?
         var known: Bool
         var stale: Bool
         var resetCountdown: String
+        var resetTime: String? = nil
         var observedAt: Double?
         var source: String
         var unknownReason: String
+        var standbyMode: String? = nil
 
+        var resetDate: Date? { QuotaPresentation.parseResetDate(resetTime) }
+        func isResetOverdue(at now: Date = Date()) -> Bool {
+            if let resetDate, resetDate <= now { return true }
+            let trimmed = resetCountdown.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed == "重置时间已过" || trimmed == "已过" || trimmed.localizedCaseInsensitiveContains("overdue")
+        }
         var staleText: String { staleResetText }
+        func effectiveResetText(at now: Date = Date(), standbyMode: String? = nil, compact: Bool = false) -> String {
+            guard known else { return "" }
+            let resolvedMode = standbyMode ?? self.standbyMode
+            if resolvedMode == "snapshot_cooling" || resolvedMode == "snapshot_cooldown_elapsed" {
+                if isResetOverdue(at: now) {
+                    return compact
+                        ? L10n.t("accounts.standby.likely_reset", fallback: L10n.shared.isEnglish ? "Likely reset" : "预计已重置")
+                        : L10n.t("accounts.standby.likely_reset_sync", fallback: L10n.shared.isEnglish ? "Likely reset · Syncs on switch" : "预计已重置 · 切换后更新")
+                }
+                if let resetDate {
+                    return QuotaPresentation.formatLocalCountdown(to: resetDate, now: now)
+                }
+                return resetCountdown
+            }
+            let isStale = stale || (resetDate.map { $0 <= now } ?? false)
+            let countdown = resetDate.map { QuotaPresentation.formatLocalCountdown(to: $0, now: now) } ?? resetCountdown
+            if isStale {
+                return countdown.isEmpty ? staleResetText : "\(countdown) · \(staleResetText)"
+            }
+            return countdown
+        }
         var resetText: String {
             if known && stale { return resetCountdown.isEmpty ? staleResetText : "\(resetCountdown) · \(staleResetText)" }
             if known { return resetCountdown }
@@ -47,9 +168,49 @@ enum QuotaPresentation {
         var remaining: Double?
         var stale: Bool
         var resetCountdown: String
+        var resetTime: String? = nil
         var observedAt: Double?
         var source: String
         var unknownReason: String = ""
+        var standbyMode: String? = nil
+
+        var resetDate: Date? { QuotaPresentation.parseResetDate(resetTime) }
+        func isResetOverdue(at now: Date = Date()) -> Bool {
+            if let resetDate, resetDate <= now { return true }
+            let trimmed = resetCountdown.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed == "重置时间已过" || trimmed == "已过" || trimmed.localizedCaseInsensitiveContains("overdue")
+        }
+        func effectiveStale(at now: Date = Date()) -> Bool {
+            if stale { return true }
+            if let resetDate, resetDate <= now { return true }
+            return false
+        }
+        func effectiveResetText(at now: Date = Date(), standbyMode: String? = nil, compact: Bool = false) -> String {
+            guard percentage != nil else { return "" }
+            let resolvedMode = standbyMode ?? self.standbyMode
+            if resolvedMode == "snapshot_cooling" || resolvedMode == "snapshot_cooldown_elapsed" {
+                if isResetOverdue(at: now) {
+                    return compact
+                        ? L10n.t("accounts.standby.likely_reset", fallback: L10n.shared.isEnglish ? "Likely reset" : "预计已重置")
+                        : L10n.t("accounts.standby.likely_reset_sync", fallback: L10n.shared.isEnglish ? "Likely reset · Syncs on switch" : "预计已重置 · 切换后更新")
+                }
+                if let resetDate {
+                    return QuotaPresentation.formatLocalCountdown(to: resetDate, now: now)
+                }
+                return resetCountdown
+            }
+            let isStale = effectiveStale(at: now)
+            let countdown: String
+            if let resetDate {
+                countdown = QuotaPresentation.formatLocalCountdown(to: resetDate, now: now)
+            } else {
+                countdown = resetCountdown
+            }
+            if isStale {
+                return countdown.isEmpty ? staleResetText : "\(countdown) · \(staleResetText)"
+            }
+            return countdown
+        }
 
         var percentage: Int? {
             guard known, let remaining, remaining.isFinite else { return nil }
@@ -89,6 +250,7 @@ enum QuotaPresentation {
                 known: percentage != nil,
                 stale: stale,
                 resetCountdown: resetCountdown,
+                resetTime: resetTime,
                 observedAt: observedAt,
                 source: source,
                 unknownReason: unknownReason.isEmpty ? L10n.t("quota.unknown_reason.api_no_value", fallback: "接口未返回可用数值") : unknownReason
@@ -99,6 +261,7 @@ enum QuotaPresentation {
     struct QuotaGroup {
         var key: String
         var displayName: String
+        var description: String = ""
         var summaryLabel: String
         var brands: [String]
         var isStandalone: Bool
@@ -106,6 +269,7 @@ enum QuotaPresentation {
         var quotaState: String
         var windows: [GroupWindow]
         var message: String
+        var standbyMode: String? = nil
 
         var primaryWindow: GroupWindow? {
             windows.first(where: { $0.percentage != nil && !$0.stale })
@@ -123,9 +287,9 @@ enum QuotaPresentation {
             if !isStandalone {
                 return "\(name) · \(window.localizedLabel)"
             }
-            if window.percentage != nil || quotaState == "known" || quotaState == "stale" {
-                switch window.period {
-                case "weekly", "5h", "daily":
+            if windows.count > 1 || window.percentage != nil || quotaState == "known" || quotaState == "stale" {
+                switch window.period.lowercased() {
+                case "weekly", "5h", "fivehour", "daily", "24h", "day":
                     return L10n.t("quota.model_with_period", ["model": name, "period": window.localizedLabel], fallback: "\(name) · \(window.localizedLabel)")
                 default:
                     return name
@@ -137,6 +301,7 @@ enum QuotaPresentation {
         func iconName(for window: GroupWindow) -> String {
             if isStandalone { return "sparkles" }
             if window.period == "weekly" || window.id == "weekly" { return "calendar" }
+            if window.period == "daily" || window.id == "daily" { return "clock" }
             if key == "claude" { return "cpu" }
             return "bolt.fill"
         }
@@ -147,9 +312,10 @@ enum QuotaPresentation {
         var modelName: String = "Gemini 4 Argon"
         var availability: String   // available | disabled | unknown
         var quotaState: String     // known | not_reported | stale
-        var period: String?        // 5h | weekly | unspecified | nil
+        var period: String?        // 5h | daily | weekly | unspecified | nil
         var remaining: Double?     // fraction 0...1
         var resetCountdown: String
+        var resetTime: String? = nil
         var message: String
         var observedAt: Double?
         var source: String?
@@ -245,6 +411,7 @@ enum QuotaPresentation {
         var quotaWarningCodes: [String] = []
         var refreshComplete: Bool?
         var refreshMessage = ""
+        var standbyMode: String? = nil
         var geminiPrimary: PrimaryWindow { primaryWindow(gemini5h, model: geminiModel) }
         var claudePrimary: PrimaryWindow { primaryWindow(claude5h, model: claudeModel) }
         var displayGroups: [QuotaGroup] {
@@ -259,6 +426,25 @@ enum QuotaPresentation {
         /// Extra standalone models beyond Argon and Carbon (automatically detected new models/groups)
         var extraStandaloneModels: [Argon] {
             standaloneModels.filter { $0.key != "argon" && $0.key != "carbon" }
+        }
+        func overdueResetSignature(at now: Date = Date()) -> String {
+            var parts: [String] = []
+            for grp in displayGroups {
+                for win in grp.windows where win.known && win.isResetOverdue(at: now) {
+                    parts.append("\(grp.key):\(win.period):\(win.resetTime ?? win.resetCountdown)")
+                }
+            }
+            if parts.isEmpty {
+                for (name, win) in [("g5h", gemini5h), ("gw", geminiWeekly), ("c5h", claude5h), ("cw", claudeWeekly)] {
+                    if let win, win.known && win.isResetOverdue(at: now) {
+                        parts.append("\(name):\(win.resetTime ?? win.resetCountdown)")
+                    }
+                }
+            }
+            return parts.joined(separator: "|")
+        }
+        func hasOverdueKnownWindow(at now: Date = Date()) -> Bool {
+            !overdueResetSignature(at: now).isEmpty
         }
     }
 
@@ -324,7 +510,7 @@ enum QuotaPresentation {
             return L10n.t("common.period.5h", fallback: "5 小时")
         case "weekly":
             return L10n.t("common.period.weekly", fallback: "每周")
-        case "daily":
+        case "daily", "day", "24h":
             return L10n.t("common.period.daily", fallback: L10n.shared.isEnglish ? "Daily" : "每日")
         case "unspecified":
             return L10n.t("quota.model_quota", fallback: "模型配额")
@@ -350,7 +536,7 @@ enum QuotaPresentation {
     static func inferredBrands(for title: String) -> [String] {
         let lower = title.lowercased()
         if lower.contains("claude") && (lower.contains("gpt") || lower.contains("openai")) { return ["claude", "openai"] }
-        if lower.contains("gemini") || lower.contains("orchestrator") || lower.contains("argon") || lower.contains("carbon") { return ["gemini"] }
+        if lower.contains("gemini") || lower.contains("orchestrator") || lower.contains("argon") || lower.contains("carbon") || lower.contains("neon") || lower.contains("hydrogen") { return ["gemini"] }
         if lower.contains("claude") { return ["claude"] }
         if lower.contains("gpt") || lower.contains("openai") { return ["openai"] }
         return []
@@ -397,11 +583,13 @@ enum QuotaPresentation {
         let remaining = fraction(raw["remaining"])
         let stale = boolValue(raw["stale"]) ?? false
         let countdown = text(raw["resetCountdown"])
+        let resetTime = text(raw["resetTime"])
         let observed = number(raw["observedAt"])
         let source = text(raw["source"])
         let percentage = knownFlag ? percent(remaining) : nil
         return Window(percentage: percentage, known: knownFlag && percentage != nil,
-                      stale: stale, resetCountdown: countdown, observedAt: observed, source: source,
+                      stale: stale, resetCountdown: countdown, resetTime: resetTime.isEmpty ? nil : resetTime,
+                      observedAt: observed, source: source,
                       unknownReason: knownFlag ? L10n.t("quota.unknown_reason.api_no_value", fallback: "接口未返回可用数值") : unknownReason)
     }
 
@@ -413,6 +601,7 @@ enum QuotaPresentation {
         let remaining = fraction(raw["remaining"])
         let stale = boolValue(raw["stale"]) ?? false
         let countdown = text(raw["resetCountdown"])
+        let resetTime = text(raw["resetTime"])
         let observed = number(raw["observedAt"])
         let source = text(raw["source"])
         let validKnown = knownFlag && remaining != nil
@@ -424,6 +613,7 @@ enum QuotaPresentation {
             remaining: validKnown ? remaining : nil,
             stale: stale,
             resetCountdown: countdown,
+            resetTime: resetTime.isEmpty ? nil : resetTime,
             observedAt: observed,
             source: source,
             unknownReason: validKnown ? "" : L10n.t("quota.unknown_reason.api_no_value", fallback: "接口未返回可用数值")
@@ -452,6 +642,9 @@ enum QuotaPresentation {
         let rawSummary = text(raw["summaryLabel"])
         let summaryLabel = rawSummary.isEmpty ? shortSummaryLabel(key: resolvedKey, displayName: displayName) : rawSummary
         let isStandalone = boolValue(raw["isStandalone"]) ?? (resolvedKey != "gemini" && resolvedKey != "claude")
+        if isStandalone && (isOrchestratorMetaModel(id: resolvedKey, displayName: displayName) || isOrchestratorMetaModel(id: key, displayName: rawDisplay)) {
+            return nil
+        }
         let availability = text(raw["availability"]).isEmpty ? "available" : text(raw["availability"])
         let quotaState = text(raw["quotaState"]).isEmpty ? "not_reported" : text(raw["quotaState"])
         let rawBrands = raw["brands"] as? [String] ?? []
@@ -461,6 +654,7 @@ enum QuotaPresentation {
         return QuotaGroup(
             key: resolvedKey,
             displayName: displayName,
+            description: text(raw["description"]),
             summaryLabel: summaryLabel,
             brands: brands,
             isStandalone: isStandalone,
@@ -488,9 +682,12 @@ enum QuotaPresentation {
         let availability = text(raw["availability"]).isEmpty ? "unknown" : text(raw["availability"])
         let remaining = fraction(raw["remaining"])
         let state = text(raw["quotaState"]).isEmpty ? (remaining != nil ? "known" : "not_reported") : text(raw["quotaState"])
+        let resetTime = text(raw["resetTime"])
         return Argon(key: key, modelName: resolvedName, availability: availability, quotaState: state,
                      period: raw["period"] as? String, remaining: remaining,
-                     resetCountdown: text(raw["resetCountdown"]), message: text(raw["message"]),
+                     resetCountdown: text(raw["resetCountdown"]),
+                     resetTime: resetTime.isEmpty ? nil : resetTime,
+                     message: text(raw["message"]),
                      observedAt: number(raw["observedAt"]), source: raw["source"] as? String,
                      mode: text(raw["mode"]), pooledInFamily: text(raw["pooledInFamily"]))
     }
@@ -509,6 +706,7 @@ enum QuotaPresentation {
             remaining: window?.percentage.map { Double($0) / 100.0 },
             stale: window?.stale == true,
             resetCountdown: window?.resetCountdown ?? "",
+            resetTime: window?.resetTime,
             observedAt: window?.observedAt,
             source: window?.source ?? "",
             unknownReason: window?.unknownReason ?? ""
@@ -555,6 +753,7 @@ enum QuotaPresentation {
             remaining: item.remaining,
             stale: item.stale,
             resetCountdown: item.resetCountdown,
+            resetTime: item.resetTime,
             observedAt: item.observedAt,
             source: item.source ?? "",
             unknownReason: item.message
@@ -576,6 +775,9 @@ enum QuotaPresentation {
     /// windows. Legacy sentinel `以周限额为准` explicitly means the 5-hour window was not returned.
     static func contract(_ raw: [String: Any]) -> Contract {
         var result = Contract()
+        let rawStandbyMode = text(dict(raw["standbyRefreshStatus"])?["mode"])
+        let standbyMode: String? = rawStandbyMode.isEmpty ? nil : rawStandbyMode
+        result.standbyMode = standbyMode
         let nested = dict(raw["quota"])
         let quotaGroupsRaw = (raw["quotaGroups"] as? [[String: Any]]) ?? nested.flatMap { $0["quotaGroups"] as? [[String: Any]] }
         let familyWindows = dict(raw["familyWindows"]) ?? nested.flatMap { dict($0["familyWindows"]) }
@@ -609,8 +811,11 @@ enum QuotaPresentation {
             result.argon = argon(argonRaw, defaultKey: "argon", defaultModelName: "Gemini 4 Argon")
         } else if !result.hasContract {
             let argonModels = rawModels.filter { m in
-                let name = (m["name"] as? String ?? (m["model_id"] as? String ?? "")).lowercased()
-                let display = (m["display_name"] as? String ?? "").lowercased()
+                let rawName = m["name"] as? String ?? (m["model_id"] as? String ?? "")
+                let rawDisplay = m["display_name"] as? String ?? ""
+                if isOrchestratorMetaModel(id: rawName, displayName: rawDisplay) { return false }
+                let name = rawName.lowercased()
+                let display = rawDisplay.lowercased()
                 return (m["is_argon"] as? Bool == true) || name.contains("argon") || display.contains("argon")
             }
             let allArgonDisabled = !argonModels.isEmpty && argonModels.allSatisfy { m in
@@ -638,8 +843,11 @@ enum QuotaPresentation {
             result.carbon = argon(carbonRaw, defaultKey: "carbon", defaultModelName: "Gemini 4 Carbon")
         } else if !result.hasContract {
             let carbonModels = rawModels.filter { m in
-                let name = (m["name"] as? String ?? (m["model_id"] as? String ?? "")).lowercased()
-                let display = (m["display_name"] as? String ?? "").lowercased()
+                let rawName = m["name"] as? String ?? (m["model_id"] as? String ?? "")
+                let rawDisplay = m["display_name"] as? String ?? ""
+                if isOrchestratorMetaModel(id: rawName, displayName: rawDisplay) { return false }
+                let name = rawName.lowercased()
+                let display = rawDisplay.lowercased()
                 return (m["is_carbon"] as? Bool == true) || name.contains("carbon") || display.contains("carbon")
             }
             let allCarbonDisabled = !carbonModels.isEmpty && carbonModels.allSatisfy { m in
@@ -679,8 +887,16 @@ enum QuotaPresentation {
         if let standaloneRaw, !standaloneRaw.isEmpty {
             result.standaloneModels = standaloneRaw.compactMap { item in
                 let k = text(item["key"]).isEmpty ? "other" : text(item["key"])
-                let name = text(item["displayName"]).isEmpty ? k : text(item["displayName"])
-                return argon(item, defaultKey: k, defaultModelName: name)
+                let rawDisplay = !text(item["displayName"]).isEmpty ? text(item["displayName"]) : text(item["modelName"])
+                let name = rawDisplay.isEmpty ? k : rawDisplay
+                if isOrchestratorMetaModel(id: k, displayName: name) {
+                    return nil
+                }
+                guard let parsed = argon(item, defaultKey: k, defaultModelName: name),
+                      !isOrchestratorMetaModel(id: parsed.key, displayName: parsed.modelName) else {
+                    return nil
+                }
+                return parsed
             }
             if let firstArgon = result.standaloneModels.first(where: { $0.key == "argon" }) {
                 result.argon = firstArgon
@@ -690,37 +906,8 @@ enum QuotaPresentation {
             }
         } else {
             var list: [Argon] = []
-            if let a = result.argon { list.append(a) }
-            if let c = result.carbon { list.append(c) }
-            // Auto-detect any extra standalone Gemini 4+ models from rawModels when standaloneModels array is absent
-            var seenKeys: Set<String> = ["argon", "carbon", "gemini-4-argon", "gemini-4-carbon"]
-            for m in rawModels {
-                let rawId = (m["model_id"] as? String ?? (m["name"] as? String ?? "")).lowercased()
-                let family = (m["family"] as? String ?? "").lowercased()
-                let isExtraGemini4: Bool = {
-                    guard let match = extraStandaloneGeminiRegex?.firstMatch(in: rawId, range: NSRange(location: 0, length: (rawId as NSString).length)) else { return false }
-                    let code = (rawId as NSString).substring(with: match.range(at: 1)).lowercased()
-                    return !["argon", "carbon", "hydrogen", "pro", "flash", "ultra", "nano", "lite", "default"].contains(code)
-                }()
-                guard family == "other" || isExtraGemini4 else { continue }
-                let baseKey = rawId.replacingOccurrences(of: "-(?:trial|preview|exp|disabled|tiered|latest)$", with: "", options: .regularExpression)
-                guard !baseKey.isEmpty, !seenKeys.contains(baseKey) else { continue }
-                seenKeys.insert(baseKey)
-                let title = (m["display_name"] as? String)?.replacingOccurrences(of: "\\s+(?:Trial|Preview|Exp)$", with: "", options: .regularExpression) ?? ModelDisplayName.name(baseKey)
-                let isDisabled = (m["disabled"] as? Bool == true) || rawId.contains("disabled")
-                let pct = (m["own_percentage"] as? Int) ?? ((m["percentage_known"] as? Bool == true) ? (m["percentage"] as? Int) : nil)
-                let cd = text(m["reset_countdown"])
-                if isDisabled {
-                    list.append(Argon(key: baseKey, modelName: title, availability: "disabled", quotaState: "not_reported", period: nil,
-                                      remaining: nil, resetCountdown: "", message: L10n.t("quota.standalone.no_permission", ["title": title], fallback: "当前账号无 \(title) 权限（不可用）"), observedAt: nil, source: "legacy"))
-                } else if let pct {
-                    list.append(Argon(key: baseKey, modelName: title, availability: "available", quotaState: "known", period: "unspecified",
-                                      remaining: Double(max(0, min(100, pct))) / 100.0, resetCountdown: cd, message: L10n.t("quota.standalone.acquired", ["title": title], fallback: "\(title) 配额已取得"), observedAt: nil, source: "legacy"))
-                } else {
-                    list.append(Argon(key: baseKey, modelName: title, availability: "available", quotaState: "not_reported", period: nil,
-                                      remaining: nil, resetCountdown: "", message: L10n.t("quota.standalone.available_no_value", ["title": title], fallback: "存在 \(title) 模型记录，但本轮未返回可用配额数值"), observedAt: nil, source: "legacy"))
-                }
-            }
+            if let a = result.argon, !isOrchestratorMetaModel(id: a.key, displayName: a.modelName) { list.append(a) }
+            if let c = result.carbon, !isOrchestratorMetaModel(id: c.key, displayName: c.modelName) { list.append(c) }
             result.standaloneModels = list
         }
 
@@ -793,6 +980,7 @@ enum QuotaPresentation {
                         period: w?.period,
                         remaining: w?.remaining,
                         resetCountdown: w?.resetCountdown ?? "",
+                        resetTime: w?.resetTime,
                         message: grp.message,
                         observedAt: w?.observedAt,
                         source: w?.source,
@@ -815,11 +1003,34 @@ enum QuotaPresentation {
             if let c = result.carbon, !candidates.contains(where: { $0.key == c.key }) { candidates.append(c) }
             for item in candidates {
                 let k = item.key.lowercased()
-                guard !k.isEmpty, !seenStandaloneKeys.contains(k), item.isDisplayableStandalone else { continue }
+                guard !k.isEmpty,
+                      !seenStandaloneKeys.contains(k),
+                      item.isDisplayableStandalone,
+                      !isOrchestratorMetaModel(id: item.key, displayName: item.modelName) else { continue }
                 seenStandaloneKeys.insert(k)
                 groups.append(makeStandaloneGroup(from: item))
             }
             result.synthesizedGroups = groups
+        }
+        if let standbyMode {
+            result.gemini5h?.standbyMode = standbyMode
+            result.geminiWeekly?.standbyMode = standbyMode
+            result.claude5h?.standbyMode = standbyMode
+            result.claudeWeekly?.standbyMode = standbyMode
+            result.geminiModel?.standbyMode = standbyMode
+            result.claudeModel?.standbyMode = standbyMode
+            for idx in result.quotaGroups.indices {
+                result.quotaGroups[idx].standbyMode = standbyMode
+                for wIdx in result.quotaGroups[idx].windows.indices {
+                    result.quotaGroups[idx].windows[wIdx].standbyMode = standbyMode
+                }
+            }
+            for idx in result.synthesizedGroups.indices {
+                result.synthesizedGroups[idx].standbyMode = standbyMode
+                for wIdx in result.synthesizedGroups[idx].windows.indices {
+                    result.synthesizedGroups[idx].windows[wIdx].standbyMode = standbyMode
+                }
+            }
         }
         return result
     }
@@ -1032,6 +1243,13 @@ enum QuotaPresentation {
         if let matched = choices.first(where: { $0.key.lowercased() == normLower || $0.title.lowercased() == normLower }) {
             return matched.key
         }
+        if let matchedByCodename = choices.first(where: {
+            let k = $0.key.lowercased()
+            let t = $0.title.lowercased()
+            return k == "gemini-4-\(normLower)" || normLower == "gemini-4-\(k)" || t == "gemini 4 \(normLower)"
+        }) {
+            return matchedByCodename.key
+        }
 
         if normLower == "gemini_all" || inferredBrands(for: normLower).contains("gemini") {
             if let activeAccount {
@@ -1058,6 +1276,124 @@ enum QuotaPresentation {
         return choices.first?.key ?? "all"
     }
 
+    private static func concisePooledGeminiLabel(from displayName: String) -> String? {
+        let cleaned = ModelDisplayName.name(displayName)
+            .replacingOccurrences(of: "\\s+(?:Trial|Preview|Exp)$", with: "", options: [.regularExpression, .caseInsensitive])
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".;,")))
+        guard !cleaned.isEmpty else { return nil }
+        guard !isOrchestratorMetaModel(id: cleaned, displayName: cleaned) else { return nil }
+        let ns = cleaned as NSString
+        if let match = geminiVersionedNameRegex?.firstMatch(in: cleaned, range: NSRange(location: 0, length: ns.length)) {
+            let tail = ns.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let tokens = tail.lowercased().split(separator: " ").map(String.init)
+            if tokens.isEmpty || tokens.allSatisfy({ genericGeminiTierTokens.contains($0) }) {
+                return nil
+            }
+            return tail
+        }
+        let lower = cleaned.lowercased()
+        if lower == "gemini" || genericGeminiTierTokens.contains(lower) {
+            return nil
+        }
+        return cleaned
+    }
+
+    static func extractGroupMemberLabels(from description: String) -> [String] {
+        let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let regex = groupMemberListRegex else { return [] }
+        let ns = trimmed as NSString
+        guard let match = regex.firstMatch(in: trimmed, range: NSRange(location: 0, length: ns.length)),
+              match.numberOfRanges > 1 else { return [] }
+        let rawList = ns.substring(with: match.range(at: 1))
+            .replacingOccurrences(of: "\\.\\s+.*$", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\\.+$", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawList.isEmpty else { return [] }
+        return rawList
+            .replacingOccurrences(of: "，", with: ",")
+            .replacingOccurrences(of: "、", with: ",")
+            .replacingOccurrences(of: ";", with: ",")
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    static func pooledUltraGeminiModelNames(_ activeAccount: [String: Any]?) -> [String] {
+        guard let activeAccount else { return ["Argon", "Carbon"] }
+        let parsed = contract(activeAccount)
+        let standaloneKeys = Set(parsed.standaloneGroups.map { $0.key.lowercased() })
+        let standaloneNames = Set(parsed.standaloneGroups.map { $0.displayName.lowercased() })
+        func isStandaloneCandidate(_ label: String) -> Bool {
+            let lower = label.lowercased()
+            return standaloneKeys.contains(lower)
+                || standaloneKeys.contains("gemini-4-\(lower)")
+                || standaloneNames.contains(lower)
+                || standaloneNames.contains("gemini 4 \(lower)")
+        }
+
+        // 1. Prefer official Gemini QuotaSummaryGroup.description (e.g. "Models within this group: Gemini 4 Neon, ...")
+        if let geminiDesc = parsed.displayGroups.first(where: { $0.key.lowercased() == "gemini" })?.description,
+           !geminiDesc.isEmpty {
+            let rawItems = extractGroupMemberLabels(from: geminiDesc)
+            var names: [String] = []
+            var seen = Set<String>()
+            for item in rawItems {
+                guard let label = concisePooledGeminiLabel(from: item) else { continue }
+                let lower = label.lowercased()
+                guard !isStandaloneCandidate(label), !seen.contains(lower) else { continue }
+                seen.insert(lower)
+                names.append(label)
+            }
+            if !names.isEmpty { return names }
+        }
+
+        // 2. Fall back to visible non-orchestrator models belonging to the Gemini group
+        let nested = dict(activeAccount["quota"])
+        let rawModels = (activeAccount["models"] as? [[String: Any]]) ?? (nested?["models"] as? [[String: Any]]) ?? []
+        var names: [String] = ["Argon", "Carbon"].filter { !isStandaloneCandidate($0) }
+        var seen = Set(names.map { $0.lowercased() })
+        for m in rawModels {
+            let rawId = (m["model_id"] as? String ?? (m["name"] as? String ?? "")).trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayName = (m["display_name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if isOrchestratorMetaModel(id: rawId, displayName: displayName) { continue }
+            let isDisabled = (m["disabled"] as? Bool == true) || rawId.lowercased().contains("disabled")
+            let isInternal = (m["is_internal"] as? Bool == true) || (m["isInternal"] as? Bool == true)
+            let isDeprecated = (m["deprecated"] as? Bool == true)
+            let isCarried = ((m["quota_source"] as? String) ?? "").lowercased() == "carried"
+            if isDisabled || isInternal || isDeprecated || isCarried { continue }
+
+            let family = ((m["family"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if family == "claude" || family == "openai" || family == "3p" { continue }
+            if !family.isEmpty && standaloneKeys.contains(family) { continue }
+            if family.isEmpty || family == "other" {
+                let lowerId = rawId.lowercased()
+                let lowerDisplay = displayName.lowercased()
+                let isGemini = inferredBrands(for: "\(rawId) \(displayName)").contains("gemini")
+                    || lowerId.hasPrefix("gemini")
+                    || lowerDisplay.contains("gemini")
+                if !isGemini { continue }
+            }
+
+            let candidateName = !displayName.isEmpty ? displayName : ModelDisplayName.name(ModelUsageFold.baseModelKey(for: rawId))
+            guard let label = concisePooledGeminiLabel(from: candidateName) else { continue }
+            let lower = label.lowercased()
+            guard !isStandaloneCandidate(label), !seen.contains(lower) else { continue }
+            seen.insert(lower)
+            names.append(label)
+        }
+        return names.isEmpty ? ["Argon", "Carbon"] : names
+    }
+
+    private static func formatJoinedModelList(_ names: [String]) -> String {
+        guard names.count > 2 else {
+            return L10n.shared.isEnglish ? names.joined(separator: " and ") : names.joined(separator: " 与 ")
+        }
+        if L10n.shared.isEnglish {
+            return names.dropLast().joined(separator: ", ") + ", and " + names.last!
+        }
+        return names.dropLast().joined(separator: "、") + " 与 " + names.last!
+    }
+
     static func monitoredScopeSubtitle(for selectedKey: String, activeAccount: [String: Any]?) -> String {
         let profile = activeScopeProfile(activeAccount)
         let effective = effectiveMonitoredModelKey(selectedKey, activeAccount: activeAccount)
@@ -1070,7 +1406,12 @@ enum QuotaPresentation {
                 return L10n.t("policy.row.monitored.sub.dyn_all", fallback: "监测核心主力配额池，不受独立子模型单项限额影响")
             }
             if profile.isUltra {
-                return L10n.t("policy.row.monitored.sub.ultra_all", fallback: "同时监测 Gemini（已含 Argon / Carbon）与 Claude/GPT 配额池")
+                let pooledNames = pooledUltraGeminiModelNames(activeAccount)
+                if pooledNames == ["Argon", "Carbon"] {
+                    return L10n.t("policy.row.monitored.sub.ultra_all", fallback: "同时监测 Gemini（已含 Argon / Carbon）与 Claude/GPT 配额池")
+                }
+                let joined = pooledNames.joined(separator: " / ")
+                return L10n.t("policy.row.monitored.sub.ultra_all_models", ["models": joined], fallback: "同时监测 Gemini（已含 \(joined)）与 Claude/GPT 配额池")
             }
             if profile.isFree {
                 return L10n.t("policy.row.monitored.sub.free_all", fallback: "同时监测当前免费账号可用的基础 Gemini 与 Claude/GPT 配额池")
@@ -1089,7 +1430,12 @@ enum QuotaPresentation {
                 return L10n.t("policy.row.monitored.sub.dyn_gemini_base", fallback: "仅监测基础 Gemini 共享池，不含独立计费的子模型配额")
             }
             if profile.isUltra {
-                return L10n.t("policy.row.monitored.sub.ultra_gemini", fallback: "Ultra 套餐已将 Argon 与 Carbon 并入此共享池，一并监测")
+                let pooledNames = pooledUltraGeminiModelNames(activeAccount)
+                if pooledNames == ["Argon", "Carbon"] {
+                    return L10n.t("policy.row.monitored.sub.ultra_gemini", fallback: "Ultra 套餐已将 Argon 与 Carbon 并入此共享池，一并监测")
+                }
+                let joined = formatJoinedModelList(pooledNames)
+                return L10n.t("policy.row.monitored.sub.ultra_gemini_models", ["models": joined], fallback: "Ultra 套餐已将 \(joined) 并入此共享池，一并监测")
             }
             if profile.isFree {
                 return L10n.t("policy.row.monitored.sub.free_gemini", fallback: "仅监测免费套餐可用的基础 Gemini 配额池")
@@ -1172,7 +1518,7 @@ enum QuotaPresentation {
 
     static func fingerprint(_ raw: [String: Any]) -> String {
         let nested = dict(raw["quota"])
-        var fields = ["quotaGroups", "familyWindows", "familyModelQuota", "argonStatus", "carbonStatus", "standaloneModels", "refreshState", "quotaWarnings", "subscription_tier"].reduce(into: [String: Any]()) {
+        var fields = ["quotaGroups", "familyWindows", "familyModelQuota", "argonStatus", "carbonStatus", "standaloneModels", "refreshState", "quotaWarnings", "subscription_tier", "standbyRefreshStatus"].reduce(into: [String: Any]()) {
             if let value = raw[$1] { $0[$1] = value }
         }
         if fields["quotaGroups"] == nil, let qGroups = nested?["quotaGroups"] {

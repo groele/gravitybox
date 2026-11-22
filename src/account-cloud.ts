@@ -18,6 +18,8 @@ import {
   buildCarbonStatus,
   buildStandaloneModels,
   familyWindowsFromGroups,
+  isExcludedFromStandaloneModelPool,
+  isGroupAllDisabled,
   matchModelToSharedPool,
   mergeGroupSets,
   mergeGroupsWithPrevious,
@@ -27,6 +29,7 @@ import {
   normalizeCloudModels,
   normalizeIndependentArgonQuota,
   normalizeStoredGroups,
+  resolveModelsWithGroupDescriptions,
   type Family,
   type NormalizedGroup,
   type NormalizedModel,
@@ -35,10 +38,10 @@ import {
 } from './quota.js';
 
 export function getGoogleClientId(): string {
-  return process.env.GRAVITYBOX_GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID || '';
+  return process.env.GRAVITYBOX_GOOGLE_CLIENT_ID || '';
 }
 export function getGoogleClientSecret(): string {
-  return process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET || '';
+  return process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET || '';
 }
 
 export const CLOUD_CODE_LOAD_PROJECT_ENDPOINTS = [
@@ -249,19 +252,26 @@ export async function fetchCloudQuotaForAccount(params: {
     // 3) fetchAvailableModels：全部端点各查一次，按优先级合并模型目录（prod 已知值不被 daily 覆盖）。
     const modelCatalogues: NormalizedModel[][] = [];
     let forwarding: Record<string, string> = {};
+    const deprecatedAll = new Set<string>();
     for (const result of modelResults) {
       note('models', result.endpoint, result.ok);
       if (!result.ok) continue;
       modelCatalogues.push(normalizeCloudModels(result.data ?? {}, nowSec));
-      const deprecated = result.data?.deprecatedModelIds;
+      const deprecated = result.data?.deprecatedModelIds ?? result.data?.deprecated_model_ids
+        ?? result.data?.response?.deprecatedModelIds ?? result.data?.response?.deprecated_model_ids;
       if (deprecated && typeof deprecated === 'object') {
         for (const [oldId, info] of Object.entries<any>(deprecated)) {
-          if (info?.newModelId && !forwarding[oldId]) forwarding[oldId] = String(info.newModelId);
+          deprecatedAll.add(oldId);
+          const nextId = info?.newModelId ?? info?.new_model_id;
+          if (nextId && !forwarding[oldId]) forwarding[oldId] = String(nextId);
         }
       }
     }
     throwIfUserAborted();
     let freshModels = mergeModelCatalogues(modelCatalogues);
+    if (deprecatedAll.size > 0) {
+      freshModels = freshModels.map(m => (deprecatedAll.has(m.model_id) || deprecatedAll.has(m.name)) ? { ...m, deprecated: true } : m);
+    }
 
     // 4) retrieveUserQuotaSummary：全部端点各查一次，语义合并 family+window。
     const groupSets: NormalizedGroup[][] = [];
@@ -272,10 +282,12 @@ export async function fetchCloudQuotaForAccount(params: {
     }
     throwIfUserAborted();
     const freshGroups = mergeGroupSets(groupSets);
+    freshModels = resolveModelsWithGroupDescriptions(freshModels, freshGroups);
     const hasStandaloneOwnQuota = freshModels.some(model =>
-      (model.family === 'argon' || model.family === 'carbon' || model.family === 'other') && model.disabled !== true
+      (model.family === 'argon' || model.family === 'carbon' || model.family === 'other')
+      && !isExcludedFromStandaloneModelPool(model)
       && model.own_percentage_known && !model.own_stale);
-    if(providerContext&&!freshGroups.some(group=>group.buckets.some(bucket=>bucket.remaining_fraction_known)) && !hasStandaloneOwnQuota) {
+    if(providerContext&&!freshGroups.some(group=>group.buckets.some(bucket=>bucket.disabled!==true&&bucket.remaining_fraction_known)) && !hasStandaloneOwnQuota) {
       const reason=summaryResults.map(row=>row.error||(!row.ok?bt('account_cloud.reason.read_failed'):bt('account_cloud.reason.no_window'))).join(bt('common.sentence_separator'));
       throw new CloudQuotaAuthorityError(bt('account_cloud.err.authority_empty', { reason }));
     }
@@ -296,23 +308,24 @@ export async function fetchCloudQuotaForAccount(params: {
       freshCarbon,
       subscriptionTier,
     );
-    const needOtherStandaloneQuota =
+    // 当官方 RetrieveUserQuotaSummary 已返回权威 groups[] 时，不再为 'other' 或编排器模型额外探测 :retrieveUserQuota。
+    const needOtherStandaloneQuota = freshGroups.length === 0 && (
       freshStandalone.some(
         item => item.key !== 'argon' && item.key !== 'carbon' && item.availability !== 'disabled' && item.quotaState !== 'known'
       ) ||
       freshModels.some(
         m =>
           m.family === 'other' &&
-          m.disabled !== true &&
+          !isExcludedFromStandaloneModelPool(m) &&
           !m.own_percentage_known &&
-          !freshGroups.some(g => g.family === 'other' && g.buckets.some(b => b.remaining_fraction_known)) &&
           matchModelToSharedPool(m, freshWindows, freshGroups, subscriptionTier, freshModels) === null
-      );
+      )
+    );
     const needIndependentQuota = providerContext !== null && (needOtherStandaloneQuota || (['argon', 'carbon'] as const).some(family => {
       const status = family === 'argon' ? freshArgon : freshCarbon;
       if (status.mode === 'unified' || status.mode === 'disabled') return false;
-      const familyModels = freshModels.filter(m => m.family === family);
-      const hasFamilyGroup = freshGroups.some(g => g.family === family);
+      const familyModels = freshModels.filter(m => m.family === family && !isExcludedFromStandaloneModelPool(m));
+      const hasFamilyGroup = freshGroups.some(g => g.family === family && !isGroupAllDisabled(g));
       if (hasFamilyGroup || familyModels.some(m => m.own_percentage_known)) return false;
       if (family === 'argon') {
         if (familyModels.length === 0 && freshGroups.length > 0 && /free|starter|ultra/i.test(subscriptionTier ?? '')) {
@@ -325,13 +338,14 @@ export async function fetchCloudQuotaForAccount(params: {
     if (needIndependentQuota && providerContext) {
       const independent=await queryAll<any>([providerContext.origin+'/v1internal:retrieveUserQuota'],()=>projectContextRecovered&&projectObserved&&projectId?{project:projectId}:{});
       for(const result of independent) {note('independent-quota',result.endpoint,result.ok);if(result.ok)freshModels=mergeModelCatalogues([freshModels,normalizeIndependentArgonQuota(result.data,nowSec)]);}
+      freshModels = resolveModelsWithGroupDescriptions(freshModels, freshGroups);
     }
 
     // 5) 与上一次快照做语义 carryover：fresh 覆盖同 family+window，旧桶/旧模型单独标 stale。
     const previousSource: QuotaSource = account.quota?.source === 'live' ? 'live' : 'cloud';
     const matchingScope=!providerContext||account.quota?.source==='live'||(account.quota?.refresh_state?.providerOrigin===providerContext.origin&&account.quota?.refresh_state?.providerUserAgent===providerContext.userAgent&&account.quota?.refresh_state?.requestScope==='account');
     const previousGroups = normalizeStoredGroups(matchingScope?account.quota?.quota_groups ?? []:[], account.quota?.last_updated ?? nowSec, previousSource);
-    const previousModels = (matchingScope?account.quota?.models ?? []:[]).map(model => normalizedModelFromStored(model, previousSource));
+    const previousModels = (matchingScope?account.quota?.models ?? []:[]).map(model => normalizedModelFromStored(model, previousSource, previousGroups));
     const { groups: mergedGroups, staleGroups } = mergeGroupsWithPrevious(freshGroups, previousGroups, Date.now());
     const { models: mergedModels, carriedCount } = mergeModelsWithPrevious(freshModels, previousModels);
     const windows = familyWindowsFromGroups(mergedGroups, Date.now());
@@ -344,18 +358,34 @@ export async function fetchCloudQuotaForAccount(params: {
 
     // 6) 完整性：缺 family / 缺已知窗口 / 生产端点失败 / 预算超时 → complete=false，并保留原因。
     const expectedFamilies = new Set<Family>();
-    for (const group of previousGroups) if (group.family !== 'other' && !isIgnoredStandaloneFamily(group.family)) expectedFamilies.add(group.family);
-    for (const model of freshModels) if (model.family !== 'other' && model.disabled !== true && !isIgnoredStandaloneFamily(model.family)) expectedFamilies.add(model.family);
-    const presentFamilies = new Set(mergedGroups.filter(group => group.buckets.some(bucket => bucket.remaining_fraction_known && !bucket.stale)).map(group => group.family));
-    for (const model of applied) if ((model.family === 'argon' || model.family === 'carbon') && model.disabled !== true && model.own_percentage_known && !model.own_stale) presentFamilies.add(model.family);
+    const mergedGroupPresent = (group: NormalizedGroup): boolean => mergedGroups.some(item =>
+      item.family === group.family
+      && (item.family !== 'other'
+        || (Boolean(item.group_id && group.group_id) && item.group_id === group.group_id)
+        || item.display_name.toLowerCase() === group.display_name.toLowerCase()));
+    for (const group of previousGroups) {
+      if (group.family === 'other' || isIgnoredStandaloneFamily(group.family)) continue;
+      if (group.family === 'gemini' || group.family === 'claude' || mergedGroupPresent(group)) {
+        expectedFamilies.add(group.family);
+      }
+    }
+    for (const model of freshModels) {
+      if (model.family !== 'other' && !isExcludedFromStandaloneModelPool(model) && !isIgnoredStandaloneFamily(model.family)) {
+        expectedFamilies.add(model.family);
+      }
+    }
+    const presentFamilies = new Set(mergedGroups.filter(group => group.buckets.some(bucket => bucket.disabled !== true && bucket.remaining_fraction_known && !bucket.stale)).map(group => group.family));
+    for (const model of applied) if ((model.family === 'argon' || model.family === 'carbon') && !isExcludedFromStandaloneModelPool(model) && model.own_percentage_known && !model.own_stale) presentFamilies.add(model.family);
     const missingFamilies = [...expectedFamilies].filter(family => !presentFamilies.has(family));
     const missingWindows: { family: Family; window: WindowKind }[] = [];
     for (const previous of previousGroups) {
       if (isIgnoredStandaloneFamily(previous.family)) continue;
+      const isCoreGroup = previous.family === 'gemini' || previous.family === 'claude';
+      if (!isCoreGroup && !mergedGroupPresent(previous)) continue;
       for (const bucket of previous.buckets) {
-        if (bucket.window === 'unspecified') continue;
+        if (bucket.disabled === true || bucket.window === 'unspecified') continue;
         const present = mergedGroups.some(group => group.family === previous.family
-          && group.buckets.some(item => item.window === bucket.window && item.remaining_fraction_known && !item.stale));
+          && group.buckets.some(item => item.disabled !== true && item.window === bucket.window && item.remaining_fraction_known && !item.stale));
         if (!present) missingWindows.push({ family: previous.family, window: bucket.window });
       }
     }

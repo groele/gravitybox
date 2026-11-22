@@ -116,10 +116,13 @@ test('I02 provenance：保留全部 text 但篡改 kinds/count/counts 必须拒�
 
 test('I02 provenance：本地最新已存官方包核对提取，无 vendor 时仅核对最新清单基本结构', async () => {
   const versions = [...SUPPORTED_BUNDLES.keys()];
-  const available = versions.filter(version =>
-    existsSync(join(root, 'vendor', 'antigravity', version, 'main.js')) &&
-    existsSync(join(root, 'ui-strings', `${version}.json`))
-  );
+  const skipVendorAst = process.env.GRAVITYBOX_SKIP_VENDOR_PROVENANCE_TEST === '1';
+  const available = skipVendorAst
+    ? []
+    : versions.filter(version =>
+      existsSync(join(root, 'vendor', 'antigravity', version, 'main.js')) &&
+      existsSync(join(root, 'ui-strings', `${version}.json`))
+    );
   if (available.length > 0) {
     const version = available.at(-1);
     const uiStrings = JSON.parse(await readFile(join(root, 'ui-strings', `${version}.json`), 'utf8'));
@@ -129,7 +132,7 @@ test('I02 provenance：本地最新已存官方包核对提取，无 vendor 时�
     assert.equal(result.extractedCount, uiStrings.strings.length);
     return;
   }
-  // 全版本快照完整性与词典覆盖由 verify 统一检查，单项测试不重复执行。
+  // 全版本快照完整性与词典覆盖由 verify 统一检查，单项测试（或在 verify 复用门禁字节对账时）不重复执行 AST 重提。
   const latestVersion = versions.at(-1);
   const uiStrings = JSON.parse(await readFile(join(root, 'ui-strings', `${latestVersion}.json`), 'utf8'));
   assert.equal(uiStrings.appVersion, latestVersion);

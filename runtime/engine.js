@@ -95,7 +95,10 @@
   /* PROTECTED keeps user content, code and editors in English. `[data-testid="conversation-row-sidebar"]`
      is the container the app really uses for the conversation list: its title <span> is NOT inside
      `a[href^="/c/"]`, so relying on the anchor alone left conversation titles translatable. */
-  const PROTECTED = 'script,style,code,pre,input,textarea,svg,canvas,.file-tree,[data-message-id],[contenteditable]:not([contenteditable="false"]),[data-gravitybox-protect],[data-message-author-role],[data-testid*="message"]:not([data-testid="cascade-system-message-toolbar"]),[data-testid*="conversation-title"],[data-testid="conversation-row-sidebar"],[data-testid*="conversation-row"],[data-testid*="model"],[data-testid*="artifact"],[data-testid="planner-response-text"],[data-testid="user-input-step"],[data-testid="breadcrumb-segment"],[data-testid="project-header"],[data-testid="project-selector-trigger"],a[href^="/c/"],a[href*="/c/"],.monaco-editor,.xterm,.markdown,.markdown-frontmatter,.markdown-alert-title,.notebook-markdown-cell,.prose,[role="log"],.chat-message,.message-content,.conversation-title,.terminal,.output-view,.debug-console,.code-view,.artifact-container,.model-item,.gravitybox-project-name,[data-testid*="attachment"],[data-testid*="file-chip"],[data-testid*="context-chip"],[data-testid="side-question-followup-user"],[data-testid="voice-transcript-summary"],[data-testid="coordinator-card-latest-line"],[data-testid="coordinator-worker-card"] .truncate';
+  const PROTECTED_CORE = 'script,style,code,pre,input,textarea,svg,canvas,.file-tree,[data-message-id],[contenteditable]:not([contenteditable="false"]),[data-gravitybox-protect],[data-message-author-role],[data-testid*="message"]:not([data-testid="cascade-system-message-toolbar"]),[data-testid*="conversation-title"],[data-testid="conversation-row-sidebar"],[data-testid*="conversation-row"],[data-testid*="artifact"]:not([data-testid^="shortcut-row-"]),[data-testid="planner-response-text"],[data-testid="user-input-step"],[data-testid="breadcrumb-segment"],[data-testid="project-header"],[data-testid="project-selector-trigger"],a[href^="/c/"],a[href*="/c/"],.monaco-editor,.xterm,.markdown,.markdown-frontmatter,.markdown-alert-title,.notebook-markdown-cell,.prose,[role="log"],.chat-message,.message-content,.conversation-title,.terminal,.output-view,.debug-console,.code-view,.artifact-container,.model-item,.gravitybox-project-name,[data-testid*="attachment"],[data-testid*="file-chip"],[data-testid*="context-chip"],[data-testid="side-question-followup-user"],[data-testid="voice-transcript-summary"],[data-testid="coordinator-card-latest-line"],[data-testid="coordinator-worker-card"] .truncate';
+  const PROTECTED = PROTECTED_CORE + ',[data-testid*="model"]:not([data-testid^="shortcut-row-"])';
+  const SETTINGS_MODEL_PROTECTED = '[data-testid*="model-selector"],[data-testid*="model-picker"],[data-testid*="model-option"],[data-testid*="model-item"],[data-testid*="model-name"],[data-testid*="custom-model"]';
+  const SETTINGS_MODEL_WIDGET = '[role="combobox"],[aria-haspopup],[role="menu"],[role="listbox"],[role="option"]';
   /* J01 positive user-content contract. A container marked `data-gravitybox-user-content` or an element
      marked `data-gravitybox-user-name` is user-authored text: never translated, never collected. On top
      of the explicit contract (usable by adapters and tests) entity surfaces are recognised
@@ -215,7 +218,7 @@
     if (/^system-ui,|^ui-monospace,/.test(text) || /^translate[XY]\(/.test(text)) return false;
     if (/^(?:grid-rows-|opacity-|scale-|max-h-|max-w-|min-w-|h-|w-|p-|bg-|border)/.test(text) && /-|:/.test(text)) return false;
     if (/^EDITION_\d+_TEST_ONLY$/.test(text) || /^Optional(?:Double|Int)?\.empty\(\)$/.test(text)) return false;
-    if (/^(?:Alt|Ctrl|Cmd|Shift)\+[\w.]+$/i.test(text)) return false;
+    if (/^(?:Alt|Ctrl|Cmd|Command|Option|Shift)\+[\w.]+$/i.test(text)) return false;
     if (/^[a-z-]+(?::[a-z-]+)*\s+[a-z-]+/.test(text) && /-|:/.test(text)) return false;
     return true;
   }
@@ -539,7 +542,15 @@
     if (ancestors(element).some(el => el !== row && el.matches(PROTECTED))) return false;
     const text = element.firstChild;
     const original = nodeSlots.get(text)?.get('')?.original ?? element.textContent ?? '';
-    return /^\d+(?:s|m|h|d|w|mo|y)$/.test(normalize(original));
+    return /^\d+(?:m|h|d|w|mo|y)$/.test(normalize(original));
+  }
+  function isElapsedDurationNode(element) {
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
+    return Boolean(
+      element.closest(
+        '[data-testid="tool-group-elapsed"],[data-testid="tool-group-collapsible"],[data-testid="running-row"],[data-testid="ephemeral-tool-status"]'
+      )
+    );
   }
   function settingsProjectName(element,scan) {
     const button=element?.closest?.('button');
@@ -558,6 +569,13 @@
     const next=headings.find(e=>e!==start&&(start.compareDocumentPosition(e)&Node.DOCUMENT_POSITION_FOLLOWING));
     return !next||!!(button.compareDocumentPosition(next)&Node.DOCUMENT_POSITION_FOLLOWING);
   }
+  function isProtectedElement(el, scan = 0) {
+    if (matches(el, PROTECTED_CORE)) return true;
+    if (matches(el, '[data-testid*="model"]:not([data-testid^="shortcut-row-"])')) {
+      return !inSystemSettings(el, scan) || matches(el, SETTINGS_MODEL_PROTECTED);
+    }
+    return inSystemSettings(el, scan) && matches(el, SETTINGS_MODEL_WIDGET) && Boolean(el.closest('[data-testid*="model"]'));
+  }
   function blocked(element, scan = 0) {
     if(routeExcluded||restrictedAdaptiveRoute())return true;
     if (!element || element.nodeType !== Node.ELEMENT_NODE) return true;
@@ -568,7 +586,7 @@
     if (userNamed(element) || settingsProjectName(element,scan)) return true;
     const cached = blockedCache.get(element);
     if (cached !== undefined && cached.scan === scan) return cached.val;
-    const isProt = ancestors(element).some(el => matches(el, PROTECTED)) || (element.tagName === 'BUTTON' && Boolean(element.closest('[role="dialog"]')) && projectNames.has(normalize(element.textContent || '')));
+    const isProt = ancestors(element).some(el => isProtectedElement(el, scan)) || (element.tagName === 'BUTTON' && Boolean(element.closest('[role="dialog"]')) && projectNames.has(normalize(element.textContent || '')));
     blockedCache.set(element, { scan, val: isProt });
     return isProt;
   }
@@ -609,6 +627,7 @@
     return isBrandName(name) ? name : (entryFor(name) || name);
   }
 
+  const RE_DUR_D = /(\d+)\s*d\b/gi;
   const RE_DUR_H = /(\d+)\s*h\b/gi;
   const RE_DUR_M = /(\d+)\s*m\b/gi;
   const RE_DUR_S = /(\d+)\s*s\b/gi;
@@ -616,6 +635,7 @@
   const RE_WHITESPACE = /\s+/g;
   function formatDuration(d) {
     return d
+      .replace(RE_DUR_D, '$1天')
       .replace(RE_DUR_H, '$1小时')
       .replace(RE_DUR_M, '$1分')
       .replace(RE_DUR_S, '$1秒')
@@ -664,7 +684,7 @@
       pattern: /^Send feedback as\s+(.+)$/i,
       replace: (_, email) => `以 ${email} 身份发送反馈`
     },
-    // 1. Agent 执行时长与阶段状态 (如 Worked for 49s / Stopped after 12s)
+    // 1. Agent 执行时长与阶段状态 (如 Worked for 49s / Stopped after 12s / 42s / 1m 12s)
     {
       key: "Worked for {duration}", pattern: /^Worked for\s+(\d+.*)$/i,
       replace: (_, d) => `已用时 ${formatDuration(d)}`
@@ -680,6 +700,11 @@
     {
       key: "Thinking for {duration}", pattern: /^(?:Thought|Thinking)\s+for\s+(\d+.*)$/i,
       replace: (_, d) => `已思考 ${formatDuration(d)}`
+    },
+    {
+      key: "{duration}",
+      pattern: /^(?:\d+\s*d\s+)?(?:\d+\s*h\s+)?\d+\s*m\s+\d+\s*s$|^(?:\d+\s*d\s+)?\d+\s*h\s+\d+\s*m$|^\d+\s*(?:ms|s)$/i,
+      replace: (d) => formatDuration(d)
     },
 
     // 2. 列表折叠展开与分页 (如 See 6 more / See 5 more plugins)
@@ -834,9 +859,9 @@
       replace: (_, n) => `已完成 ${n} 个任务`
     },
     {
-      key: "{count}{timeUnit}", pattern: /^(\d+)(s|m|h|d|w|mo|y)$/,
+      key: "{count}{timeUnit}", pattern: /^(\d+)(m|h|d|w|mo|y)$/,
       replace: (_, n, u) => {
-        const uMap = { s: '秒前', m: '分钟前', h: '小时前', d: '天前', w: '周前', mo: '个月前', y: '年前' };
+        const uMap = { m: '分钟前', h: '小时前', d: '天前', w: '周前', mo: '个月前', y: '年前' };
         return `${n}${uMap[u] || u}`;
       }
     },
@@ -1930,13 +1955,44 @@
       key: "{count} folders in this project could not be loaded because their locations are invalid.",
       pattern: /^(\d+)\s+folders?\s+in\s+this\s+project\s+could\s+not\s+be\s+loaded\s+because\s+(?:its|their)\s+locations?\s+(?:is|are)\s+invalid\.?$/i,
       replace: (_, n) => `此项目中有 ${n} 个文件夹因其位置无效而无法加载。`
+    },
+    {
+      key: "{error} ({count} folders were cloned before the failure)",
+      pattern: /^(.+?)\s*\((\d+)\s+(?:folder\s+was|folders\s+were)\s+cloned\s+before\s+the\s+failure\)\.?$/i,
+      replace: (_, err, n) => `${nestedLabel(err)}（失败前已克隆 ${n} 个文件夹）`
+    },
+    {
+      key: "Honors standard VS Code shortcuts without collisions (e.g. {shortcuts}).",
+      pattern: /^Honors\s+standard\s+VS\s+Code\s+shortcuts\s+without\s+collisions\s+\(e\.g\.\s+(.+?)\)\.?$/i,
+      replace: (_, s) => `遵循标准 VS Code 快捷键且无冲突（例如：${translateKeybindingExamples(s)}）。`
+    },
+    {
+      key: "Uses standalone Antigravity chords (e.g. {shortcuts}). Replaces Go to Symbol ({symbol}) and Trigger Suggest ({suggest}), and rebinds VS Code Settings to {settings}.",
+      pattern: /^Uses\s+standalone\s+Antigravity\s+chords\s+\(e\.g\.\s+(.+?)\)\.\s*Replaces\s+Go\s+to\s+Symbol\s+\(([^)]+)\)\s+and\s+Trigger\s+Suggest\s+\(([^)]+)\),\s*and\s+rebinds\s+VS\s+Code\s+Settings\s+to\s+(.+?)\.?$/i,
+      replace: (_, s, sym, sug, cfg) =>
+        `使用独立 Antigravity 组合快捷键（例如：${translateKeybindingExamples(s)}）。将替代转到符号 (${sym}) 与触发建议 (${sug})，并将 VS Code 设置重新绑定至 ${cfg}。`
     }
   ];
+
+  function translateKeybindingExamples(text) {
+    return String(text || '')
+      .replace(/\bFocus Input\b/g, '聚焦输入框')
+      .replace(/\bNew Conversation\b/g, '新建对话')
+      .replace(/\bPicker in chat\b/g, '对话内选择器')
+      .replace(/\bPicker\b/g, '选择器')
+      .replace(/\bSettings\b/g, '设置')
+      .replace(/\bHistory\b/g, '历史记录')
+      .replace(/,\s+/g, '，');
+  }
 
   for (const rule of TEMPLATE_RULES) {
     rule.inlineOnly = rule.key.includes('{0}');
   }
-  function matchTemplate(key) {
+  function matchTemplate(key, el) {
+    if (isElapsedDurationNode(el) && /^\d+\s*(?:d|h|m|s|ms)(?:\s+\d+\s*(?:h|m|s|ms))*$/i.test(key)) {
+      lastMatchedKeys = ['{duration}'];
+      return formatDuration(key);
+    }
     const hasInlineSlot = key.includes('{0}');
     for (let i = 0; i < customTemplateRules.length; i++) {
       const rule = customTemplateRules[i];
@@ -1962,7 +2018,7 @@
     const key = normalize(original);
     if (!key || /(?:https?:\/\/|^(?:\/|~\/|[A-Za-z]:\\))/.test(key)) return original;
     if (/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(key)) {
-      const templated = matchTemplate(key);
+      const templated = matchTemplate(key, el);
       if (templated !== undefined) return original.match(/^\s*/)[0] + templated + original.match(/\s*$/)[0];
       return original;
     }
@@ -1981,14 +2037,14 @@
     }
     if(typeof contextual==='string'){lastMatchedKeys=[key];return original.match(/^\s*/)[0]+contextual+original.match(/\s*$/)[0];}
     let value = undefined;
-    if(conservative){value=entryFor(key);if(value!==undefined)lastMatchedKeys=[key];else value=matchTemplate(key);return value===undefined?original:original.match(/^\s*/)[0]+value+original.match(/\s*$/)[0];}
+    if(conservative){value=entryFor(key);if(value!==undefined)lastMatchedKeys=[key];else value=matchTemplate(key, el);return value===undefined?original:original.match(/^\s*/)[0]+value+original.match(/\s*$/)[0];}
 
     // P1-2: 含数字的文案优先匹配模板，避免词典中的硬编码覆盖通用模板
     if (/\d/.test(key)) {
-      value = matchTemplate(key);
+      value = matchTemplate(key, el);
     }
     if (value === undefined) { value = entryFor(key); if(value!==undefined)lastMatchedKeys=[key]; }
-    if (value === undefined) value = matchTemplate(key);
+    if (value === undefined) value = matchTemplate(key, el);
     if (value === undefined) return original;
     const lead = original.match(/^\s*/)[0];
     const tail = original.match(/\s*$/)[0];
@@ -2101,9 +2157,9 @@
     if (userNamed(element)) return false;
     if (attribute === 'aria-label' && element.matches('button[data-testid="model-selector-trigger"],[role="button"][data-testid="model-selector-trigger"]')
         && /^Select model,\s*current:\s*.+$/i.test(original)) {
-      return ancestors(element).every(el => !matches(el, PROTECTED) || el === element);
+      return ancestors(element).every(el => !isProtectedElement(el, scanCount) || el === element);
     }
-    const protectedParents = ancestors(element).filter(el => matches(el, PROTECTED));
+    const protectedParents = ancestors(element).filter(el => isProtectedElement(el, scanCount));
     if (protectedParents.some(el => el !== element || !['INPUT', 'TEXTAREA'].includes(el.tagName))) return false;
     // These first-party controls have no UI ancestor. Keep the exception exact so arbitrary
     // form metadata outside known UI (including the unknown-area fixture) remains untouched.
@@ -2661,7 +2717,14 @@
       const draft=[...document.querySelectorAll('input,textarea,[contenteditable]:not([contenteditable="false"])')].some(e=>rendered(e)&&!e.readOnly&&!e.disabled&&!['button','submit','reset','checkbox','radio','range','hidden','file'].includes(e.type)&&(e.value??e.textContent??'').trim());
       const attachments=[...document.querySelectorAll('input[type="file"]')].some(e=>e.files?.length>0)||[...document.querySelectorAll('[data-testid*="attachment"],[data-testid*="file-chip"]')].some(rendered);
       const unsaved=[...document.querySelectorAll('.tab.dirty,[data-dirty="true"],[role="tab"][aria-label*="unsaved" i]')].some(rendered);
-      const generating=[...document.querySelectorAll('button,[role="button"]')].some(e=>rendered(e)&&/^(Stop generating|Stop|停止生成|停止)$/.test(e.getAttribute('aria-label')||e.textContent.trim()));
+      const generating=[...document.querySelectorAll('button,[role="button"]')].some(e=>{
+        if(!rendered(e))return false;
+        if(e.getAttribute('data-testid')==='input-cancel-button')return true;
+        const label=(e.getAttribute('aria-label')||e.getAttribute('title')||e.textContent||'').trim();
+        if(/^(?:Stop generating|Cancel generation|Cancel\s*[（(][^）)]+[）)]|停止生成|取消生成|终止生成|取消\s*[（(][^）)]+[）)])$/i.test(label))return true;
+        if(/^(?:Stop|停止)$/i.test(label)&&Boolean(e.closest('[data-testid="agent-input-box"],.surface-composer')))return true;
+        return false;
+      });
       return {busy:draft||attachments||unsaved||generating,draft,attachments,unsaved,generating};
     },
     maintenanceState(){const state=api.draftState();return{...state,busy:state.busy||[...document.querySelectorAll('[role="dialog"],[role="menu"]')].some(visibleUi)};},

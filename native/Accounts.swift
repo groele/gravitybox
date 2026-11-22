@@ -11,6 +11,7 @@ final class AccountsPage: NSObject {
     let policySubtitleLabel = text("", size: 11, color: Design.secondary)
     let configButton = button(L10n.t("accounts.smart_switch.config_btn"), target: nil, action: #selector(showPolicySettings))
     let toggleCollapseAllButton = button(L10n.t("accounts.collapse_all"), target: nil, action: #selector(toggleCollapseAllAccounts))
+    let manageAccountsButton = button(L10n.t("accounts.manage_btn", fallback: "管理账号…"), target: nil, action: #selector(addAccount))
     let policyBox: NSBox
     let recommendationDivider = divider()
     let cardsStack = NSStackView()
@@ -120,8 +121,8 @@ final class AccountsPage: NSObject {
     init(app: Assistant) {
         self.app = app
         self.isAllCollapsedMode = app.configuration?.value.accountsCollapsed ?? false
-        let saveCurrentBtn = button(L10n.t("accounts.add_btn"), target: nil, action: #selector(addAccount))
-        saveCurrentBtn.bezelColor = .controlAccentColor
+        manageAccountsButton.title = L10n.t("accounts.manage_btn", fallback: "管理账号…")
+        manageAccountsButton.bezelColor = .controlAccentColor
         let refreshQuotaBtn = QuotaRefreshButton(target: nil, action: #selector(refreshAllQuotas))
 
         toggleCollapseAllButton.image = NSImage(
@@ -134,7 +135,7 @@ final class AccountsPage: NSObject {
         toggleCollapseAllButton.toolTip = nil
         toggleCollapseAllButton.setAccessibilityLabel(isAllCollapsedMode ? L10n.t("accounts.a11y.expand_all") : L10n.t("accounts.a11y.collapse_all"))
 
-        let headerActions = horizontal([toggleCollapseAllButton, refreshQuotaBtn, saveCurrentBtn], spacing: 8)
+        let headerActions = horizontal([toggleCollapseAllButton, refreshQuotaBtn, manageAccountsButton], spacing: 8)
         headerActions.detachesHiddenViews = true
         let root = pageStack(title: L10n.t("accounts.title"), actions: headerActions)
         root.spacing = Design.Spacing.page
@@ -154,7 +155,7 @@ final class AccountsPage: NSObject {
         pendingRecoveryBox = pendingBox
         root.addArrangedSubview(pendingBox)
 
-        // 1. 紧凑智能切换设置卡片
+        // 1. 紧凑备用推荐设置卡片
         autoSwitchBadgeBox.boxType = .custom
         autoSwitchBadgeBox.cornerRadius = 7
         autoSwitchBadgeBox.borderWidth = 0.5
@@ -253,7 +254,7 @@ final class AccountsPage: NSObject {
         super.init()
 
         toggleCollapseAllButton.target = self
-        saveCurrentBtn.target = self
+        manageAccountsButton.target = self
         refreshQuotaBtn.target = self
         rollbackButton.target = self
         switchRecommendedBtn.target = self
@@ -274,11 +275,12 @@ final class AccountsPage: NSObject {
     }
 
     private static func formatCollapsedQuotaSummary(_ contract: QuotaPresentation.Contract) -> String {
+        let now = Date()
         var parts: [String] = []
         for group in contract.displayGroups {
             if let pct = group.primaryPercentage {
                 let label = group.summaryLabel.isEmpty ? group.displayName : group.summaryLabel
-                let hasStaleWindow = group.primaryWindow?.stale == true || group.windows.contains(where: { $0.stale })
+                let hasStaleWindow = group.primaryWindow?.effectiveStale(at: now) == true || group.windows.contains(where: { $0.effectiveStale(at: now) })
                 let staleSuffix = hasStaleWindow
                     ? " (\(L10n.t("quota.stale", fallback: "已过期")))"
                     : ""
@@ -296,6 +298,7 @@ final class AccountsPage: NSObject {
             return
         }
         toggleCollapseAllButton.isHidden = false
+
         let allCollapsed = validIds.isSubset(of: collapsedAccountIds)
         isAllCollapsedMode = allCollapsed
         let title = allCollapsed ? L10n.t("accounts.expand_all") : L10n.t("accounts.collapse_all")
@@ -608,8 +611,20 @@ final class AccountsPage: NSObject {
             card.quotaWarningLabel.isHidden = true
         }
 
+        let singleNotice = (app.singleAccountRefreshNotices[id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if let error = refreshError {
             card.refreshErrorLabel.stringValue = InterfaceText.quotaMessage(error)
+            card.refreshErrorLabel.textColor = accessibleWarningColor()
+            card.refreshErrorLabel.toolTip = nil
+            card.refreshErrorLabel.isHidden = false
+        } else if let singleErr = app.singleAccountRefreshErrors[id]?.trimmingCharacters(in: .whitespacesAndNewlines), !singleErr.isEmpty {
+            card.refreshErrorLabel.stringValue = InterfaceText.quotaMessage(singleErr)
+            card.refreshErrorLabel.textColor = accessibleWarningColor()
+            card.refreshErrorLabel.toolTip = nil
+            card.refreshErrorLabel.isHidden = false
+        } else if !singleNotice.isEmpty {
+            card.refreshErrorLabel.stringValue = singleNotice
+            card.refreshErrorLabel.textColor = .secondaryLabelColor
             card.refreshErrorLabel.toolTip = nil
             card.refreshErrorLabel.isHidden = false
         } else {
@@ -641,14 +656,27 @@ final class AccountsPage: NSObject {
             card.staleLabel.isHidden = true
         }
 
-        if !isCollapsed,
-           let quota = item["quota"] as? [String: Any], let stamp = quota["last_updated"] as? Double, stamp > 0 {
+        let standbyMode = app.standbyRefreshMode(item)
+        let quota = item["quota"] as? [String: Any]
+        let stamp = QuotaPresentation.number(quota?["last_updated"]) ?? QuotaPresentation.number(item["quota_last_updated"]) ?? 0
+        if !isCollapsed, standbyMode == "snapshot_cooldown_elapsed" {
+            card.updateLabel.stringValue = L10n.t("accounts.standby.reset_passed", fallback: "已到重置时间 · 切换后更新")
+            card.updateLabel.textColor = Design.blue
+            card.updateLabel.toolTip = L10n.t("accounts.standby.multi_device_hint")
+            card.updateLabel.isHidden = false
+        } else if !isCollapsed, stamp > 0 {
             let dateStr = Self.dateFormatter.string(from: Date(timeIntervalSince1970: stamp))
-            let isStale = (Date().timeIntervalSince1970 - stamp) > 15 * 60
-            let updateText = isStale ? L10n.t("accounts.updated_at_stale", ["time": dateStr]) : L10n.t("accounts.updated_at", ["time": dateStr])
-            card.updateLabel.stringValue = updateText
-            card.updateLabel.textColor = isStale ? accessibleWarningColor() : .secondaryLabelColor
-            card.updateLabel.toolTip = nil
+            if standbyMode == "snapshot_cooling" {
+                card.updateLabel.stringValue = L10n.t("accounts.standby.recorded_at", ["time": dateStr], fallback: "记录于 \(dateStr) · 切换后同步")
+                card.updateLabel.textColor = .secondaryLabelColor
+                card.updateLabel.toolTip = L10n.t("accounts.standby.multi_device_hint")
+            } else {
+                let isStale = (Date().timeIntervalSince1970 - stamp) > app.quotaStaleThresholdSeconds
+                let updateText = isStale ? L10n.t("accounts.updated_at_stale", ["time": dateStr]) : L10n.t("accounts.updated_at", ["time": dateStr])
+                card.updateLabel.stringValue = updateText
+                card.updateLabel.textColor = isStale ? accessibleWarningColor() : .secondaryLabelColor
+                card.updateLabel.toolTip = nil
+            }
             card.updateLabel.isHidden = false
         } else {
             card.updateLabel.stringValue = ""
@@ -701,6 +729,7 @@ final class AccountsPage: NSObject {
                 ], inset: 16)
                 cardsStack.addArrangedSubview(emptyCard)
                 fillWidth(emptyCard, in: cardsStack)
+                syncCollapseHeaderButtonState()
                 return
             }
         }
@@ -810,7 +839,7 @@ final class AccountsPage: NSObject {
                     return l == r ? left.offset < right.offset : l
                 }.map(\.element)
                 self.updateAutoSwitchState()
-                let newFingerprint = "\(self.activeId):\(self.app.statusValue.liveAccountEmail):" + self.accounts.map { item in
+                let newFingerprint = "\(self.activeId):\(self.app.statusValue.liveAccountEmail):\(self.app.quotaStaleThresholdSeconds):" + self.accounts.map { item in
                     let id = item["id"] as? String ?? ""
                     let rev = item["revision"] as? String ?? ""
                     let g5Cd = item["geminiFiveHourResetCountdown"] as? String ?? ""
@@ -822,8 +851,11 @@ final class AccountsPage: NSObject {
                     let dis = (item["disabled"] as? Bool == true) ? "1" : "0"
                     let vblk = (item["validation_blocked"] as? Bool == true) ? "1" : "0"
                     let credState = (item["credentialReadiness"] as? [String: Any])?["state"] as? String ?? ""
+                    let standbyMode = self.app.standbyRefreshMode(item) ?? ""
+                    let singleNotice = self.app.singleAccountRefreshNotices[id] ?? ""
+                    let singleErr = self.app.singleAccountRefreshErrors[id] ?? ""
                     if !rev.isEmpty {
-                        return "\(id):\(item["name"] as? String ?? ""):\(rev):\(dis):\(vblk):\(credState):\(g5Cd):\(gWCd):\(cWCd):\(aWCd):\(modelsCd):\(QuotaPresentation.fingerprint(item))"
+                        return "\(id):\(item["name"] as? String ?? ""):\(rev):\(dis):\(vblk):\(credState):\(standbyMode):\(singleNotice):\(singleErr):\(g5Cd):\(gWCd):\(cWCd):\(aWCd):\(modelsCd):\(QuotaPresentation.fingerprint(item))"
                     }
                     let g5h = item["geminiFiveHourRemaining"] as? Int ?? -1
                     let gWk = item["geminiWeeklyRemaining"] as? Int ?? -1
@@ -841,7 +873,7 @@ final class AccountsPage: NSObject {
                         let mCd = m["reset_countdown"] as? String ?? (m["resetCountdown"] as? String ?? "")
                         return "\(mName)=\(mPct)=\(mCd)"
                     }.joined(separator: ",")
-                    return "\(id):\(g5h):\(gWk):\(c5h):\(cWk):\(aWk):\(label):\(tier):\(dis):\(err):\(lastUp):\(modelsKey):\(QuotaPresentation.fingerprint(item))"
+                    return "\(id):\(g5h):\(gWk):\(c5h):\(cWk):\(aWk):\(label):\(tier):\(dis):\(standbyMode):\(singleNotice):\(singleErr):\(err):\(lastUp):\(modelsKey):\(QuotaPresentation.fingerprint(item))"
                 }.joined(separator: "|")
                 if newFingerprint != self.renderedFingerprint {
                     self.renderedFingerprint = newFingerprint
@@ -892,10 +924,19 @@ final class AccountsPage: NSObject {
         let isEnabled = autoSwitchToggle.state == .on
         let threshold = max(1, intVal(autoSwitchConfig, "reserve_percentage", fallback: intVal(autoSwitchConfig, "reservePercentage", fallback: 10)))
         let candidateMin = max(1, intVal(autoSwitchConfig, "candidate_min_percentage", fallback: intVal(autoSwitchConfig, "candidateMinPercentage", fallback: 30)))
+        let rawModel = (autoSwitchConfig["monitored_model"] as? String ?? "all").trimmingCharacters(in: .whitespacesAndNewlines)
+        let activeAcc = currentActiveAccountPayload()
+        let effectiveKey = QuotaPresentation.effectiveMonitoredModelKey(rawModel, activeAccount: activeAcc)
         let monitored = monitoredModelSummaryLabel()
 
         policyBox.fillColor = Design.card
         policySubtitleLabel.stringValue = L10n.t("accounts.smart_switch.subtitle", ["monitored": monitored, "threshold": threshold, "min": candidateMin])
+        let rawDisplay = QuotaPresentation.monitoredModelDisplayName(rawModel, accounts: accounts)
+        if !rawModel.isEmpty, rawModel.lowercased() != "all", effectiveKey.lowercased() != rawModel.lowercased(), rawDisplay != monitored {
+            policySubtitleLabel.toolTip = L10n.t("accounts.smart_switch.adapted_tooltip", ["raw": rawDisplay, "effective": monitored], fallback: "原配置监测 \(rawDisplay)，当前账号已自适应为 \(monitored)")
+        } else {
+            policySubtitleLabel.toolTip = nil
+        }
         if isEnabled {
             policyBox.borderWidth = 0.5
             policyBox.borderColor = Design.dynamicAlpha(Design.blue, 0.32)
@@ -945,6 +986,7 @@ final class AccountsPage: NSObject {
         recommendationFingerprint = ""
         recommendedAccountId = nil
         app.cachedRecommendedAccountId = nil
+        app.lastRecommendedAccountsFingerprint = ""
         recommendationLabel.stringValue = ""
         switchRecommendedBtn.identifier = nil
         switchRecommendedBtn.isHidden = true
@@ -1046,7 +1088,10 @@ final class AccountsPage: NSObject {
             case .success(let value):
                 self.accountRefreshErrors[id] = nil
                 self.accountRefreshErrorStamps[id] = nil
-                self.app.showMessage(value["message"] as? String ?? L10n.t("accounts.refresh.single_success", ["email": email]))
+                let msg = (value["standbyDeferred"] as? Bool == true)
+                    ? (value["notice"] as? String ?? value["message"] as? String ?? L10n.t("accounts.refresh.single_success", ["email": email]))
+                    : (value["message"] as? String ?? L10n.t("accounts.refresh.single_success", ["email": email]))
+                self.app.showMessage(msg)
                 self.app.refresh()
             }
             self.applyCardRefreshState()
@@ -1102,7 +1147,7 @@ final class AccountsPage: NSObject {
     var addAccountSheet: AddAccountSheet?
     @objc func addAccount() {
         guard let window = app.window, window.activeSheetWindow == nil else { return }
-        let sheet = AddAccountSheet(app: app) { [weak app = self.app] in app?.accountsPage?.fetch(); app?.refresh() }
+        let sheet = AddAccountSheet(app: app, accountCount: accounts.count) { [weak app = self.app] in app?.accountsPage?.fetch(); app?.refresh() }
         addAccountSheet = sheet
         sheet.show(in: window) { [weak self] in self?.addAccountSheet = nil }
     }
@@ -1233,6 +1278,10 @@ final class AccountsPage: NSObject {
         surface.addSubview(stack)
         pin(stack, to: surface, inset: 20)
 
+        #if NATIVE_UI_TEST
+        Assistant.configureHeadlessWindowIfNeeded(window)
+        Assistant.configureHeadlessWindowIfNeeded(sheet)
+        #endif
         window.beginSheet(sheet) { [weak self] resp in
             if let obs = handler.observer { NotificationCenter.default.removeObserver(obs) }
             withExtendedLifetime(handler) {}

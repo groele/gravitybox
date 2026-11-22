@@ -127,11 +127,11 @@ async function main() {
   const completedSteps = [];
   const timings = [];
   if (!dictOnly) process.stdout.write('[verify] 原生 UI 夹具不纳入默认门禁；按需运行 npm run test:native-ui，安装后另行人工验收\n');
-  async function step(name, binary, args) {
+  async function step(name, binary, args, { env } = {}) {
     process.stdout.write(`检查：${name}\n`);
     const started = performance.now();
     try {
-      const result = await run(binary, args, { cwd: root, maxBuffer: 4e6 });
+      const result = await run(binary, args, { cwd: root, maxBuffer: 4e6, ...(env ? { env } : {}) });
       await writeFile(join(out, `${name}.log`), result.stdout + result.stderr);
       completedSteps.push(name);
       const durationMs = performance.now() - started;
@@ -200,12 +200,15 @@ async function main() {
   const noVendor = argv.includes('--no-vendor') || process.env.GRAVITYBOX_NO_VENDOR === '1';
   const fullVendor = argv.includes('--full-vendor') || process.env.GRAVITYBOX_FULL_VENDOR === '1';
   const latestVersion = scope.targetAppVersions[scope.targetAppVersions.length - 1];
+  const latestSupportedVersion = supportedVersions[supportedVersions.length - 1];
   const gateTasks = [];
   for (const targetVersion of scope.targetAppVersions) {
     const cachedBundle = join(root, 'vendor', 'antigravity', targetVersion, 'main.js');
     const shouldVerifyVendor = !noVendor && existsSync(cachedBundle) && (fullVendor || scope.mode === VALIDATION_SCOPE_TARGETED || targetVersion === latestVersion);
     const file = `${targetVersion}.json`, expected = SUPPORTED_BUNDLES.get(targetVersion);
-    const gateArgs = [join(root, 'tools/coverage-report.mjs'), '--strings', join(root, 'ui-strings', file), '--gate', '--skip-advisory-scan', '--out', join(out, `coverage-${file}`)];
+    const stringsPath = join(root, 'ui-strings', file);
+    const reportOut = join(out, `coverage-${file}`);
+    const gateArgs = [join(root, 'tools/coverage-report.mjs'), '--strings', stringsPath, '--gate', '--skip-advisory-scan', '--out', reportOut];
     if (expected) gateArgs.push('--expect-bundle-sha256', expected);
     if (shouldVerifyVendor) {
       gateArgs.push('--bundle', cachedBundle);
@@ -213,27 +216,99 @@ async function main() {
       gateArgs.push('--no-vendor');
       process.stdout.write(`[verify] ${targetVersion} 启用免 vendor 校验模式（基于 ui-strings/${file} 验证词典）\n`);
     }
-    gateTasks.push({ targetVersion, gateArgs });
+    gateTasks.push({ targetVersion, shouldVerifyVendor, stringsPath, reportOut, expected, gateArgs });
+  }
+
+  const latestGateTask = gateTasks.find(task => task.targetVersion === latestSupportedVersion);
+  const shouldVerifyLatestVendor = Boolean(!noVendor && latestGateTask?.shouldVerifyVendor);
+
+  async function runNoVendorGatesBatch(tasks) {
+    if (!tasks.length) return;
+    const { loadDictLayers, properNounViolations, runCoverageReport } = await import(pathToFileURL(join(root, 'tools/coverage-report.mjs')).href);
+    const dictDir = join(root, 'dict');
+    const dictLoaded = await loadDictLayers(dictDir);
+    const preloadedDict = { ...dictLoaded, violations: properNounViolations(dictLoaded.entries) };
+    for (const task of tasks) {
+      const name = `词典门禁-${task.targetVersion}`;
+      process.stdout.write(`检查：${name}\n`);
+      const started = performance.now();
+      let result;
+      try {
+        result = await runCoverageReport({
+          stringsPath: task.stringsPath,
+          dictDir,
+          expectSha256: task.expected,
+          noVendor: true,
+          skipAdvisoryScan: true,
+          out: task.reportOut,
+          gate: true,
+          preloadedDict,
+        });
+      } catch (error) {
+        const detail = `[coverage-report] ${error?.stack ?? error?.message ?? error}\n`;
+        await writeFile(join(out, `${name}.log`), detail);
+        process.stderr.write(`\n--- [${name} 错误详情] ---\n${detail}\n------------------------\n`);
+        await reportFailureToStepSummary({
+          name,
+          binary: process.execPath,
+          args: task.gateArgs,
+          error: { code: 1, message: error?.message ?? String(error) },
+          detail,
+          completedSteps: [...completedSteps],
+        });
+        throw new Error(`${name} 未通过，见质检报告`);
+      }
+      const detail = result.stdout + result.stderr;
+      await writeFile(join(out, `${name}.log`), detail);
+      if (result.exitCode !== 0) {
+        if (detail.trim()) process.stderr.write(`\n--- [${name} 错误详情] ---\n${detail}\n------------------------\n`);
+        await reportFailureToStepSummary({
+          name,
+          binary: process.execPath,
+          args: task.gateArgs,
+          error: { code: result.exitCode, message: `词典门禁未通过（exit ${result.exitCode}）` },
+          detail,
+          completedSteps: [...completedSteps],
+        });
+        throw new Error(`${name} 未通过，见质检报告`);
+      }
+      completedSteps.push(name);
+      const durationMs = performance.now() - started;
+      timings.push({ name, durationMs });
+      process.stdout.write(`通过：${name}（${(durationMs / 1000).toFixed(2)} 秒）\n`);
+    }
   }
 
   async function runDictionaryGates() {
-    const concurrency = Math.max(1, Math.min(4, cpus().length || 2));
-    let cursor = 0;
-    await Promise.all(Array.from({ length: Math.min(concurrency, gateTasks.length) }, async () => {
-      while (cursor < gateTasks.length) {
-        const { targetVersion, gateArgs } = gateTasks[cursor++];
-        await step(`词典门禁-${targetVersion}`, process.execPath, gateArgs);
-      }
-    }));
+    const vendorTasks = gateTasks.filter(task => task.shouldVerifyVendor);
+    const noVendorTasks = gateTasks.filter(task => !task.shouldVerifyVendor);
+    const runVendorTasks = async () => {
+      if (!vendorTasks.length) return;
+      const concurrency = Math.max(1, Math.min(4, cpus().length || 2));
+      let cursor = 0;
+      await Promise.all(Array.from({ length: Math.min(concurrency, vendorTasks.length) }, async () => {
+        while (cursor < vendorTasks.length) {
+          const { targetVersion, gateArgs } = vendorTasks[cursor++];
+          await step(`词典门禁-${targetVersion}`, process.execPath, gateArgs);
+        }
+      }));
+    };
+    await Promise.all([runNoVendorGatesBatch(noVendorTasks), runVendorTasks()]);
   }
 
   if (dictOnly) {
     await Promise.all([privacyPromise, runDictionaryGates()]);
   } else {
+    const unitTestEnv = {
+      ...process.env,
+      GRAVITYBOX_SKIP_REPO_PRIVACY_TEST: '1',
+      ...(shouldVerifyLatestVendor ? { GRAVITYBOX_SKIP_VENDOR_PROVENANCE_TEST: '1' } : {}),
+    };
     const settled = await Promise.allSettled([
       privacyPromise,
       swiftPromise,
-      step('单元与集成', process.execPath, [join(root, 'tools/run-tests.mjs')]),
+      step('UI测试类型检查', process.execPath, [join(root, 'tools/native-build.mjs'), '--typecheck', '--ui-test']),
+      step('单元与集成', process.execPath, [join(root, 'tools/run-tests.mjs')], { env: unitTestEnv }),
       step('浏览器回归', process.execPath, [join(root, 'test/browser.mjs')]),
       runDictionaryGates(),
     ]);

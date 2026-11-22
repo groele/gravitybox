@@ -301,6 +301,7 @@ class FakeShadowRoot {
       '#lbl-cache-saved',
       '#val-cache-saved',
       '#pop-ctx-prefix',
+      '#pop-ctx-role',
       '#pop-ctx-pct',
       '#pop-ctx-capacity',
       '#pop-ctx-track',
@@ -432,6 +433,7 @@ describe('HUD raw 数值精度与缺值展示', () => {
       assert.equal(text('#val-ttft-latest'), languageMode === 'en' ? '1.24s' : '1.24 秒');
       assert.equal(text('#lbl-tps-latest'), languageMode === 'en' ? 'Latest Step TPS' : '最近一步 TPS');
       assert.equal(text('#val-tps-latest'), '171 tok/s');
+      assert.equal(instance.shadow.querySelector('#row-session-compactions'), null);
       assert.equal(text('#val-turn-dur'), languageMode === 'en' ? '18s' : '18秒');
       assert.equal(text('#val-ttft'), languageMode === 'en' ? '3.85s' : '3.85 秒');
       assert.equal(text('#val-model-dur'), languageMode === 'en' ? '22m28s' : '22分28秒');
@@ -484,6 +486,7 @@ describe('HUD raw 数值精度与缺值展示', () => {
       }, languageMode);
       assert.equal(zeroComp.instance.shadow.querySelector('#hud-compaction-badge').hasAttribute('hidden'), true);
       assert.equal(zeroComp.text('#hud-compaction-badge'), '');
+      assert.equal(zeroComp.instance.shadow.querySelector('#row-session-compactions'), null);
       assert.equal(zeroComp.instance.shadow.querySelector('.capsule-context').classList.contains('has-compaction'), false);
       assert.equal(zeroComp.text('#hud-txt-session .hud-turns'), languageMode === 'en' ? '1.5KT ' : '1.5K 轮 ');
       assert.equal(zeroComp.text('#pop-session-badge'), languageMode === 'en' ? '1.5K turns 2.5M steps' : '1.5K 轮 2.5M 步');
@@ -2368,6 +2371,10 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
         inst.shadow.querySelector('#pop-ctx-prefix').textContent,
         lang === 'en' ? 'Current Context · Hydrogen ' : '当前上下文 · Hydrogen '
       );
+      const popRole = inst.shadow.querySelector('#pop-ctx-role');
+      assert.equal(popRole.hasAttribute('hidden'), false);
+      assert.equal(popRole.classList.contains('is-role-executor'), true);
+      assert.equal(popRole.textContent, lang === 'en' ? 'Exec' : '执行');
       assert.equal(
         inst.shadow.querySelector('#lbl-ctx-peak').textContent,
         lang === 'en' ? 'Model Peak Context' : '当前模型峰值'
@@ -2376,20 +2383,19 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       assert.equal(inst.shadow.querySelector('#hud-ctx-stages-wrap').hasAttribute('hidden'), false);
       assert.equal(
         inst.shadow.querySelector('#lbl-ctx-stages').textContent,
-        lang === 'en' ? 'Orchestrator Context' : 'Orchestrator 上下文'
+        lang === 'en' ? 'Prior Model Context' : '曾用模型上下文'
       );
       const listHtml = inst.shadow.querySelector('#hud-ctx-stages-list').innerHTML;
-      assert.equal(listHtml.includes(lang === 'en' ? 'Plan · Carbon' : '规划 · Carbon'), true);
+      assert.equal(listHtml.includes('<span class="hud-stage-label">Carbon</span>'), true);
+      assert.equal(listHtml.includes(lang === 'en' ? 'class="hud-role-badge is-role-planner">Plan<' : 'class="hud-role-badge is-role-planner">规划<'), true);
       assert.equal(listHtml.includes('90.2% · 462K / 512K'), true);
-      assert.equal(listHtml.includes(lang === 'en' ? 'Exec · Hydrogen' : '执行 · Hydrogen'), true);
-      assert.equal(listHtml.includes(lang === 'en' ? 'Active' : '当前'), true);
-      assert.equal(listHtml.includes('91.4% · 468K / 512K'), true);
+      assert.equal(listHtml.includes('<span class="hud-stage-label">Hydrogen</span>'), false, 'Option A 底部列表不得重复渲染当前活跃模型');
+      assert.equal(listHtml.includes('class="hud-stage-badge"'), false, 'Option A 底部列表不应出现当前活跃徽章');
       assert.equal(listHtml.includes('class="hud-stage-label"'), true);
     }
 
-    // 3b. 验证通用待介入执行阶段（不写死 Hydrogen）、history 分组标题与简化模型短名（保留 .hud-stage-label 防徽章裁切）
+    // 3b. 验证通用待介入执行阶段（不写死 Hydrogen）、统一单标题平铺列表（无二次 history 标题）与角色前缀保留（保留 .hud-stage-label 防徽章裁切）
     assert.match(HUD_STYLES_CSS, /\.hud-stage-label\s*\{[^}]*text-overflow:\s*ellipsis/);
-    assert.match(HUD_STYLES_CSS, /\.hud-ctx-history-title\s*\{[^}]*border-top:/);
     assert.match(HUD_STYLES_CSS, /\.hud-stage-badge\s*\{[^}]*flex:\s*0\s+0\s+auto/);
 
     const historyMetrics = {
@@ -2503,11 +2509,23 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
 
     for (const lang of ['zh', 'en']) {
       const inst = renderWithLang(historyMetrics, lang);
+      assert.equal(
+        inst.shadow.querySelector('#pop-ctx-prefix').textContent,
+        lang === 'en' ? 'Current Context · Carbon ' : '当前上下文 · Carbon '
+      );
+      const popRole = inst.shadow.querySelector('#pop-ctx-role');
+      assert.equal(popRole.hasAttribute('hidden'), false);
+      assert.equal(popRole.classList.contains('is-role-planner'), true);
+      assert.equal(popRole.textContent, lang === 'en' ? 'Plan' : '规划');
+      assert.equal(
+        inst.shadow.querySelector('#lbl-ctx-stages').textContent,
+        lang === 'en' ? 'Prior Model Context' : '曾用模型上下文'
+      );
       const listHtml = inst.shadow.querySelector('#hud-ctx-stages-list').innerHTML;
       assert.equal(listHtml.includes(lang === 'en' ? 'Exec Stage' : '执行阶段'), true);
       assert.equal(listHtml.includes(lang === 'en' ? 'Pending' : '待介入'), true);
-      assert.equal(listHtml.includes(lang === 'en' ? 'Earlier in Session' : '本对话曾用模型'), true);
-      assert.equal((listHtml.match(/class="hud-ctx-history-title"/g) || []).length, 1, 'history 标题应只渲染一次');
+      assert.equal(listHtml.includes('hud-ctx-history-title'), false, '统一列表不应再渲染二次 history 标题');
+      assert.equal(listHtml.includes('<span class="hud-stage-label">Carbon</span>'), false, 'Option A 底部列表不得重复渲染当前活跃规划模型');
       assert.equal(listHtml.includes('<span class="hud-stage-label">Hydrogen (High)</span>'), true);
       assert.equal(listHtml.includes('<span class="hud-stage-label">3.8 Flash (High)</span>'), true);
       assert.equal(listHtml.includes('<span class="hud-stage-label">Sonnet 4.6</span>'), true);
@@ -2520,12 +2538,96 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       };
       inst.renderModelStagesList(domList, historyMetrics.context.modelStages, false);
       const historyNodes = domList.children.filter((n) => n.className === 'hud-ctx-history-title');
-      assert.equal(historyNodes.length, 1);
-      assert.equal(historyNodes[0].textContent, lang === 'en' ? 'Earlier in Session' : '本对话曾用模型');
+      assert.equal(historyNodes.length, 0);
       const stageNodes = domList.children.filter((n) => n.classList.contains('hud-stage-item'));
       assert.equal(stageNodes.length, 5);
       const firstLabel = stageNodes[0].children[0].children[0].children[1];
       assert.equal(firstLabel.className, 'hud-stage-label');
+    }
+
+    // 3c. 验证全 pending 非活跃列表使用“待切换模型 / Pending Model”，以及无模型短名时的顶部前缀兜底
+    const pendingOnlyMetrics = {
+      availability: 'ready',
+      session: { turns: 1, steps: 2, compactionCount: 0 },
+      tokens: { totalTokens: 10000, cacheHitRate: 0.5 },
+      context: {
+        hasUsageData: true,
+        modelId: 'gemini-4-carbon',
+        modelDisplayName: 'Orchestrator (Carbon)',
+        modelShortLabel: 'Carbon',
+        modelCompactLabel: 'C',
+        isMultiModel: true,
+        isOrchestrator: true,
+        usedTokens: 5000,
+        peakContextTokens: 5000,
+        capacityTokens: 512000,
+        usedRatio: 5000 / 512000,
+        usedRatioFormatted: '0.98%',
+        breakdown: { cachedContextTokens: 2000, uncachedContextTokens: 3000, latestOutputTokens: 200 },
+        modelStages: [
+          {
+            slotKey: 'orchestrator:carbon',
+            role: 'planner',
+            section: 'primary',
+            modelId: 'gemini-4-carbon',
+            modelDisplayName: 'Orchestrator (Carbon)',
+            shortLabel: 'Carbon',
+            compactLabel: 'C',
+            hasUsageData: true,
+            isActive: true,
+            usedTokens: 5000,
+            peakContextTokens: 5000,
+            capacityTokens: 512000,
+            usedRatio: 5000 / 512000,
+            usedRatioFormatted: '0.98%',
+          },
+          {
+            slotKey: 'orchestrator:executor_pending',
+            role: 'executor',
+            section: 'primary',
+            modelId: 'pending',
+            modelDisplayName: '',
+            shortLabel: '',
+            compactLabel: '',
+            hasUsageData: false,
+            isActive: false,
+            usedTokens: 0,
+            peakContextTokens: 0,
+            capacityTokens: 512000,
+            usedRatio: 0,
+            usedRatioFormatted: '0%',
+          },
+        ],
+      },
+    };
+    for (const lang of ['zh', 'en']) {
+      const pendingInst = renderWithLang(pendingOnlyMetrics, lang);
+      assert.equal(
+        pendingInst.shadow.querySelector('#pop-ctx-prefix').textContent,
+        lang === 'en' ? 'Current Context · Carbon ' : '当前上下文 · Carbon '
+      );
+      const pendingRole = pendingInst.shadow.querySelector('#pop-ctx-role');
+      assert.equal(pendingRole.hasAttribute('hidden'), false);
+      assert.equal(pendingRole.textContent, lang === 'en' ? 'Plan' : '规划');
+      assert.equal(
+        pendingInst.shadow.querySelector('#lbl-ctx-stages').textContent,
+        lang === 'en' ? 'Pending Model' : '待切换模型'
+      );
+      const bareInst = renderWithLang({
+        ...pendingOnlyMetrics,
+        context: {
+          ...pendingOnlyMetrics.context,
+          modelId: 'pending',
+          modelDisplayName: '',
+          modelShortLabel: '',
+          modelCompactLabel: '',
+        },
+      }, lang);
+      assert.equal(
+        bareInst.shadow.querySelector('#pop-ctx-prefix').textContent,
+        lang === 'en' ? 'Current Context ' : '当前上下文 '
+      );
+      assert.equal(bareInst.shadow.querySelector('#pop-ctx-role').hasAttribute('hidden'), true);
     }
 
     // 4. 验证渲染阶段的模型名 XSS 防护转义
@@ -2771,7 +2873,7 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
     });
 
     for (const lang of ['zh', 'en']) {
-      // A. 当前活跃 Carbon 自身 0 次压缩：底部会话胶囊仍显示总压缩次数 6 (danger)，但 #val-ctx-peak 不得误挂历史模型压缩后缀
+      // A. 当前活跃 Carbon/Neon 自身 0 次压缩：常驻胶囊必须隐藏徽标（不得误挂搭档/历史模型压缩数），会话总压缩数 6 展示于对话统计弹窗
       const instZeroActive = new HudInstance(`ctx-stage-comp-0-${lang}`, { languageMode: lang });
       instZeroActive.shadow = new FakeShadowRoot('open', null);
       instZeroActive.shadow.innerHTML = instZeroActive.buildHudHtml();
@@ -2779,9 +2881,18 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       instZeroActive.applyMetricsToDom(payload0);
 
       const sessionBadge = instZeroActive.shadow.querySelector('#hud-compaction-badge');
-      assert.equal(sessionBadge.hasAttribute('hidden'), false);
-      assert.equal(sessionBadge.getAttribute('data-compaction-tier'), 'danger');
-      assert.equal(sessionBadge.textContent, '6');
+      assert.equal(sessionBadge.hasAttribute('hidden'), true, '当前展示模型未压缩时，常驻胶囊不得显示其他模型的压缩徽标');
+      assert.equal(sessionBadge.textContent, '');
+      assert.equal(instZeroActive.shadow.querySelector('.capsule-context').classList.contains('has-compaction'), false);
+      assert.equal(
+        instZeroActive.shadow.querySelector('.capsule-context').getAttribute('aria-label').includes(lang === 'en' ? 'Compacted' : '已压缩'),
+        false
+      );
+      assert.equal(instZeroActive.shadow.querySelector('#row-session-compactions'), null);
+      assert.equal(
+        instZeroActive.shadow.querySelector('#hud-popover-session').getAttribute('data-exact-summary').includes('compactions=6'),
+        true
+      );
       assert.equal(
         instZeroActive.shadow.querySelector('#val-ctx-peak').textContent,
         '256K tok',
@@ -2850,12 +2961,15 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       assert.equal(findByClass(stageNodes[3], 'hud-stage-compaction')?.getAttribute('data-compaction-tier'), 'danger');
       assert.equal(findByClass(stageNodes[3], 'hud-stage-compaction')?.textContent, '3');
 
-      // B. 当前活跃 Carbon 自身发生 2 次压缩：#val-ctx-peak 仅展示当前模型的 2 次，且活跃行同时并存“当前”与数字圆圈“2”
+      // B. 当前活跃模型自身发生 2 次压缩：常驻胶囊与 #val-ctx-peak 均仅反映当前模型的 2 次，而对话统计弹窗展示全会话总计 8 次
       const instActiveComp = new HudInstance(`ctx-stage-comp-2-${lang}`, { languageMode: lang });
       instActiveComp.shadow = new FakeShadowRoot('open', null);
       instActiveComp.shadow.innerHTML = instActiveComp.buildHudHtml();
       const payload2 = buildMultiCompMetrics(2);
       instActiveComp.applyMetricsToDom(payload2);
+      assert.equal(instActiveComp.shadow.querySelector('#hud-compaction-badge').hasAttribute('hidden'), false);
+      assert.equal(instActiveComp.shadow.querySelector('#hud-compaction-badge').getAttribute('data-compaction-tier'), 'warn');
+      assert.equal(instActiveComp.shadow.querySelector('#hud-compaction-badge').textContent, '2');
       assert.equal(
         instActiveComp.shadow.querySelector('#val-ctx-peak').textContent,
         lang === 'en' ? '256K tok (2x compacted)' : '256K tok (已压缩 2 次)'
@@ -2869,7 +2983,7 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
         lang === 'en' ? 'Compacted 2 times' : '已压缩 2 次'
       );
 
-      // C. 非 Orchestrator 3 模型切换场景：标题为“曾用模型上下文 / Prior Model Context”，自动剔除当前模型防重复，且 unavailable 态清理压缩徽章
+      // C. 非 Orchestrator 3 模型切换场景：标题统一为“本对话曾用模型 / Models in Session”，自动剔除当前模型防重复，且保留曾经担任 planner/executor 的角色前缀
       const nonOrchInst = new HudInstance(`non-orch-dedup-${lang}`, { languageMode: lang });
       nonOrchInst.shadow = new FakeShadowRoot('open', null);
       nonOrchInst.shadow.innerHTML = nonOrchInst.buildHudHtml();
@@ -2912,7 +3026,7 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
             },
             {
               slotKey: 'model:gemini-4-carbon',
-              role: 'model',
+              role: 'planner',
               section: 'primary',
               modelId: 'gemini-4-carbon',
               modelDisplayName: 'Gemini 4 Carbon (Medium)',
@@ -2947,12 +3061,18 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
         },
       });
       assert.equal(
+        nonOrchInst.shadow.querySelector('#pop-ctx-prefix').textContent,
+        lang === 'en' ? 'Current Context · Hydrogen ' : '当前上下文 · Hydrogen '
+      );
+      assert.equal(nonOrchInst.shadow.querySelector('#pop-ctx-role').hasAttribute('hidden'), true);
+      assert.equal(
         nonOrchInst.shadow.querySelector('#lbl-ctx-stages').textContent,
         lang === 'en' ? 'Prior Model Context' : '曾用模型上下文'
       );
       const nonOrchListHtml = nonOrchInst.shadow.querySelector('#hud-ctx-stages-list').innerHTML;
       assert.equal(nonOrchListHtml.includes('Opus 5.5 (Medium)'), true);
-      assert.equal(nonOrchListHtml.includes('Carbon (Medium)'), true);
+      assert.equal(nonOrchListHtml.includes('<span class="hud-stage-label">Carbon</span>'), true);
+      assert.equal(nonOrchListHtml.includes(lang === 'en' ? 'class="hud-role-badge is-role-planner">Plan<' : 'class="hud-role-badge is-role-planner">规划<'), true);
       assert.equal(nonOrchListHtml.includes('Hydrogen (High)'), false, '非 Orchestrator 下半区必须剔除当前已激活模型防重复');
       assert.equal(
         nonOrchListHtml.includes(
@@ -2974,6 +3094,192 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       });
       assert.equal(nonOrchInst.shadow.querySelector('#hud-compaction-badge').hasAttribute('hidden'), true);
       assert.equal(nonOrchInst.shadow.querySelector('.capsule-context').classList.contains('has-compaction'), false);
+    }
+  });
+
+  it('OPT-01：独立子智能体轨迹分栏 (isSubagentTrajectory) 保留后端 isStreaming，普通分屏 (isSubpane) 不误亮', () => {
+    const subInst = new HudInstance('pane-sub-traj', { isSubpane: true });
+    const subHost = new FakeElement('div');
+    const subShadow = subHost.attachShadow({ mode: 'open' });
+    subHost.shadowRoot = subShadow;
+    subInst.host = subHost;
+    subInst.shadow = subShadow;
+    subShadow.innerHTML = subInst.buildHudHtml();
+    subInst.switchConversation('sub-traj-conv', 'gemini-3.8-flash', false);
+
+    subInst.updateMetrics({
+      conversationId: 'sub-traj-conv',
+      sessionRevision: subInst.getSessionRevision(),
+      updatedAt: Date.now(),
+      isStreaming: true,
+      activityPhase: 'generating',
+      session: {
+        isSubagentTrajectory: true,
+        turns: 1,
+        steps: 2,
+        activeModelStepCount: 0,
+        activeToolStepCount: 0,
+        currentTurnDurationSeconds: 1,
+      },
+    });
+    assert.equal(subInst.backendIsStreaming, true);
+    assert.equal(subInst.isStreaming, true);
+    assert.equal(subInst.activityPhase, 'generating');
+    assert.ok(subInst.turnClockTimer !== null, '子智能体分栏后端流式期间必须保持跑表运行');
+
+    // 两步交接期仅发生模型名变动且 DOM 仍无停止按钮时，不得因 domIsStreaming=false 停表冻结
+    subInst.notifyModelOrStreamingChange('gemini-4-argon', false);
+    assert.equal(subInst.isStreaming, true);
+    assert.equal(subInst.hasActiveWork, true);
+    assert.ok(subInst.turnClockTimer !== null, '模型切换通知不得冻结正在运行的子智能体轨迹跑表');
+
+    // 若 DOM 经历从 true -> false 显式结束一轮，同步复位 backendIsStreaming
+    subInst.notifyModelOrStreamingChange('gemini-4-argon', true);
+    subInst.notifyModelOrStreamingChange('gemini-4-argon', false);
+    assert.equal(subInst.backendIsStreaming, false);
+    assert.equal(subInst.isStreaming, false);
+
+    // 对比：普通分屏对话 (isSubpane=true, isSubagentTrajectory=false) 挂着后台子代理时，不得把前台小圆点点亮
+    const splitMain = new HudInstance('pane-split-main', { isSubpane: true });
+    const mainHost = new FakeElement('div');
+    const mainShadow = mainHost.attachShadow({ mode: 'open' });
+    mainHost.shadowRoot = mainShadow;
+    splitMain.host = mainHost;
+    splitMain.shadow = mainShadow;
+    mainShadow.innerHTML = splitMain.buildHudHtml();
+    splitMain.switchConversation('split-main-conv', 'gemini-3.8-flash', false);
+    splitMain.updateMetrics({
+      conversationId: 'split-main-conv',
+      sessionRevision: splitMain.getSessionRevision(),
+      updatedAt: Date.now(),
+      isStreaming: true,
+      isSubagentRunning: true,
+      runningSubagentCount: 1,
+      activityPhase: 'idle',
+      session: {
+        isSubagentTrajectory: false,
+        turns: 1,
+        steps: 2,
+        activeModelStepCount: 0,
+        activeToolStepCount: 0,
+      },
+    });
+    assert.equal(splitMain.isStreaming, false, '普通分屏主会话不得因后台子代理将前台 isStreaming 抬成 true');
+    assert.equal(splitMain.activityPhase, 'idle');
+    assert.equal(splitMain.isSubagentRunning, true);
+
+    subInst.dispose();
+    splitMain.dispose();
+  });
+
+  it('2.34.0 DOM data-context-window 探针、收窄 MutationObserver、syncAllSessions 刷新代际防竞态与通用阶段短名', () => {
+    const observedCalls = [];
+    const OrigMO = globalThis.MutationObserver;
+    const origDoc = globalThis.document;
+    globalThis.MutationObserver = class {
+      constructor(cb) { this.cb = cb; }
+      observe(target, opts) { observedCalls.push({ target, opts }); }
+      disconnect() {}
+    };
+    const fakeBody = { nodeType: 1, querySelectorAll: () => [] };
+    const fakeDocEl = { nodeType: 1 };
+    globalThis.document = {
+      body: fakeBody,
+      documentElement: fakeDocEl,
+      hidden: false,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+    try {
+      const bridgeEvents = [];
+      const manager = new AntigravityHudManager({
+        onBridgeEvent: (e) => bridgeEvents.push(e),
+      });
+      manager.start();
+
+      // 1. 验证 document.body subtree MutationObserver 不再监听全子树 style / class
+      const subtreeObs = observedCalls.find((c) => c.target === fakeBody && c.opts?.subtree === true);
+      assert.ok(subtreeObs, '应存在 document.body subtree observer');
+      assert.equal(subtreeObs.opts.attributeFilter.includes('style'), false, 'subtree observer 不得监听 style');
+      assert.equal(subtreeObs.opts.attributeFilter.includes('class'), false, 'subtree observer 不得监听 class');
+      assert.equal(subtreeObs.opts.attributeFilter.includes('data-context-window'), true);
+
+      // 2. 验证 data-context-window 解析与非品牌硬编码触发器解析
+      assert.equal(manager.parseContextWindowTokens('512k'), 512_000);
+      assert.equal(manager.parseContextWindowTokens('1M'), 1_000_000);
+      assert.equal(manager.parseContextWindowTokens('256000'), 256_000);
+      assert.equal(manager.parseContextWindowTokens('invalid'), undefined);
+
+      const mockTrigger = new FakeElement('button');
+      mockTrigger.setAttribute('data-testid', 'model-selector-trigger');
+      mockTrigger.setAttribute('data-context-window', '512k');
+      mockTrigger.setAttribute('aria-label', 'Select model, current: Orchestrator Gemini 4 Neon High');
+      mockTrigger.textContent = 'Orchestrator Gemini 4 Neon High';
+      const mockView = new FakeElement('div');
+      mockView.appendChild(mockTrigger);
+      assert.equal(manager.resolveActiveModel(mockView, 1), 'Orchestrator Gemini 4 Neon High');
+      assert.equal(manager.resolveActiveModelCapacity(mockView, 1), 512_000);
+
+      // 3. 验证 syncAllSessions 推进 sessionRevision 防止旧在途轮询包倒灌覆盖
+      const inst = new HudInstance('pane-sync', {
+        paneSlotId: 'pane-sync',
+        onBridgeEvent: (e) => bridgeEvents.push(e),
+        allocateRevision: () => manager.allocateSessionRevision(),
+      });
+      const host = new FakeElement('div');
+      const shadow = host.attachShadow({ mode: 'open' });
+      host.shadowRoot = shadow;
+      inst.host = host;
+      inst.shadow = shadow;
+      shadow.innerHTML = inst.buildHudHtml();
+      const rev1 = inst.switchConversation('conv-sync-race', 'Orchestrator Gemini 4 Neon High', false, false, 0, null, 'idle', 512_000);
+      assert.equal(bridgeEvents.at(-1)?.modelCapacity, 512_000);
+      assert.equal(inst.updateMetrics({
+        conversationId: 'conv-sync-race',
+        paneSlotId: 'pane-sync',
+        sessionRevision: rev1,
+        metricsSequence: 200,
+        updatedAt: Date.now(),
+        context: { hasUsageData: true, usedTokens: 90_000, capacityTokens: 512_000, usedRatio: 90_000 / 512_000 },
+      }), true);
+
+      manager.instances.set('pane-sync', inst);
+      manager.reconcileMounts = () => {};
+      manager.syncAllSessions();
+      const rev2 = inst.getSessionRevision();
+      assert.ok(rev2 > rev1, 'syncAllSessions 必须推进单调 sessionRevision');
+      // 旧代际在途乱序旧包 (rev1, seq=150) 必须被严格拒收
+      assert.equal(inst.updateMetrics({
+        conversationId: 'conv-sync-race',
+        paneSlotId: 'pane-sync',
+        sessionRevision: rev1,
+        metricsSequence: 150,
+        updatedAt: Date.now(),
+        context: { hasUsageData: true, usedTokens: 10_000, capacityTokens: 512_000, usedRatio: 10_000 / 512_000 },
+      }), false, '旧代际在途轮询包不得覆盖最新状态');
+      assert.equal(inst.lastMetrics.context.usedTokens, 90_000);
+
+      // 4. 验证通用阶段短名（含 Orchestrator 前缀、第三方厂商前缀与未知待介入规划阶段中性文案）
+      const listEl = new FakeElement('div');
+      inst.renderModelStagesList(
+        listEl,
+        [
+          { slotKey: 'orchestrator:planner_pending', role: 'planner', modelId: 'pending', shortLabel: '', hasUsageData: false, isActive: false },
+          { slotKey: 'model:openai-gpt-5-2', role: 'model', modelId: 'gpt-5.2', modelDisplayName: 'Orchestrator OpenAI GPT-5.2', shortLabel: 'GPT-5.2', hasUsageData: true, isActive: true, usedTokens: 50_000, capacityTokens: 200_000, usedRatio: 0.25 },
+        ],
+        false
+      );
+      assert.match(listEl.innerHTML, /规划阶段/);
+      assert.match(listEl.innerHTML, /GPT-5\.2/);
+      assert.equal(/Orchestrator|OpenAI/.test(listEl.innerHTML), false);
+
+      inst.dispose();
+      manager.dispose();
+    } finally {
+      globalThis.MutationObserver = OrigMO;
+      globalThis.document = origDoc;
     }
   });
 });

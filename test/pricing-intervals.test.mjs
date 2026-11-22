@@ -8,6 +8,8 @@ import { UsageStatsManager, resolveDatabaseModelFullName } from '../dist/usage.j
 import { resolvePricingForTimestamp, calculateEstimatedUsd, matchPricingKeys, localizePricingProvenance } from '../dist/pricing.js';
 import { ProtobufWriter } from '../dist/protobuf.js';
 import { MODEL_PRICES } from '../dist/model-catalog.js';
+import { normalizeModelId, THINKING_EFFORT_SUFFIX_RE } from '../dist/model-identity.js';
+import { resolveModelCapacity } from '../dist/hud.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir } from 'node:fs/promises';
@@ -48,12 +50,15 @@ test('时序费率解析：正确命中历史时段与当前时段', () => {
 });
 
 test('静态模型费率向后兼容：单对象格式全时段稳定生效', () => {
-  const gpt4o = MODEL_PRICES['gpt-4o'];
-  assert.ok(!Array.isArray(gpt4o) && !gpt4o.intervals, 'gpt-4o 保持单对象格式且无时段');
+  const staticFixture = { model: 'static-fixture', input: 2.5, output: 10, cached: 1.25 };
   const pastStamp = Math.floor(Date.parse('2025-01-01T00:00:00Z') / 1000);
   const futureStamp = Math.floor(Date.parse('2028-01-01T00:00:00Z') / 1000);
-  assert.equal(resolvePricingForTimestamp(gpt4o, pastStamp).input, 2.5);
-  assert.equal(resolvePricingForTimestamp(gpt4o, futureStamp).input, 2.5);
+  assert.equal(resolvePricingForTimestamp(staticFixture, pastStamp).input, 2.5);
+  assert.equal(resolvePricingForTimestamp(staticFixture, futureStamp).input, 2.5);
+
+  const gpt4o = MODEL_PRICES['gpt-4o'];
+  assert.ok(gpt4o, 'gpt-4o 必须存在内置单价');
+  assert.equal(resolvePricingForTimestamp(gpt4o, pastStamp, 'gpt-4o')?.input, 2.5);
 });
 
 test('跨时段真实事件累计：历史事件金额永久冻结，不随调价回溯', () => {
@@ -201,9 +206,9 @@ test('全自动智能补齐未计价（零按钮、用户无感）：仅补齐�
   manager.rateLocksDirty = true;
   await manager.saveRateLocks();
 
-  // 2. 模拟自动补齐自愈
+  // 2. 模拟自动补齐自愈：清理未计价旧锁，但无新定价落锁时不虚报补齐条数
   const healed = await manager.autoHealUnpricedHistory();
-  assert.equal(healed, 1, '应精准识别并清理 1 条未计价条目');
+  assert.equal(healed, 0, '未实际获得新定价落锁时不得虚报已补齐条数');
   assert.equal(manager.rateLocks[lockedKey].usd, 5.0, '原本正常锁定的记录金额绝不受影响');
   assert.equal(manager.rateLocks[unpricedKey], undefined, '未计价记录旧锁已被释放以允许重新匹配新价');
 
@@ -217,14 +222,16 @@ test('Hydrogen 定价、xhigh 后缀匹配与 Antigravity 动态模型过滤（�
 
   const hydrogen = MODEL_PRICES['gemini-4-hydrogen'];
   assert.ok(hydrogen && !Array.isArray(hydrogen), 'gemini-4-hydrogen 必须存在内置单价');
-  assert.equal(hydrogen.input, 1.5);
-  assert.equal(hydrogen.output, 7.5);
-  assert.equal(hydrogen.cached, 0.075);
-  assert.equal(hydrogen.cacheWrite, 0);
+  assert.ok(Number.isFinite(hydrogen.input) && hydrogen.input > 0);
+  assert.ok(Number.isFinite(hydrogen.output) && hydrogen.output > 0);
+  assert.ok(Number.isFinite(hydrogen.cached) && hydrogen.cached >= 0);
   const beforeCacheWriteSec = Math.floor(Date.parse('2026-11-13T12:00:00Z') / 1000);
   const afterCacheWriteSec = Math.floor(Date.parse('2027-01-12T12:00:00Z') / 1000);
   const resolvedBefore = resolvePricingForTimestamp(hydrogen, beforeCacheWriteSec, 'gemini-4-hydrogen');
   const resolvedAfter = resolvePricingForTimestamp(hydrogen, afterCacheWriteSec, 'gemini-4-hydrogen');
+  assert.equal(resolvedBefore?.input, 1.5);
+  assert.equal(resolvedBefore?.output, 7.5);
+  assert.equal(resolvedBefore?.cached, 0.075);
   assert.equal(resolvedBefore?.cacheWrite, 0);
   assert.equal(resolvedAfter?.cacheWrite, 1.875);
   assert.equal(calculateEstimatedUsd(1_000_000, 100_000, 2_000_000, resolvedBefore, 500_000), 1.5 + 0.75 + 0.15);
@@ -273,7 +280,7 @@ test('已下架历史模型从价格基准过滤后，历史 SQLite 用量费用
   await mkdir(convDir, { recursive: true });
   const dbPath = join(convDir, 'retired-history.db');
 
-  const nowSec = Math.floor(Date.now() / 1000);
+  const novSec = Math.floor(Date.parse('2026-11-15T12:00:00Z') / 1000);
   const octSec = Math.floor(Date.parse('2026-10-15T12:00:00Z') / 1000);
   const mkBlob = (modelId, inputTok, outputTok, cachedTok, stamp) => {
     const usageMsg = Buffer.concat([
@@ -296,7 +303,7 @@ test('已下架历史模型从价格基准过滤后，历史 SQLite 用量费用
      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
      INSERT INTO gen_metadata (idx, data) VALUES (1, X'${mkBlob('gpt-4o', 1_000_000, 0, 0, octSec)}');
      INSERT INTO gen_metadata (idx, data) VALUES (2, X'${mkBlob('gemini-3.8-flash-n', 1_000_000, 0, 0, octSec)}');
-     INSERT INTO gen_metadata (idx, data) VALUES (3, X'${mkBlob('gemini-4-hydrogen-xhigh', 1_000_000, 0, 0, nowSec)}');`,
+     INSERT INTO gen_metadata (idx, data) VALUES (3, X'${mkBlob('gemini-4-hydrogen-xhigh', 1_000_000, 0, 0, novSec)}');`,
   ]);
 
   const manager = new UsageStatsManager({ geminiDir: temp, stateDir: temp });
@@ -401,16 +408,18 @@ test('Gemini 4 Neon 定价、全档位/Orchestrator 别名映射、2027-01-12 �
 
   const neon = MODEL_PRICES['gemini-4-neon'];
   assert.ok(neon && !Array.isArray(neon), 'gemini-4-neon 必须存在内置单价');
-  assert.equal(neon.input, 3.0);
-  assert.equal(neon.output, 15.0);
-  assert.equal(neon.cached, 0.15);
-  assert.equal(neon.cacheWrite, 0);
+  assert.ok(Number.isFinite(neon.input) && neon.input > 0);
+  assert.ok(Number.isFinite(neon.output) && neon.output > 0);
+  assert.ok(Number.isFinite(neon.cached) && neon.cached >= 0);
 
   const beforeCacheWriteSec = Math.floor(Date.parse('2026-11-19T12:00:00Z') / 1000);
   const afterCacheWriteSec = Math.floor(Date.parse('2027-01-12T12:00:00Z') / 1000);
   const resolvedBefore = resolvePricingForTimestamp(neon, beforeCacheWriteSec, 'gemini-4-neon');
   const resolvedAfter = resolvePricingForTimestamp(neon, afterCacheWriteSec, 'gemini-4-neon');
 
+  assert.equal(resolvedBefore?.input, 3.0);
+  assert.equal(resolvedBefore?.output, 15.0);
+  assert.equal(resolvedBefore?.cached, 0.15);
   assert.equal(resolvedBefore?.cacheWrite, 0);
   assert.equal(resolvedAfter?.cacheWrite, 3.75);
   assert.equal(calculateEstimatedUsd(1_000_000, 100_000, 2_000_000, resolvedBefore, 500_000), 3.0 + 1.5 + 0.3);
@@ -421,4 +430,48 @@ test('Gemini 4 Neon 定价、全档位/Orchestrator 别名映射、2027-01-12 �
   assert.equal(/[\u4e00-\u9fff]/.test(enBefore?.platform ?? ''), false);
   assert.equal(/[\u4e00-\u9fff]/.test(enBefore?.conditions ?? ''), false);
   assert.equal(/[\u4e00-\u9fff]/.test(enAfter?.conditions ?? ''), false);
+});
+
+test('OPT-07/08/09：gemini-3.6-flash 时序费率、Sonnet 溯源、Claude Fable/Mythos 与 GPT-6+ 归一化及 minimal/max 剥离', async () => {
+  const catalogRaw = JSON.parse(
+    await readFile(new URL('../assets/model-catalog.json', import.meta.url), 'utf8')
+  );
+  assert.equal(
+    catalogRaw.prices['claude-sonnet-4-6']?.provenance?.sourceUrl,
+    'https://platform.claude.com/docs/en/about-claude/pricing'
+  );
+  assert.equal(
+    catalogRaw.prices['claude-sonnet-5-5']?.provenance?.sourceUrl,
+    'https://platform.claude.com/docs/en/about-claude/pricing'
+  );
+
+  const g36 = MODEL_PRICES['gemini-3.6-flash'];
+  const stamp2026 = Math.floor(Date.parse('2026-11-19T12:00:00Z') / 1000);
+  const stamp2027 = Math.floor(Date.parse('2027-01-05T12:00:00Z') / 1000);
+  const p2026 = resolvePricingForTimestamp(g36, stamp2026, 'gemini-3.6-flash');
+  const p2027 = resolvePricingForTimestamp(g36, stamp2027, 'gemini-3.6-flash');
+  assert.equal(p2026?.input, 0.75);
+  assert.equal(p2026?.output, 3.75);
+  assert.equal(p2026?.cached, 0.075);
+  assert.equal(p2027?.input, 1.5);
+  assert.equal(p2027?.output, 7.5);
+  assert.equal(p2027?.cached, 0.15);
+
+  // Claude 新家族双向归一化且排除思考词元误翻
+  assert.equal(normalizeModelId('claude-5.2-fable'), 'claude-fable-5-2');
+  assert.equal(normalizeModelId('claude-mythos-5.2'), 'claude-mythos-5-2');
+  assert.equal(normalizeModelId('claude-4.5-thinking'), 'claude-4.5-thinking');
+
+  const fableCap = resolveModelCapacity('claude-fable-5-2');
+  assert.equal(fableCap.isFallback, false);
+  assert.equal(fableCap.displayName, 'Claude Fable 5.2');
+  const gpt6Cap = resolveModelCapacity('gpt-6.2-astra');
+  assert.equal(gpt6Cap.isFallback, false);
+  assert.equal(gpt6Cap.displayName, 'GPT-6.2 Astra');
+
+  // minimal / max 后缀一致性
+  assert.equal(matchPricingKeys('claude-opus-5-5-minimal'), 'claude-opus-5-5');
+  assert.equal(matchPricingKeys('claude-sonnet-5-5-max'), 'claude-sonnet-5-5');
+  assert.equal('gemini-4-neon-minimal'.replace(THINKING_EFFORT_SUFFIX_RE, ''), 'gemini-4-neon');
+  assert.equal('gemini-4-neon-max'.replace(THINKING_EFFORT_SUFFIX_RE, ''), 'gemini-4-neon');
 });

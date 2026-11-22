@@ -305,7 +305,7 @@ test('runtime/hud-i18n.js 与 assets/i18n/*.json#hud 保持全量词条逐字一
   assert.deepEqual(Object.keys(zhPack.hud).sort(), Object.keys(enPack.hud).sort());
   assert.deepEqual(Object.keys(HUD_I18N['zh-Hans']).sort(), Object.keys(zhPack.hud).sort());
   assert.deepEqual(Object.keys(HUD_I18N.en).sort(), Object.keys(enPack.hud).sort());
-  assert.equal(Object.keys(zhPack.hud).length, 83);
+  assert.equal(Object.keys(zhPack.hud).length, 85);
   assert.deepEqual(HUD_I18N['zh-Hans'], zhPack.hud);
   assert.deepEqual(HUD_I18N.en, enPack.hud);
 

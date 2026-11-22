@@ -73,6 +73,8 @@ final class AccountPolicySheet: NSObject {
     private var reserveSubLabel: NSTextField!
     private var candidateTitleLabel: NSTextField!
     private var candidateSubLabel: NSTextField!
+    private let initialRawMonitoredModel: String
+    private var userChangedMonitoredScope = false
     private let cancelButton = button(L10n.t("common.cancel", fallback: "取消"), target: nil, action: #selector(cancel))
     let saved: () -> Void
     var onDismiss: (() -> Void)?
@@ -87,9 +89,10 @@ final class AccountPolicySheet: NSObject {
     init(app: Assistant, config: [String: Any], saved: @escaping () -> Void) {
         self.app = app
         self.activeAccount = app.resolvedActiveAccount()
+        self.initialRawMonitoredModel = (config["monitored_model"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         self.saved = saved
         super.init()
-        window.title = L10n.t("policy.title", fallback: "智能切换配置")
+        window.title = L10n.t("policy.title", fallback: "备用推荐配置")
         window.isReleasedWhenClosed = false
 
         strategyPopup.addItem(withTitle: L10n.t("policy.strategy.priority", fallback: "配额充裕优先"))
@@ -210,7 +213,7 @@ final class AccountPolicySheet: NSObject {
         errorLabel.isHidden = true
 
         let headerBadge = iconBadge("arrow.triangle.2.circlepath", tint: Design.blue, size: 32)
-        let titleLabel = text(L10n.t("policy.title", fallback: "智能切换配置"), size: 16, weight: .semibold, color: .labelColor)
+        let titleLabel = text(L10n.t("policy.title", fallback: "备用推荐配置"), size: 16, weight: .semibold, color: .labelColor)
         self.titleLabel = titleLabel
         let heading = horizontal([headerBadge, titleLabel, flexibleSpace()], spacing: 10)
         heading.alignment = .centerY
@@ -254,7 +257,7 @@ final class AccountPolicySheet: NSObject {
     }
 
     private func syncLocalizedChrome() {
-        let title = L10n.t("policy.title", fallback: "智能切换配置")
+        let title = L10n.t("policy.title", fallback: "备用推荐配置")
         window.title = title
         titleLabel.stringValue = title
         let selectedStrat = (strategyPopup.selectedItem?.representedObject as? String) ?? "priority"
@@ -298,7 +301,7 @@ final class AccountPolicySheet: NSObject {
         for constraint in popupWidthConstraints {
             constraint.constant = unifiedPopupWidth
         }
-        monitoredScopeChanged()
+        updateMonitoredSubtitle()
     }
 
     private static func syncWrappingLabelWidths(in view: NSView) {
@@ -329,12 +332,17 @@ final class AccountPolicySheet: NSObject {
         surface.layoutSubtreeIfNeeded()
     }
 
-    @objc func monitoredScopeChanged() {
+    private func updateMonitoredSubtitle() {
         let selectedKey = (modelPopup.selectedItem?.representedObject as? String) ?? "all"
         let sub = QuotaPresentation.monitoredScopeSubtitle(for: selectedKey, activeAccount: activeAccount)
         monitoredSubLabel.stringValue = sub
         monitoredSubLabel.isHidden = sub.isEmpty
         resizeSheetToFit()
+    }
+
+    @objc func monitoredScopeChanged() {
+        userChangedMonitoredScope = true
+        updateMonitoredSubtitle()
     }
 
     func show(in parent: NSWindow, onDismiss: @escaping () -> Void) {
@@ -372,7 +380,8 @@ final class AccountPolicySheet: NSObject {
         errorLabel.isHidden = true
         resizeSheetToFit()
         let strat = strategyPopup.selectedItem?.representedObject as? String ?? "priority"
-        let model = modelPopup.selectedItem?.representedObject as? String ?? "all"
+        let selectedModel = modelPopup.selectedItem?.representedObject as? String ?? "all"
+        let model = (!userChangedMonitoredScope && !initialRawMonitoredModel.isEmpty) ? initialRawMonitoredModel : selectedModel
         saveButton.isEnabled = false
         app.bridge.send([
             "command": "auto_switch_set",

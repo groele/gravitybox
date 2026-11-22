@@ -334,11 +334,21 @@ final class UsagePage: NSObject {
             "cacheWrite": cacheWritePart,
             "output": self.formatCompactTokens(output)
         ])
+        let rawRows = (value["byModel"] as? [[String: Any]]) ?? (value["models"] as? [[String: Any]]) ?? []
+        let rows = ModelUsageFold.sortByUsage(ModelUsageFold.foldThinkingVariants(rawRows))
+        let displayUnpricedCount: Int = rows.isEmpty
+            ? ((summary["unpricedModels"] as? Int) ?? (summary["unpriced_models"] as? Int) ?? (value["unpricedModels"] as? Int) ?? 0)
+            : rows.filter { row in
+                let usd = doubleVal(row, "estimatedUsd", fallback: doubleVal(row, "estimated_usd"))
+                let isPriced = (row["priced"] as? Bool) ?? (usd > 0)
+                return !isPriced
+            }.count
         let pricedCount = (summary["pricedModels"] as? Int) ?? (summary["priced_models"] as? Int) ?? (value["pricedModels"] as? Int) ?? 0
         let unpricedCount = (summary["unpricedModels"] as? Int) ?? (summary["unpriced_models"] as? Int) ?? (value["unpricedModels"] as? Int) ?? 0
+        let effectiveUnpricedCount = max(displayUnpricedCount, unpricedCount > 0 && rows.isEmpty ? unpricedCount : 0)
         self.costTitle.stringValue = L10n.t("usage.section.cost")
-        let isAllUnpriced = unpricedCount > 0 && pricedCount == 0 && usd == 0
-        let isPartialCost = unpricedCount > 0 && !isAllUnpriced
+        let isAllUnpriced = (unpricedCount > 0 || displayUnpricedCount > 0) && pricedCount == 0 && usd == 0
+        let isPartialCost = (unpricedCount > 0 || displayUnpricedCount > 0) && !isAllUnpriced
         self.usdMetric.stringValue = isAllUnpriced ? L10n.t("menu_panel.usage.unpriced") : self.formatUsd(usd)
         self.costStatusBadge.isHidden = !isPartialCost
         if isPartialCost {
@@ -356,13 +366,12 @@ final class UsagePage: NSObject {
         let avgIn = requests > 0 ? total / requests : 0
         self.requestsDetail.stringValue = requests > 0 ? L10n.t("usage.requests.avg_per_call", ["count": self.formatCompactTokens(avgIn)]) : L10n.t("usage.requests.none")
 
-        self.updateReadStatus(summary)
+        self.updateReadStatus(summary, foldedUnpricedCount: effectiveUnpricedCount)
 
-        let priceRows = value["byModel"] as? [[String: Any]] ?? []
-        let outdated = priceRows.filter { ($0["pricingStatus"] as? String ?? "") == "expired" }.count
+        let outdated = rows.filter { ($0["pricingStatus"] as? String ?? "") == "expired" }.count
         var costNotes: [String] = []
-        if unpricedCount > 0 {
-            costNotes.append(L10n.t("usage.cost.unpriced_models_note", ["count": unpricedCount]))
+        if effectiveUnpricedCount > 0 {
+            costNotes.append(L10n.t("usage.cost.unpriced_models_note", ["count": effectiveUnpricedCount]))
         }
         if outdated > 0 {
             costNotes.append(L10n.t("usage.cost.outdated_models", ["count": outdated]))
@@ -375,7 +384,6 @@ final class UsagePage: NSObject {
             self.usdDetail.textColor = .secondaryLabelColor
             self.usdDetail.isHidden = true
         }
-        let rows = (value["byModel"] as? [[String: Any]]) ?? (value["models"] as? [[String: Any]]) ?? []
         self.modelRows = rows
         let scroll = self.view as? NSScrollView
         let preservedOrigin = self.restoreScroll ? self.app.usageScrollOrigin : (scroll?.contentView.bounds.origin ?? .zero)
@@ -394,13 +402,13 @@ final class UsagePage: NSObject {
         }
     }
 
-    func updateReadStatus(_ summary: [String: Any]) {
+    func updateReadStatus(_ summary: [String: Any], foldedUnpricedCount: Int? = nil) {
         let failed = intVal(summary, "failedDatabasesCount", fallback: intVal(summary, "failed_databases_count"))
         let skipped = intVal(summary, "skippedLargeRecords", fallback: intVal(summary, "skipped_large_records"))
         let unknown = intVal(summary, "unknownTimeRecords")
         let scanned = intVal(summary, "databasesScanned")
         let discovered = intVal(summary, "databasesDiscovered", fallback: scanned)
-        let unpriced = intVal(summary, "unpricedModels", fallback: intVal(summary, "unpriced_models"))
+        let unpriced = foldedUnpricedCount ?? intVal(summary, "unpricedModels", fallback: intVal(summary, "unpriced_models"))
         let scope = InterfaceText.usageScope(scanned: scanned, discovered: discovered, failed: failed, skipped: skipped, unknown: unknown)
         let cached = summary["availability"] as? String == "cached"
         let rawWarnings = summary["pricing_warnings"] as? [String] ?? []
@@ -445,7 +453,7 @@ final class UsagePage: NSObject {
         let signpost = PerformanceSignpost.begin("UsageChartsAndBreakdown")
         defer { PerformanceSignpost.end("UsageChartsAndBreakdown", signpost) }
         if let rows = (value["byModel"] as? [[String: Any]]) ?? (value["models"] as? [[String: Any]]) {
-            self.modelRows = rows
+            self.modelRows = ModelUsageFold.foldThinkingVariants(rows)
         }
         // 1. 更新趋势柱状图
         if segIdx == 0 {

@@ -14,7 +14,7 @@ import { ProtobufWriter } from "../dist/protobuf.js";
 import { getIpcEndpoint } from "../dist/platform.js";
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
-describeContractGroup("undefined · audit-p1-backend", { concurrency: false }, async () => {
+describeContractGroup("IPC 契约 · audit-p1-backend", { concurrency: false }, async () => {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const BUCKET_RESET_MS = 4 * 60 * 60 * 1000 + 19 * 60 * 1000; // 4h19m
@@ -160,7 +160,7 @@ test('C01/C02: auto_switch_best 默认只读、execute 需确认，IPC 响应不
 });
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
-describeContractGroup("undefined · optimization-20261023", { concurrency: false }, async () => {
+describeContractGroup("IPC 契约 · optimization-20261023", { concurrency: false }, async () => {
 
 test('幂等性保留所有业务id，传输requestId可变，异目标必须冲突', () => {
   assert.deepEqual(canonicalPayload({requestId:'one',idempotencyKey:'k',id:'a',data:{id:'nested'}}),canonicalPayload({requestId:'two',idempotencyKey:'k',id:'a',data:{id:'nested'}}));
@@ -171,7 +171,7 @@ test('幂等性保留所有业务id，传输requestId可变，异目标必须冲
 });
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
-describeContractGroup("undefined · v090-engines", { concurrency: false }, async () => {
+describeContractGroup("IPC 契约 · v090-engines", { concurrency: false }, async () => {
 const execFileAsync = promisify(execFile);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -475,7 +475,7 @@ test('P0-02/P1-15/P1-17/P1-19/P1-20: 维护目录动态双语、resume切回中�
   });
   assert.equal(projectedOverview.token, undefined);
   assert.equal(projectedOverview.quota.five_hour_remaining, null);
-  assert.ok(projectedOverview.revision.endsWith(':' + projectedOverview.credentialReadiness.state));
+  assert.ok(projectedOverview.revision.endsWith(':' + projectedOverview.credentialReadiness.state + ':' + projectedOverview.standbyRefreshStatus.mode));
 
   const tasks = new Tasks(dir, () => {});
   await tasks.start();
@@ -543,6 +543,41 @@ test('P0-02/P1-15/P1-17/P1-19/P1-20: 维护目录动态双语、resume切回中�
     const preflightRes = await rpc(dir, { command: 'account_switch_preflight' });
     assert.equal(preflightRes.ok, true);
     assert.equal(typeof preflightRes.insidersRunning, 'boolean');
+
+    // v1.1.3: 验证 account_import_json 与 account_export_backup IPC 契约及 C02 零 Token 透传
+    const importFixturePath = join(dir, 'ipc-import-fixture.json');
+    await writeFile(importFixturePath, JSON.stringify({
+      email: 'ipc-imported@example.test',
+      name: 'IPC Imported',
+      token: {
+        access_token: 'SECRET_IPC_ACCESS_TOKEN',
+        refresh_token: 'SECRET_IPC_REFRESH_TOKEN',
+        id_token: 'SECRET_IPC_ID_TOKEN',
+        expiry_timestamp: 1700000123,
+        project_id: 'ipc-proj-1',
+      },
+    }));
+    const importIpcRes = await rpc(dir, { command: 'account_import_json', paths: [importFixturePath] });
+    assert.equal(importIpcRes.ok, true);
+    assert.equal(importIpcRes.imported, 1);
+    assert.equal(importIpcRes.updated, 0);
+    const importIpcRaw = JSON.stringify(importIpcRes);
+    for (const secret of ['SECRET_IPC_ACCESS_TOKEN', 'SECRET_IPC_REFRESH_TOKEN', 'SECRET_IPC_ID_TOKEN', 'access_token', 'refresh_token', 'id_token']) {
+      assert.equal(importIpcRaw.includes(secret), false, `account_import_json 响应不得泄露 ${secret}`);
+    }
+
+    const exportTargetPath = join(dir, 'ipc-exported-backup.json');
+    const unconfirmedExport = await rpc(dir, { command: 'account_export_backup', path: exportTargetPath, confirmed: false });
+    assert.equal(unconfirmedExport.ok, false, '未显式 confirmed: true 的导出请求必须被拒绝');
+
+    const confirmedExport = await rpc(dir, { command: 'account_export_backup', path: exportTargetPath, confirmed: true });
+    assert.equal(confirmedExport.ok, true);
+    assert.equal(confirmedExport.path, exportTargetPath);
+    assert.equal(confirmedExport.count, 3);
+    const exportIpcRaw = JSON.stringify(confirmedExport);
+    for (const secret of ['SECRET_IPC_ACCESS_TOKEN', 'SECRET_IPC_REFRESH_TOKEN', 'SECRET_IPC_ID_TOKEN', 'access_token', 'refresh_token', 'id_token']) {
+      assert.equal(exportIpcRaw.includes(secret), false, `account_export_backup 响应不得泄露 ${secret}`);
+    }
 
     const mainSource = await readFile(fileURLToPath(new URL('../src/main.ts', import.meta.url)), 'utf8');
     assert.ok(!/if\s*\(\s*\['pause',\s*'restore',\s*'stop'\]/.test(mainSource), 'pause/restore 不得无差别取消所有任务');

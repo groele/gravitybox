@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { AccountsManager, projectAccountForIpc, computeAccountRevision } from "../dist/accounts.js";
+import { getGoogleClientId, getGoogleClientSecret } from "../dist/account-cloud.js";
 import { once } from "node:events";
 import { AccountSwitchService } from "../dist/account-switch.js";
 import { recoverFileSet, commitAccountAndIndex, recoverAccountCommit } from "../dist/files.js";
@@ -861,4 +862,190 @@ test('P1-16 & P1-20: 落盘配额告警/错误跨语种动态重翻译并语义�
   const afterRebuild = await mgr.loadIndex();
   assert.ok(afterRebuild.accounts.some(a => a.id === 'extra-rebuilt'), 'rebuildIndex 后 loadIndex 必须读取最新索引');
 });
+
+test('v1.1.3 Issue #20: JSON 批量导入、嵌套 token 解析、过期时间保留、ID 防碰撞与 0600 备份导出闭环', async t => {
+  const srcDir = await mkdtemp(join(tmpdir(), 'gb-v113-import-src-'));
+  const stateDir = await mkdtemp(join(tmpdir(), 'gb-v113-import-state-'));
+  const restoreDir = await mkdtemp(join(tmpdir(), 'gb-v113-restore-state-'));
+  t.after(async () => {
+    await rm(srcDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(restoreDir, { recursive: true, force: true });
+  });
+
+  const prevClientId = process.env.GRAVITYBOX_GOOGLE_CLIENT_ID;
+  const prevClientSecret = process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET;
+  const prevGenericId = process.env.GOOGLE_CLIENT_ID;
+  const prevGenericSecret = process.env.GOOGLE_CLIENT_SECRET;
+  delete process.env.GRAVITYBOX_GOOGLE_CLIENT_ID;
+  delete process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET;
+  // 验证通用 GOOGLE_CLIENT_ID 不会误触发 oauthClientConfigured
+  process.env.GOOGLE_CLIENT_ID = 'generic-unrelated-client-id';
+  process.env.GOOGLE_CLIENT_SECRET = 'generic-unrelated-client-secret';
+  t.after(() => {
+    if (prevClientId === undefined) delete process.env.GRAVITYBOX_GOOGLE_CLIENT_ID;
+    else process.env.GRAVITYBOX_GOOGLE_CLIENT_ID = prevClientId;
+    if (prevClientSecret === undefined) delete process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET;
+    else process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET = prevClientSecret;
+    if (prevGenericId === undefined) delete process.env.GOOGLE_CLIENT_ID;
+    else process.env.GOOGLE_CLIENT_ID = prevGenericId;
+    if (prevGenericSecret === undefined) delete process.env.GOOGLE_CLIENT_SECRET;
+    else process.env.GOOGLE_CLIENT_SECRET = prevGenericSecret;
+  });
+
+  const mgr = new AccountsManager(stateDir);
+  assert.equal(getGoogleClientId(), '', '收窄环境变量后通用 GOOGLE_CLIENT_ID 不得激活后台 OAuth 配置');
+  assert.equal(getGoogleClientSecret(), '', '收窄环境变量后通用 GOOGLE_CLIENT_SECRET 不得激活后台 OAuth 配置');
+
+  const existing = await mgr.upsertAccount({
+    email: 'owner@example.test',
+    name: 'Original Owner',
+    refreshToken: '1//refresh-owner-orig',
+    accessToken: 'ya29.owner-orig',
+    expiresIn: 3600,
+  });
+
+  // 1. 构造带有与 existing 相同 id 但不同邮箱的 Antigravity Tools 格式 JSON（嵌套 token.* + 已过期的秒级时间戳）
+  const pastExpirySec = 1700000000;
+  const externalCollisionFile = join(srcDir, 'collision-tools.json');
+  await writeFile(externalCollisionFile, JSON.stringify({
+    id: existing.id,
+    name: 'Imported Tools User',
+    custom_label: 'Tools Backup',
+    token: {
+      email: 'Tools.User@Example.TEST',
+      access_token: 'ya29.expired-tools-token',
+      refresh_token: '1//refresh-tools-nested',
+      expiry_timestamp: pastExpirySec,
+      project_id: 'cloudaicompanion-nested-proj',
+      is_gcp_tos: true,
+      id_token: 'eyJ.nested.id.token',
+      token_type: 'Bearer',
+    },
+  }, null, 2));
+
+  // 2. 构造目录扫描（包含毫秒级过期时间、损坏 JSON、缺失 refresh_token、以及应被忽略的 accounts.json 索引文件）
+  const batchFolder = join(srcDir, 'folder-batch');
+  await mkdir(batchFolder, { recursive: true });
+  const futureExpirySec = Math.floor(Date.now() / 1000) + 7200;
+  await writeFile(join(batchFolder, 'valid-ms.json'), JSON.stringify([
+    {
+      email: 'ms-user@example.test',
+      name: 'MS User',
+      token: {
+        access_token: 'ya29.future-ms',
+        refresh_token: '1//refresh-ms-user',
+        expiry_timestamp: futureExpirySec * 1000,
+        project_id: 'proj-ms',
+      },
+    },
+    {
+      email: 'broken-no-rt@example.test',
+      token: { access_token: 'ya29.only-access' },
+    },
+  ]));
+  await writeFile(join(batchFolder, 'corrupted.json'), '{ invalid json ');
+  await writeFile(join(batchFolder, 'accounts.json'), JSON.stringify({
+    accounts: [{ id: 'idx-1', email: 'index-only@example.test' }],
+    current_account_id: 'idx-1',
+  }));
+
+  // 3. 构造符号链接（必须被安全护栏跳过）
+  const symlinkPath = join(srcDir, 'symlink-account.json');
+  await fs.promises.symlink(externalCollisionFile, symlinkPath);
+
+  const importRes = await mgr.importAccountsFromJson([externalCollisionFile, batchFolder, symlinkPath]);
+  assert.equal(importRes.imported, 2, '应成功导入 2 个新账号');
+  assert.equal(importRes.updated, 0, '外部 ID 碰撞不得覆盖已有不同邮箱账号');
+  assert.equal(importRes.expiredWithoutRefreshConfig, 1, '应准确统计已过期且未配置后台刷新凭据的账号数量');
+  assert.ok(importRes.skipped.length >= 3, '损坏文件、缺 refresh_token 记录与符号链接均应计入 skipped');
+  const importResText = JSON.stringify(importRes);
+  assert.ok(!importResText.includes('1//refresh-'), '导入汇总结果严禁包含任何 refresh_token');
+  assert.ok(!importResText.includes('ya29.'), '导入汇总结果严禁包含任何 access_token');
+
+  // 验证原有账号未被外部同 ID 覆盖
+  const preservedOwner = await mgr.getAccount(existing.id);
+  assert.equal(preservedOwner.email, 'owner@example.test');
+  assert.equal(preservedOwner.token.refresh_token, '1//refresh-owner-orig');
+
+  // 验证嵌套 token.* 字段与历史 expiry_timestamp 完整保留
+  const indexAfterImport = await mgr.loadIndex();
+  assert.equal(indexAfterImport.accounts.length, 3);
+  const toolsSummary = indexAfterImport.accounts.find(a => a.email === 'tools.user@example.test');
+  assert.ok(toolsSummary, '邮箱应标准化为小写');
+  assert.notEqual(toolsSummary.id, existing.id, '新导入账号必须生成独立本地 UUID');
+  const toolsAcc = await mgr.getAccount(toolsSummary.id);
+  assert.equal(toolsAcc.token.expiry_timestamp, pastExpirySec, '必须保留原始过去 expiry_timestamp 而非重置为 now+3600');
+  assert.equal(toolsAcc.token.project_id, 'cloudaicompanion-nested-proj');
+  assert.equal(toolsAcc.token.is_gcp_tos, true);
+  assert.equal(toolsAcc.token.id_token, 'eyJ.nested.id.token');
+  assert.equal(toolsAcc.custom_label, 'Tools Backup');
+
+  const msSummary = indexAfterImport.accounts.find(a => a.email === 'ms-user@example.test');
+  assert.ok(msSummary);
+  const msAcc = await mgr.getAccount(msSummary.id);
+  assert.equal(msAcc.token.expiry_timestamp, futureExpirySec, '毫秒级时间戳必须规范化为秒级');
+
+  // 4. 重复导入同一邮箱应走更新而非重复新增
+  const reimportRes = await mgr.importAccountsFromJson([externalCollisionFile]);
+  assert.equal(reimportRes.imported, 0);
+  assert.equal(reimportRes.updated, 1);
+
+  // 5. 测试安全导出与 confirmed 门禁
+  const backupPath = join(srcDir, 'exported-backup.json');
+  await assert.rejects(mgr.exportAccountsBackup(backupPath, false), /显式确认|explicit confirmation/);
+
+  const exportRes = await mgr.exportAccountsBackup(backupPath, true);
+  assert.equal(exportRes.count, 3);
+  assert.equal(exportRes.path, backupPath);
+  assert.ok(!JSON.stringify(exportRes).includes('1//refresh-'), '导出 IPC 返回值不得包含凭据');
+
+  const st = await fs.promises.lstat(backupPath);
+  assert.equal(st.mode & 0o777, 0o600, '导出的备份文件权限必须严格为 0600');
+  const rawBackup = JSON.parse(await readFile(backupPath, 'utf8'));
+  assert.equal(rawBackup.schema, 'gravitybox.accounts.backup');
+  assert.equal(rawBackup.version, '1.0');
+  assert.equal(typeof rawBackup.exportedAt, 'string');
+  assert.equal(rawBackup.accounts.length, 3);
+  assert.ok(rawBackup.accounts.every(a => a.device_profile === undefined), '导出备份应剥离本机 device_profile');
+
+  // 6. 将导出的备份重新导入全新 AccountsManager，验证 100% 互通还原
+  const restoreMgr = new AccountsManager(restoreDir);
+  const restoreRes = await restoreMgr.importAccountsFromJson([backupPath]);
+  assert.equal(restoreRes.imported, 3);
+  assert.equal(restoreRes.updated, 0);
+  const restoredSummary = (await restoreMgr.loadIndex()).accounts.find(a => a.email === 'tools.user@example.test');
+  assert.ok(restoredSummary);
+  const restoredTools = await restoreMgr.getAccount(restoredSummary.id);
+  assert.equal(restoredTools.token.expiry_timestamp, pastExpirySec);
+  assert.equal(restoredTools.token.project_id, 'cloudaicompanion-nested-proj');
+  assert.equal(restoredTools.custom_label, 'Tools Backup');
+
+  // 7. 字段类型校验、换新 refresh_token 重置旧 access_token/过期时间，以及禁止导出覆写 stateDir 内部文件
+  const invalidTypesFile = join(srcDir, 'invalid-types-and-refresh.json');
+  await writeFile(invalidTypesFile, JSON.stringify({
+    email: 'tools.user@example.test',
+    custom_label: { nested: 'bad' },
+    name: 12345,
+    project_id: ['bad-array'],
+    id_token: { bad: true },
+    refresh_token: '1//refresh-tools-rotated',
+  }));
+  const rotatedRes = await mgr.importAccountsFromJson([invalidTypesFile]);
+  assert.equal(rotatedRes.updated, 1);
+  const rotatedTools = await mgr.getAccount(toolsSummary.id);
+  assert.equal(rotatedTools.token.refresh_token, '1//refresh-tools-rotated');
+  assert.equal(rotatedTools.token.access_token, 'pending_refresh', '换新 refresh_token 且未带新 access_token 时必须重置为 pending_refresh');
+  assert.equal(rotatedTools.token.expiry_timestamp, 0, '重置为 pending_refresh 时必须归零旧 expiry_timestamp');
+  assert.equal(rotatedTools.token.project_id, 'cloudaicompanion-nested-proj', '非字符串 project_id 必须被忽略而不写入对象/数组');
+  assert.equal(rotatedTools.token.id_token, 'eyJ.nested.id.token', '非字符串 id_token 必须被忽略');
+  assert.equal(rotatedTools.custom_label, 'Tools Backup', '非字符串 custom_label 必须被忽略');
+
+  await assert.rejects(
+    mgr.exportAccountsBackup(join(stateDir, 'accounts.json'), true),
+    /有效|路径|path/i,
+    '导出绝不允许覆写 stateDir 内部受管文件'
+  );
 });
+});
+

@@ -27,8 +27,11 @@ import {
   fetchBundleFromOrigin,
   computeBundleSha256,
   extractUiStrings, extractedKind,
-  findMissingStrings,
   createPendingList,
+  computeBundleDictionaryCoverage,
+  ADAPTIVE_FULL_TRANSLATION_MIN_COVERAGE,
+  ADAPTIVE_FULL_TRANSLATION_MIN_STRINGS,
+  type ExtractedString,
 } from './bundle.js';
 
 export type AssistantStatus = {
@@ -51,7 +54,7 @@ export type AssistantStatus = {
   taskRevision?: number;
   bundleReads?:number;bundleBytes?:number;
 };
-type PageSession = { cdp: CDP; targetId: string; contextId?: number; registration?: string; updateChain: Promise<void>; url: string;languageMode?:string;detaching?:boolean };
+type PageSession = { cdp: CDP; targetId: string; contextId?: number; registration?: string; updateChain: Promise<void>; url: string; languageMode?: string; detaching?: boolean; bundleSha256?: string; domContractPassed?: boolean; bootedConservative?: boolean; registeredFullTranslation?: boolean };
 function isSafeCandidate(key: unknown): key is string {
   return typeof key === 'string' && isEnglishSource(key) && key.length <= 400 && !/(?:https?:\/\/|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|(?:^|\s)(?:\/|~\/|[A-Za-z]:\\)|\b(?:sk-|AIza)[A-Za-z0-9_-]{12,})/.test(key);
 }
@@ -98,7 +101,10 @@ export class Controller {
   private syncWaiters: (() => void)[] = [];
   private lastInspectedSha?: string;
   private lastInspectedAppVersion?: string;
+  private lastInspectedDictVersion?: string;
+  private lastInspectedBundle?: { sha: string; extracted: ExtractedString[] };
   private inspectingBundle = false;
+  private adaptiveFullTranslationByBundle = new Map<string, boolean>();
   private unverifiedWindowRetries = 0;
   private trustedCandidates: PendingItem[] = [];
   private bundleCache = new BundleCache();
@@ -308,6 +314,11 @@ export class Controller {
     }
   }
   private verifiedBundle(){const expected=SUPPORTED_BUNDLES.get(this.status.appVersion??'');return !!this.options.fixture||!!expected&&expected===this.status.bundleSha256;}
+  private shouldUseFullTranslation(session?: PageSession): boolean {
+    if (this.verifiedBundle()) return true;
+    if (!session || !session.domContractPassed || !session.bundleSha256) return false;
+    return this.adaptiveFullTranslationByBundle.get(`${session.bundleSha256}:${this.options.dictionary.version}`) === true;
+  }
   private retry(delay?: number) {
     clearTimeout(this.reconnection);
     if (this.stopped) return;
@@ -324,14 +335,15 @@ export class Controller {
     clearTimeout(this.targetTimer);
     this.targetTimer = setTimeout(() => void this.sync().catch(() => this.publish('error', this.t('status.probe_failed'))), delayMs);
   }
-  private boot(url: string) {
+  private boot(url: string, session?: PageSession) {
     const page = new URL(url);
     const effectiveHudLocale = this.effectiveHudLocale();
     const languageMode = this.paused ? 'en' : (this.locale === 'zh-Hans' ? 'zh' : this.locale);
-    const key = `${page.origin}${page.pathname}:${this.options.dictionary.version}:${this.verifiedBundle()}:${this.hudEnabled}:${this.paused}:${effectiveHudLocale}`;
+    const fullTranslation = this.shouldUseFullTranslation(session);
+    const key = `${page.origin}${page.pathname}:${this.options.dictionary.version}:${fullTranslation}:${this.hudEnabled}:${this.paused}:${effectiveHudLocale}`;
     const cached = this.bootCache.get(key);
     if (cached) return cached;
-    const source = `delete globalThis.__GRAVITYBOX_ATTACH_DEEP_SCAN__;delete globalThis.__GRAVITYBOX_ATTACH_HUD__;globalThis.__GRAVITYBOX_BOOT__=${JSON.stringify({ origin: page.origin, path: page.pathname, dictionary: this.options.dictionary, conservative:!this.verifiedBundle(),runtimeId:this.runtimeId,shortcutEnabled:this.options.shortcutEnabled!==false,hudEnabled:this.hudEnabled,translationEnabled:!this.paused,languageMode,locale:effectiveHudLocale,shellValidated:true })};\n${this.engine}`;
+    const source = `delete globalThis.__GRAVITYBOX_ATTACH_DEEP_SCAN__;delete globalThis.__GRAVITYBOX_ATTACH_HUD__;globalThis.__GRAVITYBOX_BOOT__=${JSON.stringify({ origin: page.origin, path: page.pathname, dictionary: this.options.dictionary, conservative:!fullTranslation,runtimeId:this.runtimeId,shortcutEnabled:this.options.shortcutEnabled!==false,hudEnabled:this.hudEnabled,translationEnabled:!this.paused,languageMode,locale:effectiveHudLocale,shellValidated:true })};\n${this.engine}`;
     if (this.bootCache.size < 4) this.bootCache.set(key, source);
     return source;
   }
@@ -426,7 +438,7 @@ export class Controller {
           : this.t('status.waiting_supported_window');
       this.publish(defaultMode, defaultMsg);
 
-      if (!this.options.fixture && this.endpoint && permitted.length > 0 && !this.inspectingBundle && (this.lastInspectedAppVersion !== this.endpoint.appVersion || this.lastInspectedSha!==this.status.bundleSha256)) {
+      if (!this.options.fixture && this.endpoint && permitted.length > 0 && !this.inspectingBundle && (this.lastInspectedAppVersion !== this.endpoint.appVersion || this.lastInspectedSha !== this.status.bundleSha256 || this.lastInspectedDictVersion !== this.options.dictionary.version)) {
         const pageTarget = permitted[0];
         if (pageTarget) {
           try {
@@ -453,6 +465,7 @@ export class Controller {
         const activeApp = this.activeAppPath();
         if(!await this.checkPageService(frame.url,activeApp))throw new Error(this.t('controller.err.page_unverified'));
         const bundle=await this.bundleCache.read(activeApp,this.endpoint.pid,this.endpoint.appVersion,new URL(frame.url).origin);
+        session.bundleSha256=bundle.hash;
         this.status.bundleSha256=bundle.hash;this.status.bundleCacheHit=bundle.cacheHit;this.status.unverifiedVersion=!this.verifiedBundle();
         if(bundle.source)this.initialBundle=bundle.source;
       }
@@ -474,12 +487,19 @@ export class Controller {
         if(/^\/(?:onboarding|oauth|auth|login|sign-in)(?:\/|$)/i.test(new URL(frame.url).pathname))throw new Error(this.t('controller.err.onboarding_skipped'));
         const contract=await session.cdp.evaluate(`(async()=>{for(let i=0;i<30;i++){if(!!document.body&&((!!document.querySelector('[aria-label*="Sidebar" i],[aria-label*="侧边栏"],[data-testid*="sidebar" i],[data-testid="agent-input-box"]')&&!!document.querySelector('[data-testid="model-selector-trigger"],a[href="/history"],a[href="/customizations"],[data-testid="agent-input-box"],textarea,input'))||(/^\\/(?:settings(?:\\/[^?#]*)?|settings-standalone)$/.test(location.pathname)&&!!document.querySelector('[role="dialog"][aria-label="Settings"],[role="dialog"][aria-label="设置"],[data-testid*="settings"]')&&!!document.querySelector('[role="tablist"],nav,[role="navigation"]'))||(location.pathname==='/terminal-standalone'&&!!document.querySelector('.xterm,.monaco-editor,[data-testid*="terminal"]'))))return true;await new Promise(r=>setTimeout(r,100));}return false;})()`,session.contextId);
         if(!contract)throw new Error(this.t('controller.err.unrecognized_structure'));
+        session.domContractPassed = true;
+      }
+      const desiredFullTranslation = this.shouldUseFullTranslation(session);
+      const desiredConservative = !desiredFullTranslation;
+      if (session.registeredFullTranslation !== undefined && session.registeredFullTranslation !== desiredFullTranslation) {
+        await this.applyDocumentRegistration(session);
       }
       if(this.dormant||this.stopped||session.detaching)return;
       if (!previous?.active) previous = await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.state()', session.contextId);
       if(this.dormant||this.stopped||session.detaching)return;
       const preservedManualEn = !this.paused && session.languageMode === 'en';
-      if (previous?.active&&previous.runtimeId===this.runtimeId) {
+      const conservativeModeChanged = session.bootedConservative !== undefined && session.bootedConservative !== desiredConservative;
+      if (previous?.active&&previous.runtimeId===this.runtimeId&&!conservativeModeChanged) {
         if (previous.version === this.options.dictionary.version) await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.refresh()', session.contextId);
         else await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__.update(${JSON.stringify(this.options.dictionary)})`, session.contextId);
         const desiredLanguageMode = this.paused ? 'en' : preservedManualEn ? 'en' : (this.locale === 'zh-Hans' ? 'zh' : 'en');
@@ -487,7 +507,8 @@ export class Controller {
           await session.cdp.evaluate(`globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage?.(${JSON.stringify(desiredLanguageMode)})`, session.contextId);
         }
       }
-      else{if(previous?.active)await session.cdp.evaluate(this.hudEnabled?'globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.({keepHud:true})':'(globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.(),globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.())',session.contextId);await session.cdp.evaluate(this.boot(session.url),session.contextId);if((this.options.fixture||preservedManualEn)&&!this.paused&&(previous?.languageMode==='en'||preservedManualEn))await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage?.("en")',session.contextId);}
+      else{if(previous?.active)await session.cdp.evaluate(this.hudEnabled?'globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.({keepHud:true})':'(globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.(),globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.())',session.contextId);await session.cdp.evaluate(this.boot(session.url,session),session.contextId);session.bootedConservative=desiredConservative;if((this.options.fixture||preservedManualEn)&&!this.paused&&(previous?.languageMode==='en'||preservedManualEn))await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.toggleLanguage?.("en")',session.contextId);}
+      if (session.bootedConservative === undefined) session.bootedConservative = desiredConservative;
       let state: any;
       for (let i = 0; i < 10; i++) {
         state = await session.cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.state()', session.contextId);
@@ -511,16 +532,19 @@ export class Controller {
     }
     return session.updateChain;
   }
+  private async applyDocumentRegistration(session: PageSession): Promise<void> {
+    if(session.detaching||this.dormant||this.stopped)return;
+    if(session.registration){await session.cdp.send('Page.removeScriptToEvaluateOnNewDocument',{identifier:session.registration});session.registration=undefined;}
+    if(session.detaching||this.dormant||this.stopped)return;
+    const registered=await session.cdp.send('Page.addScriptToEvaluateOnNewDocument',{source:this.boot(session.url,session),worldName:WORLD});
+    if(session.detaching||this.dormant||this.stopped){await session.cdp.send('Page.removeScriptToEvaluateOnNewDocument',{identifier:registered.identifier});return;}
+    session.registration=registered.identifier;
+    session.registeredFullTranslation=this.shouldUseFullTranslation(session);
+  }
   private refreshRegistration(session: PageSession):Promise<void> {
     if(session.detaching)return Promise.resolve();
-    session.updateChain=session.updateChain.catch(()=>{}).then(async()=>{
-      if(session.detaching||this.dormant||this.stopped)return;
-      if(session.registration){await session.cdp.send('Page.removeScriptToEvaluateOnNewDocument',{identifier:session.registration});session.registration=undefined;}
-      if(session.detaching||this.dormant||this.stopped)return;
-      const registered=await session.cdp.send('Page.addScriptToEvaluateOnNewDocument',{source:this.boot(session.url),worldName:WORLD});
-      if(session.detaching||this.dormant||this.stopped){await session.cdp.send('Page.removeScriptToEvaluateOnNewDocument',{identifier:registered.identifier});return;}
-      session.registration=registered.identifier;
-    });return session.updateChain;
+    session.updateChain=session.updateChain.catch(()=>{}).then(()=>this.applyDocumentRegistration(session));
+    return session.updateChain;
   }
   /** 后台异步对比界面包指纹，提取界面串并检测未译新词，不阻塞前台窗口注入与翻译。 */
   private async inspectBundleInBackground(origin: string, appVersion: string,initialSource?:string): Promise<void> {
@@ -531,11 +555,21 @@ export class Controller {
       const sha = computeBundleSha256(source);
       this.status.bundleSha256 = sha;
       this.lastInspectedAppVersion = appVersion;
-      if (this.lastInspectedSha === sha) return;
+      if (this.lastInspectedSha === sha && this.lastInspectedDictVersion === this.options.dictionary.version) return;
       this.lastInspectedSha = sha;
 
-      const extracted = extractUiStrings(source, { includeJsxRuntime: true });
-      const missing = findMissingStrings(extracted, this.options.dictionary);
+      const extracted =
+        this.lastInspectedBundle?.sha === sha
+          ? this.lastInspectedBundle.extracted
+          : extractUiStrings(source, { includeJsxRuntime: true });
+      this.lastInspectedBundle = { sha, extracted };
+      this.lastInspectedDictVersion = this.options.dictionary.version;
+      const bundleCoverage = computeBundleDictionaryCoverage(extracted, this.options.dictionary);
+      const missing = bundleCoverage.missing;
+      const highConfidenceAdaptive =
+        bundleCoverage.total >= ADAPTIVE_FULL_TRANSLATION_MIN_STRINGS &&
+        bundleCoverage.coverage >= ADAPTIVE_FULL_TRANSLATION_MIN_COVERAGE;
+      this.adaptiveFullTranslationByBundle.set(`${sha}:${this.options.dictionary.version}`, highConfidenceAdaptive);
       this.trustedCandidates = missing.filter(isSafeCandidate).map(key=>({key,kind:extractedKind(extracted.find(e=>e.text===key)?.kinds),source:'static'}));
       this.status.newStringsCount = this.trustedCandidates.length;
 
@@ -566,6 +600,20 @@ export class Controller {
 
       if (this.stopped || this.paused) return;
       const isVerified = this.verifiedBundle();
+      if (!isVerified && highConfidenceAdaptive && !this.dormant) {
+        const upgradeTargets = [...this.pages.values()].filter(
+          (s) => !s.detaching && s.bundleSha256 === sha && s.domContractPassed && s.bootedConservative === true
+        );
+        if (upgradeTargets.length > 0) {
+          this.bootCache.clear();
+          await Promise.allSettled(
+            upgradeTargets.map(async (session) => {
+              await this.refreshRegistration(session);
+              await this.queueBootstrap(session, false);
+            })
+          );
+        }
+      }
       const candidateCount = this.trustedCandidates.length;
       if (!isVerified) {
         const msg = candidateCount > 0
@@ -586,6 +634,14 @@ export class Controller {
   }
   private async applyDictionary(dictionary: Dictionary) {
     this.options.dictionary = dictionary;
+    if (this.lastInspectedBundle) {
+      const bundleCoverage = computeBundleDictionaryCoverage(this.lastInspectedBundle.extracted, dictionary);
+      const highConfidenceAdaptive =
+        bundleCoverage.total >= ADAPTIVE_FULL_TRANSLATION_MIN_STRINGS &&
+        bundleCoverage.coverage >= ADAPTIVE_FULL_TRANSLATION_MIN_COVERAGE;
+      this.adaptiveFullTranslationByBundle.set(`${this.lastInspectedBundle.sha}:${dictionary.version}`, highConfidenceAdaptive);
+      this.lastInspectedDictVersion = dictionary.version;
+    }
     this.bootCache.clear();
     this.status.dictionaryVersion = dictionary.version; this.status.entries = Object.keys(dictionary.entries).length;
     this.status.errors = [];
@@ -654,7 +710,7 @@ export class Controller {
           '(globalThis.__GRAVITYBOX_PENDING_BOOT__?.cancel?.(),globalThis.__GRAVITYBOX_ENGINE_V1__?.dispose?.({keepHud:true}))',
           session.contextId
         );
-        await session.cdp.evaluate(this.boot(session.url), session.contextId);
+        await session.cdp.evaluate(this.boot(session.url, session), session.contextId);
         await session.cdp.evaluate(
           `(globalThis.__GRAVITYBOX_ATTACH_HUD__?.(), globalThis.__GRAVITYBOX_HUD_V1__?.setLanguage?.(${JSON.stringify(hudLocale)}), globalThis.__GRAVITYBOX_HUD_V1__?.setEnabled?.(true))`,
           session.contextId
@@ -951,7 +1007,8 @@ export class Controller {
     const scope=coverageScopes(entry)[0], normalized=key.replace(/\s+/g,' ').trim(), target=scope?scopedKey(normalized,scope.kind,scope.route):normalized;
     return{key:target,displayKey:key,context:scope?describeContext(scope):this.t('controller.coverage.general_context'),value:this.options.dictionary.entries[target]??entry.translation??'',version:this.options.dictionary.version};
   }
-  async hasRunningAgentTask(): Promise<{ busy: boolean; reason?: string }> {
+  async hasRunningAgentTask(): Promise<{ busy: boolean; checked?: boolean; reason?: string }> {
+    let checked = false;
     for (const page of this.pages.values()) {
       if (page.contextId === undefined) continue;
       try {
@@ -959,29 +1016,43 @@ export class Controller {
           page.cdp.evaluate(
             `(() => {
               const engineState = globalThis.__GRAVITYBOX_ENGINE_V1__?.draftState?.();
-              if (engineState?.generating) return { busy: true, reason: ${JSON.stringify(this.t('controller.task.streaming_busy'))} };
+              if (engineState?.generating) return { busy: true, checked: true, reason: ${JSON.stringify(this.t('controller.task.streaming_busy'))} };
               const rendered = e => !!e?.getClientRects?.().length && getComputedStyle(e).visibility !== 'hidden';
-              const stopBtn = [...document.querySelectorAll('button,[role="button"],[data-testid*="stop"],[data-testid*="cancel"]')].some(e => {
+              const hasIdleBanner = [...document.querySelectorAll('[data-testid="idle-status-text"]')].some(e => rendered(e) && !!(e.textContent || '').trim());
+              const hasTurnSignal = [...document.querySelectorAll('[data-testid="input-cancel-button"],[data-state="streaming"],[data-streaming="true"],[data-testid="agent-loading"],[data-testid="browser-subagent-thinking"],[data-testid="running-subagent-steps-toggle"],[data-testid="running-subagent-browser-steps"]')].some(e => {
                 if (!rendered(e)) return false;
-                const label = (e.getAttribute('aria-label') || e.getAttribute('title') || e.getAttribute('data-tooltip-id') || e.textContent || '').trim();
-                if (/^(Stop generating|Stop|Cancel generation|Cancel|Abort|Interrupt|停止生成|停止|取消生成|终止生成|中断)$/i.test(label)) return true;
-                if (/(?:stop|cancel)\s*(?:generation|generating|streaming|agent|response|task)/i.test(label)) return true;
-                if (e.querySelector?.('.codicon-debug-stop, .codicon-stop-circle')) return true;
+                const tid = e.getAttribute('data-testid') || '';
+                if (tid === 'agent-loading' && hasIdleBanner) return false;
+                if (tid !== 'input-cancel-button' && e.closest?.('[data-testid="idle-status-text"],[data-testid="running-items-card"]')) return false;
+                return true;
+              });
+              if (hasTurnSignal) return { busy: true, checked: true, reason: ${JSON.stringify(this.t('controller.task.agent_busy'))} };
+              const stopBtn = [...document.querySelectorAll('button,[role="button"],[data-testid="input-cancel-button"]')].some(e => {
+                if (!rendered(e)) return false;
+                if (e.closest?.('[role="dialog"],[role="alertdialog"],[role="menu"],[role="listbox"],[data-select-popup],[data-testid="running-row"],[data-testid="running-selection-bar"]')) return false;
+                const tid = (e.getAttribute('data-testid') || '').toLowerCase();
+                if (tid === 'input-cancel-button') return true;
+                const cls = typeof e.className === 'string' ? e.className.toLowerCase() : '';
+                if (/(?:voice|dictat|microphone|audio-record|speech|record-audio)/i.test(tid + ' ' + cls)) return false;
+                const label = (e.getAttribute('aria-label') || e.getAttribute('title') || e.textContent || '').trim();
+                if (/(?:voice|dictat|recording|microphone|语音|录音|听写|麦克风)/i.test(label)) return false;
+                if (/^(?:Stop generating|Cancel generation|Stop subagent|Cancel\\s*[（(][^）)]+[）)]|停止生成|取消生成|终止生成|停止子智能体|取消\\s*[（(][^）)]+[）)])$/i.test(label)) return true;
+                if (/(?:stop|cancel)\\s*(?:generation|generating|streaming|agent|response)/i.test(label)) return true;
+                if (/^(?:Stop|Interrupt|停止|中断)$/i.test(label) && Boolean(e.closest?.('[data-testid="agent-input-box"],.surface-composer'))) return true;
                 return false;
               });
-              if (stopBtn) return { busy: true, reason: ${JSON.stringify(this.t('controller.task.agent_busy'))} };
-              const streaming = [...document.querySelectorAll('[data-state="streaming"],[data-streaming="true"],.codicon-loading')].some(rendered);
-              if (streaming) return { busy: true, reason: ${JSON.stringify(this.t('controller.task.agent_busy'))} };
-              return { busy: false };
+              if (stopBtn) return { busy: true, checked: true, reason: ${JSON.stringify(this.t('controller.task.agent_busy'))} };
+              return { busy: false, checked: true };
             })()`,
             page.contextId
           ),
-          new Promise<{ busy: boolean }>(resolve => setTimeout(() => resolve({ busy: false }), 600)),
+          new Promise<{ busy: boolean; checked: boolean }>(resolve => setTimeout(() => resolve({ busy: false, checked: false }), 600)),
         ]);
+        if (res?.checked) checked = true;
         if (res?.busy) return res;
       } catch {}
     }
-    return { busy: false };
+    return { busy: false, checked };
   }
   async maintenancePreflight(){
     if(!this.endpoint||!this.pages.size)return{ok:true,pid:0};
@@ -1011,6 +1082,10 @@ export class Controller {
     const deep:DeepReport={schema:1,scope:'metadata',startedAt:new Date().toISOString(),finishedAt:new Date().toISOString(),state:'partial',steps:[],plugins:await readPluginCatalog(join(homedir(),'.gemini/config/plugins'),signal),nativeMenus:sanitizeNativeMenus(nativeInput,new Set(prepared.nativeKeys)),notes:[this.t('controller.scan.note_metadata_only'),this.t('controller.scan.note_local_only')]};
     const reportFilename = this.t('deep_scan.report_filename');
     deep.state=deep.nativeMenus.state==='read'&&!deep.plugins.limited?'complete':'partial';report.deep=deep;signal.throwIfAborted();onCommit?.();const directory=join(this.options.stateDir!,'reports');await atomicJson(join(directory,'coverage.json'),report,signal);await atomicJson(join(directory,'deep-scan.json'),deep,signal);await atomicText(join(directory,reportFilename),deepMarkdown(deep),signal);this.coverage=report;this.publish();return{ok:deep.state==='complete',partial:true,message:this.t('controller.scan.summary', { count: deep.plugins.entries.length, menuMessage: deep.nativeMenus.message })};
+  }
+  async refreshHudForPricingChange(): Promise<void> {
+    if (!this.hudEnabled || this.stopped) return;
+    await this.hudBridge.refreshAllForPricingChange();
   }
   async stop() {
     this.stopped = true; this.closeProfileWatchers(); clearTimeout(this.reconnection); clearTimeout(this.targetTimer);

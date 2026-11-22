@@ -52,9 +52,25 @@ export const HUD_GEN_METADATA_PROJECTION: ProtoSelection = {
   2: true,
   4: true,
   3: {
+    1: true,
     14: true,
     27: { 4: true, 8: true, 12: true, 20: true },
     28: true,
+    60: { 1: true },
+  },
+};
+export const HUD_EXECUTOR_METADATA_PROJECTION: ProtoSelection = {
+  10: {
+    1: {
+      1: true,
+      14: true,
+      27: { 4: true, 8: true, 12: true, 20: true },
+      28: true,
+      60: { 1: true },
+    },
+    2: {
+      5: true,
+    },
   },
 };
 
@@ -91,6 +107,16 @@ export const USAGE_PROTO_LIMITS: ProtoProjectionLimits = {
   maxFields: 100_000,
   maxMs: 4000,
   chunkBytes: 16 * 1024,
+};
+
+export const HUD_GEN_PROTO_LIMITS: ProtoProjectionLimits = {
+  maxReadBytes: 24 * 1024 * 1024,
+  maxOutputBytes: 256 * 1024,
+  maxFieldBytes: 64 * 1024,
+  maxFields: 150_000,
+  maxMs: 4000,
+  chunkBytes: 16 * 1024,
+  skipOversizedLeafFields: true,
 };
 
 export function projectProtobuf(

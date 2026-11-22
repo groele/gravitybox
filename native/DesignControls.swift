@@ -82,13 +82,16 @@ class DesignButton: NSButton {
     override func mouseExited(with event: NSEvent) { hovered = false }
 
     override var intrinsicContentSize: NSSize {
+        let isSmall = controlSize == .small
+        let btnHeight: CGFloat = isSmall ? 24 : 28
         if title.isEmpty, image != nil {
-            return NSSize(width: isQuietAccessory ? 26 : 30, height: isQuietAccessory ? 26 : 28)
+            return NSSize(width: isQuietAccessory ? 26 : 30, height: isQuietAccessory ? 26 : btnHeight)
         }
-        let width = (title as NSString).size(withAttributes: [.font: font ?? NSFont.systemFont(ofSize: 12, weight: .medium)]).width
-        let iconExtra: CGFloat = image != nil ? 18 : 0
-        let pad: CGFloat = isQuietAccessory ? 16 : 24
-        return NSSize(width: ceil(width) + pad + iconExtra, height: 28)
+        let defaultFont = NSFont.systemFont(ofSize: isSmall ? 11.5 : 12, weight: .medium)
+        let width = (title as NSString).size(withAttributes: [.font: font ?? defaultFont]).width
+        let iconExtra: CGFloat = image != nil ? 16 : 0
+        let pad: CGFloat = isQuietAccessory ? 16 : (isSmall ? 18 : 24)
+        return NSSize(width: ceil(width) + pad + iconExtra, height: btnHeight)
     }
 
     func drawButtonChromeAndLabel(spinnerLeftInset: CGFloat? = nil, centeredSpinnerWidth: CGFloat? = nil) {
@@ -313,7 +316,59 @@ class DesignButton: NSButton {
     }
 }
 
+final class DesignPopUpHoverOverlay: NSView {
+    private var tracking: NSTrackingArea?
+    private let motion = DesignMotion()
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
+        tracking = area
+        addTrackingArea(area)
+    }
+
+    private func animateHover(to target: CGFloat) {
+        guard let popup = superview as? NSPopUpButton, let cell = popup.cell as? DesignPopUpCell else { return }
+        guard popup.isEnabled else {
+            motion.cancel()
+            cell.hoverProgress = 0
+            popup.needsDisplay = true
+            return
+        }
+        motion.animate(in: popup, from: cell.hoverProgress, to: target, curve: .hover, threshold: 0.01) { [weak popup, weak cell] value in
+            cell?.hoverProgress = value
+            popup?.needsDisplay = true
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        animateHover(to: 1.0)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        animateHover(to: 0.0)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            motion.cancel()
+            if let popup = superview as? NSPopUpButton, let cell = popup.cell as? DesignPopUpCell {
+                cell.hoverProgress = 0
+            }
+        }
+    }
+
+    deinit { motion.cancel() }
+}
+
 final class DesignPopUpCell: NSPopUpButtonCell {
+    var hoverProgress: CGFloat = 0
+    var leadingSymbolName: String?
+
     private func presentMenuBelow(_ controlView: NSView) {
         guard isEnabled, let menu, !menu.items.isEmpty else { return }
         synchronizeTitleAndSelectedItem()
@@ -336,62 +391,146 @@ final class DesignPopUpCell: NSPopUpButtonCell {
 
     override func draw(withFrame cellFrame: NSRect, in controlView: NSView) {
         let focused = controlView.window?.firstResponder === controlView
-        let insetRect = cellFrame.insetBy(dx: 0.5, dy: 0.5)
-        let path = NSBezierPath(roundedRect: insetRect, xRadius: 7.5, yRadius: 7.5)
+        let isSmall = controlSize == .small
+        let cornerR: CGFloat = isSmall ? 7.0 : 7.5
+        let rect = cellFrame.insetBy(dx: 0.75, dy: 0.75)
+        let path = NSBezierPath(roundedRect: rect, xRadius: cornerR, yRadius: cornerR)
         let isDark = controlView.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let fill = isHighlighted
-            ? (isDark ? NSColor(white: 0.24, alpha: 1.0) : Design.color(0xE1E4EC, 0x242428))
-            : Design.subcard
-        fill.setFill()
+        let hp = hoverProgress
+        let pp: CGFloat = isHighlighted ? 1.0 : 0.0
+        let enableScale: CGFloat = isEnabled ? 1.0 : 0.45
+
+        NSGraphicsContext.saveGraphicsState()
+        if isEnabled {
+            let shadow = NSShadow()
+            shadow.shadowColor = isDark
+                ? NSColor.black.withAlphaComponent(0.32 * (1.0 - 0.5 * pp))
+                : NSColor(srgbRed: 0.05, green: 0.08, blue: 0.16, alpha: (0.075 + 0.03 * hp) * (1.0 - 0.5 * pp))
+            shadow.shadowOffset = NSSize(width: 0, height: -1.0)
+            shadow.shadowBlurRadius = 2.2
+            shadow.set()
+        }
+        let baseFill = isDark
+            ? NSColor.white.withAlphaComponent((0.095 + 0.045 * hp - 0.025 * pp) * enableScale)
+            : NSColor(srgbRed: 0.965, green: 0.972, blue: 0.988, alpha: (0.94 + 0.05 * hp - 0.06 * pp) * enableScale)
+        baseFill.setFill()
         path.fill()
+        NSGraphicsContext.restoreGraphicsState()
+
+        let topGlass = isDark
+            ? NSColor.white.withAlphaComponent((0.13 + 0.05 * hp - 0.03 * pp) * enableScale)
+            : NSColor.white.withAlphaComponent((0.97 + 0.03 * hp - 0.08 * pp) * enableScale)
+        let botGlass = isDark
+            ? NSColor.white.withAlphaComponent((0.07 + 0.035 * hp - 0.02 * pp) * enableScale)
+            : NSColor(srgbRed: 0.935, green: 0.945, blue: 0.970, alpha: (0.88 + 0.06 * hp) * enableScale)
+        if let grad = NSGradient(starting: topGlass, ending: botGlass) {
+            grad.draw(in: path, angle: controlView.isFlipped ? -90 : 90)
+        }
+        if isEnabled && hp > 0.01 {
+            Design.blue.withAlphaComponent((isDark ? 0.08 : 0.045) * hp).setFill()
+            path.fill()
+        }
+
         if focused {
             Design.blue.setStroke()
             path.lineWidth = 1.5
             path.stroke()
         } else {
-            Design.border.setStroke()
-            path.lineWidth = 1
+            let strokeColor: NSColor
+            if isEnabled && hp > 0.05 {
+                strokeColor = isDark
+                    ? NSColor.white.withAlphaComponent(0.14 + 0.08 * hp)
+                    : Design.blue.withAlphaComponent(0.18 * hp + 0.085 * (1.0 - hp))
+            } else {
+                strokeColor = isDark
+                    ? NSColor.white.withAlphaComponent(0.12 * enableScale)
+                    : NSColor.black.withAlphaComponent(0.085 * enableScale)
+            }
+            strokeColor.setStroke()
+            path.lineWidth = 0.75
             path.stroke()
         }
-        let isSmall = controlSize == .small
-        let fontSize: CGFloat = isSmall ? 11 : 12
+        if isEnabled {
+            Design.drawSpecularBevel(in: rect, cornerRadius: cornerR, isDark: isDark)
+        }
+
+        var textLeadingOffset: CGFloat = 10
+        if let symbolName = leadingSymbolName, !symbolName.isEmpty,
+           let symImg = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
+            let iconBox: CGFloat = isSmall ? 11.5 : 12.5
+            let rawSz = symImg.size
+            let scale = (rawSz.width > 0 && rawSz.height > 0) ? min(iconBox / rawSz.width, iconBox / rawSz.height) : 1.0
+            let iconW = max(4, round(rawSz.width * scale * 2.0) / 2.0)
+            let iconH = max(4, round(rawSz.height * scale * 2.0) / 2.0)
+            let iconRect = NSRect(
+                x: cellFrame.minX + 10,
+                y: cellFrame.midY - iconH / 2,
+                width: iconW,
+                height: iconH
+            )
+            let iconColor = focused
+                ? Design.blue
+                : (isEnabled ? (hp > 0.25 ? Design.primary : Design.secondary) : Design.secondary.withAlphaComponent(0.5))
+            if let cg = NSGraphicsContext.current?.cgContext {
+                cg.saveGState()
+                cg.beginTransparencyLayer(in: iconRect, auxiliaryInfo: nil)
+                symImg.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: controlView.isFlipped, hints: [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)])
+                cg.setBlendMode(.sourceAtop)
+                iconColor.setFill()
+                cg.fill(iconRect)
+                cg.endTransparencyLayer()
+                cg.restoreGState()
+            }
+            textLeadingOffset = 10 + iconW + 5.5
+        }
+
+        let fontSize: CGFloat = isSmall ? 11.5 : 12
         let drawFont = NSFont.systemFont(ofSize: fontSize, weight: .medium)
         let lineH = ceil(drawFont.ascender - drawFont.descender)
-        let titleRect = NSRect(x: cellFrame.minX + 10, y: floor(cellFrame.midY - lineH / 2), width: max(0, cellFrame.width - (isSmall ? 30 : 32)), height: lineH + 2)
+        let trailingZone: CGFloat = isSmall ? 22 : 24
+        let titleRect = NSRect(
+            x: cellFrame.minX + textLeadingOffset,
+            y: floor(cellFrame.midY - lineH / 2),
+            width: max(0, cellFrame.width - textLeadingOffset - trailingZone),
+            height: lineH + 2
+        )
         let style = NSMutableParagraphStyle(); style.lineBreakMode = .byTruncatingTail
+        let fgColor = isEnabled ? Design.primary : Design.secondary.withAlphaComponent(0.55)
         (title as NSString).draw(in: titleRect, withAttributes: [
             .font: drawFont,
-            .foregroundColor: isEnabled ? Design.primary : Design.secondary,
+            .foregroundColor: fgColor,
             .paragraphStyle: style
         ])
-        // Crisp macOS dual-chevron (up/down) pop-up indicator
-        let cx = cellFrame.maxX - 13
+
+        // 精细双箭头指示器（对齐现代 macOS 胶囊选择框比例）
+        let cx = cellFrame.maxX - (isSmall ? 12 : 13)
         let cy = cellFrame.midY
         let chev = NSBezierPath()
-        // Up chevron (in flipped controlView coordinates, y decreases upwards)
-        chev.move(to: NSPoint(x: cx - 3.2, y: cy - 1.4))
-        chev.line(to: NSPoint(x: cx, y: cy - 4.4))
-        chev.line(to: NSPoint(x: cx + 3.2, y: cy - 1.4))
-        // Down chevron
-        chev.move(to: NSPoint(x: cx - 3.2, y: cy + 1.4))
-        chev.line(to: NSPoint(x: cx, y: cy + 4.4))
-        chev.line(to: NSPoint(x: cx + 3.2, y: cy + 1.4))
-        chev.lineWidth = 1.35
+        let ySign: CGFloat = controlView.isFlipped ? 1.0 : -1.0
+        chev.move(to: NSPoint(x: cx - 2.6, y: cy - 1.3 * ySign))
+        chev.line(to: NSPoint(x: cx, y: cy - 3.8 * ySign))
+        chev.line(to: NSPoint(x: cx + 2.6, y: cy - 1.3 * ySign))
+        chev.move(to: NSPoint(x: cx - 2.6, y: cy + 1.3 * ySign))
+        chev.line(to: NSPoint(x: cx, y: cy + 3.8 * ySign))
+        chev.line(to: NSPoint(x: cx + 2.6, y: cy + 1.3 * ySign))
+        chev.lineWidth = 1.2
         chev.lineCapStyle = .round
         chev.lineJoinStyle = .round
-        (focused ? Design.blue : Design.secondary).setStroke()
+        let chevColor = focused ? Design.blue : (hp > 0.25 && isEnabled ? Design.primary : Design.secondary)
+        chevColor.setStroke()
         chev.stroke()
     }
     override func cellSize(forBounds rect: NSRect) -> NSSize {
         let isSmall = controlSize == .small
-        let drawFont = NSFont.systemFont(ofSize: isSmall ? 11 : 12, weight: .medium)
+        let drawFont = NSFont.systemFont(ofSize: isSmall ? 11.5 : 12, weight: .medium)
         let itemTitles = (menu?.items ?? []).filter { !$0.isSeparatorItem }.map(\.title)
         let candidates = itemTitles.isEmpty ? [title] : itemTitles
         let maxTitleW = candidates.reduce(CGFloat(0)) { acc, item in
             max(acc, ceil((item as NSString).size(withAttributes: [.font: drawFont]).width))
         }
-        let chrome: CGFloat = isSmall ? 34 : 36
-        let minW: CGFloat = isSmall ? 78 : 84
+        let iconExtra: CGFloat = (leadingSymbolName?.isEmpty == false) ? 18 : 0
+        let chrome: CGFloat = (isSmall ? 34 : 38) + iconExtra
+        let minW: CGFloat = isSmall ? 78 : 88
         return NSSize(width: max(minW, maxTitleW + chrome), height: isSmall ? 26 : 28)
     }
 }
@@ -620,24 +759,44 @@ final class InlineRefreshButton: DesignButton {
 // Unified capsule segmented control with 120Hz sliding pill thumb and directional specular bevel, drop-in compatible with NSSegmentedControl.
 final class DesignSegmentedControl: NSControl {
     override var allowsVibrancy: Bool { false }
-    let labels: [String]
+    private(set) var labels: [String]
     private var segmentButtons: [SegmentButton] = []
+    private let segmentStack = NSStackView()
     private var _selectedSegment: Int = 0
     private var slidePosition: CGFloat = 0
     private let slideMotion = DesignMotion()
+    private let compact: Bool
+    private let equalWidthSegments: Bool
+    private let maxSegmentWidth: CGFloat?
 
     var segmentCount: Int { segmentButtons.count }
 
     func setLabel(_ label: String, forSegment segment: Int) {
         guard segmentButtons.indices.contains(segment) else { return }
+        labels[segment] = label
         let btn = segmentButtons[segment]
         btn.title = label
         btn.setAccessibilityLabel(label)
-        btn.updateMinimumWidth()
+        btn.updateWidthConstraints(maxWidth: maxSegmentWidth)
         btn.needsDisplay = true
         invalidateIntrinsicContentSize()
         needsLayout = true
         needsDisplay = true
+    }
+
+    func updateSegments(labels newLabels: [String], tooltips: [String?]? = nil, selectedIndex: Int, animated: Bool = false) {
+        let clamped = newLabels.isEmpty ? 0 : max(0, min(newLabels.count - 1, selectedIndex))
+        if newLabels == labels {
+            for (idx, btn) in segmentButtons.enumerated() {
+                btn.toolTip = (tooltips?.indices.contains(idx) == true) ? tooltips?[idx] : nil
+            }
+            if _selectedSegment != clamped || Int(round(slidePosition)) != clamped {
+                setSelected(clamped, animated: animated && Design.shouldAnimate(in: self))
+            }
+            return
+        }
+        labels = newLabels
+        rebuildSegments(tooltips: tooltips, selectedIndex: clamped)
     }
 
     var selectedSegment: Int {
@@ -650,16 +809,33 @@ final class DesignSegmentedControl: NSControl {
         override func resignFirstResponder() -> Bool { let result = super.resignFirstResponder(); needsDisplay = true; return result }
         override var allowsVibrancy: Bool { false }
         let index: Int
+        let compact: Bool
+        weak var owner: DesignSegmentedControl?
         var isSelectedSegment = false { didSet { if oldValue != isSelectedSegment { needsDisplay = true } } }
         private var hoverTracking: NSTrackingArea?
         var hovered = false { didSet { if oldValue != hovered { needsDisplay = true } } }
         private var minWidthConstraint: NSLayoutConstraint?
+        private var maxWidthConstraint: NSLayoutConstraint?
 
-        init(title: String, index: Int, target: AnyObject?, action: Selector) {
+        var preferredSegmentWidth: CGFloat {
+            let fontSize: CGFloat = compact ? 11.5 : 12
+            let hPad: CGFloat = compact ? 18 : 22
+            let minW: CGFloat = compact ? 44 : 54
+            let textW = ceil((title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: .semibold)]).width) + hPad
+            let bounded = max(minW, textW)
+            if let maxW = maxWidthConstraint?.constant {
+                return min(maxW, bounded)
+            }
+            return bounded
+        }
+
+        init(title: String, index: Int, compact: Bool, maxWidth: CGFloat?, owner: DesignSegmentedControl, action: Selector) {
             self.index = index
+            self.compact = compact
+            self.owner = owner
             super.init(frame: .zero)
             self.title = title
-            self.target = target
+            self.target = owner
             self.action = action
             bezelStyle = .inline
             isBordered = false
@@ -668,17 +844,29 @@ final class DesignSegmentedControl: NSControl {
             setAccessibilityElement(true)
             setAccessibilityRole(.radioButton)
             setAccessibilityLabel(title)
-            let w = ceil((title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold)]).width) + 22
             translatesAutoresizingMaskIntoConstraints = false
-            let widthConstraint = widthAnchor.constraint(greaterThanOrEqualToConstant: max(54, w))
+            let widthConstraint = widthAnchor.constraint(greaterThanOrEqualToConstant: 44)
             widthConstraint.isActive = true
             self.minWidthConstraint = widthConstraint
+            if let maxWidth {
+                let maxC = widthAnchor.constraint(lessThanOrEqualToConstant: maxWidth)
+                maxC.isActive = true
+                self.maxWidthConstraint = maxC
+            }
+            updateWidthConstraints(maxWidth: maxWidth)
         }
         required init?(coder: NSCoder) { fatalError() }
 
-        func updateMinimumWidth() {
-            let w = ceil((title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold)]).width) + 22
-            minWidthConstraint?.constant = max(54, w)
+        func updateWidthConstraints(maxWidth: CGFloat?) {
+            let fontSize: CGFloat = compact ? 11.5 : 12
+            let hPad: CGFloat = compact ? 18 : 22
+            let minW: CGFloat = compact ? 44 : 54
+            let w = ceil((title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: .semibold)]).width) + hPad
+            let resolvedMin = max(minW, w)
+            minWidthConstraint?.constant = maxWidth.map { min($0, resolvedMin) } ?? resolvedMin
+            if let maxWidth {
+                maxWidthConstraint?.constant = maxWidth
+            }
             invalidateIntrinsicContentSize()
         }
 
@@ -691,69 +879,121 @@ final class DesignSegmentedControl: NSControl {
         }
         override func mouseEntered(with event: NSEvent) { if isEnabled { hovered = true } }
         override func mouseExited(with event: NSEvent) { hovered = false }
+        override func keyDown(with event: NSEvent) {
+            if event.keyCode == 123 {
+                owner?.moveSelection(by: -1)
+            } else if event.keyCode == 124 {
+                owner?.moveSelection(by: 1)
+            } else {
+                super.keyDown(with: event)
+            }
+        }
 
         override func draw(_ dirtyRect: NSRect) {
             let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let cornerR: CGFloat = compact ? 5.5 : 6
             let rect = bounds.insetBy(dx: 1, dy: 1)
-            if window?.firstResponder === self { Design.blue.setStroke(); let ring = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6); ring.lineWidth = 2; ring.stroke() }
-            let path = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+            if window?.firstResponder === self { Design.blue.setStroke(); let ring = NSBezierPath(roundedRect: rect, xRadius: cornerR, yRadius: cornerR); ring.lineWidth = 2; ring.stroke() }
+            let path = NSBezierPath(roundedRect: rect, xRadius: cornerR, yRadius: cornerR)
             if !isSelectedSegment && hovered {
                 (isDark ? NSColor.white.withAlphaComponent(0.055) : NSColor.black.withAlphaComponent(0.035)).setFill()
                 path.fill()
             }
+            let fontSize: CGFloat = compact ? 11.5 : 12
             let weight: NSFont.Weight = isSelectedSegment ? .semibold : .medium
             let fg: NSColor = isSelectedSegment ? .labelColor : (hovered ? .labelColor : Design.secondary)
             let pStyle = NSMutableParagraphStyle()
             pStyle.alignment = .center
+            pStyle.lineBreakMode = .byTruncatingTail
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 12, weight: weight),
+                .font: NSFont.systemFont(ofSize: fontSize, weight: weight),
                 .foregroundColor: fg,
                 .paragraphStyle: pStyle
             ]
             let sz = (title as NSString).size(withAttributes: attrs)
-            let drawRect = NSRect(x: 2, y: (bounds.height - sz.height) / 2, width: max(0, bounds.width - 4), height: sz.height)
+            let hInset: CGFloat = compact ? 6 : 4
+            let drawRect = NSRect(x: hInset, y: (bounds.height - sz.height) / 2, width: max(0, bounds.width - hInset * 2), height: sz.height)
             (title as NSString).draw(in: drawRect, withAttributes: attrs)
         }
     }
 
-    init(labels: [String], trackingMode: NSSegmentedControl.SwitchTracking = .selectOne, target: AnyObject? = nil, action: Selector? = nil) {
+    init(
+        labels: [String],
+        trackingMode: NSSegmentedControl.SwitchTracking = .selectOne,
+        target: AnyObject? = nil,
+        action: Selector? = nil,
+        compact: Bool = false,
+        equalWidthSegments: Bool = true,
+        maxSegmentWidth: CGFloat? = nil
+    ) {
         self.labels = labels
+        self.compact = compact
+        self.equalWidthSegments = equalWidthSegments
+        self.maxSegmentWidth = maxSegmentWidth
         super.init(frame: .zero)
         self.target = target
         self.action = action
         focusRingType = .none
         translatesAutoresizingMaskIntoConstraints = false
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.distribution = .fillEqually
-        stack.spacing = 2
-        for (idx, item) in labels.enumerated() {
-            let btn = SegmentButton(title: item, index: idx, target: self, action: #selector(segmentClicked(_:)))
-            btn.isSelectedSegment = (idx == 0)
-            btn.setAccessibilityValue(idx == 0 ? 1 : 0)
-            segmentButtons.append(btn)
-            stack.addArrangedSubview(btn)
-            btn.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        }
-        addSubview(stack)
-        stack.translatesAutoresizingMaskIntoConstraints = false
+        segmentStack.orientation = .horizontal
+        segmentStack.distribution = equalWidthSegments ? .fillEqually : .fill
+        segmentStack.spacing = 2
+        addSubview(segmentStack)
+        segmentStack.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 3),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -3),
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: 3),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3)
+            segmentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 3),
+            segmentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -3),
+            segmentStack.topAnchor.constraint(equalTo: topAnchor, constant: 3),
+            segmentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3)
         ])
+        rebuildSegments(tooltips: nil, selectedIndex: 0)
         setAccessibilityElement(true)
         setAccessibilityRole(.tabGroup)
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    private func rebuildSegments(tooltips: [String?]?, selectedIndex: Int) {
+        slideMotion.cancel()
+        segmentStack.arrangedSubviews.forEach {
+            segmentStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+        segmentButtons.removeAll()
+        let clamped = labels.isEmpty ? 0 : max(0, min(labels.count - 1, selectedIndex))
+        _selectedSegment = clamped
+        slidePosition = CGFloat(clamped)
+        let btnHeight: CGFloat = compact ? 18 : 22
+        for (idx, item) in labels.enumerated() {
+            let btn = SegmentButton(title: item, index: idx, compact: compact, maxWidth: maxSegmentWidth, owner: self, action: #selector(segmentClicked(_:)))
+            btn.isSelectedSegment = (idx == clamped)
+            btn.setAccessibilityValue(idx == clamped ? 1 : 0)
+            if let tooltips, tooltips.indices.contains(idx) {
+                btn.toolTip = tooltips[idx]
+            }
+            if !equalWidthSegments {
+                btn.setContentHuggingPriority(.required, for: .horizontal)
+                btn.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+            }
+            segmentButtons.append(btn)
+            segmentStack.addArrangedSubview(btn)
+            btn.heightAnchor.constraint(equalToConstant: btnHeight).isActive = true
+        }
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+        needsDisplay = true
+    }
+
     override var intrinsicContentSize: NSSize {
-        let totalW = segmentButtons.reduce(CGFloat(6)) { acc, b in
-            let w = ceil((b.title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold)]).width) + 22
-            return acc + max(54, w)
-        } + CGFloat(max(0, segmentButtons.count - 1)) * 2
-        return NSSize(width: totalW, height: 28)
+        let totalH: CGFloat = compact ? 24 : 28
+        let totalW: CGFloat
+        if equalWidthSegments, let maxBtnW = segmentButtons.map(\.preferredSegmentWidth).max() {
+            totalW = 6 + maxBtnW * CGFloat(segmentButtons.count) + CGFloat(max(0, segmentButtons.count - 1)) * 2
+        } else {
+            totalW = segmentButtons.reduce(CGFloat(6)) { acc, b in
+                acc + b.preferredSegmentWidth
+            } + CGFloat(max(0, segmentButtons.count - 1)) * 2
+        }
+        return NSSize(width: totalW, height: totalH)
     }
 
     private func setSelected(_ index: Int, animated: Bool) {
@@ -781,6 +1021,19 @@ final class DesignSegmentedControl: NSControl {
         setSelected(sender.index, animated: Design.shouldAnimate(in: self))
         if let action {
             NSApp.sendAction(action, to: target, from: self)
+        }
+    }
+
+    func moveSelection(by delta: Int) {
+        guard isEnabled, !segmentButtons.isEmpty else { return }
+        let next = max(0, min(segmentButtons.count - 1, _selectedSegment + delta))
+        let targetBtn = segmentButtons[next]
+        window?.makeFirstResponder(targetBtn)
+        if next != _selectedSegment {
+            setSelected(next, animated: Design.shouldAnimate(in: self))
+            if let action {
+                NSApp.sendAction(action, to: target, from: self)
+            }
         }
     }
 
@@ -815,8 +1068,10 @@ final class DesignSegmentedControl: NSControl {
 
     override func draw(_ dirtyRect: NSRect) {
         let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let outerRadius: CGFloat = compact ? 7.5 : 8
+        let thumbRadius: CGFloat = compact ? 5.5 : 6
         let outerRect = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let outerPath = NSBezierPath(roundedRect: outerRect, xRadius: 8, yRadius: 8)
+        let outerPath = NSBezierPath(roundedRect: outerRect, xRadius: outerRadius, yRadius: outerRadius)
         (isDark ? NSColor.white.withAlphaComponent(0.05) : NSColor.black.withAlphaComponent(0.045)).setFill()
         outerPath.fill()
         (isDark ? NSColor.white.withAlphaComponent(0.07) : NSColor.black.withAlphaComponent(0.06)).setStroke()
@@ -825,7 +1080,7 @@ final class DesignSegmentedControl: NSControl {
 
         let thumbRect = interpolatedThumbRect().insetBy(dx: 0.5, dy: 0.5)
         guard thumbRect.width > 1 && thumbRect.height > 1 else { return }
-        let thumbPath = NSBezierPath(roundedRect: thumbRect, xRadius: 6, yRadius: 6)
+        let thumbPath = NSBezierPath(roundedRect: thumbRect, xRadius: thumbRadius, yRadius: thumbRadius)
 
         NSGraphicsContext.saveGraphicsState()
         let thumbShadow = NSShadow()
@@ -844,7 +1099,7 @@ final class DesignSegmentedControl: NSControl {
         (isDark ? NSColor.white.withAlphaComponent(0.14) : NSColor.black.withAlphaComponent(0.07)).setStroke()
         thumbPath.lineWidth = 0.6
         thumbPath.stroke()
-        Design.drawSpecularBevel(in: thumbRect, cornerRadius: 6, isDark: isDark)
+        Design.drawSpecularBevel(in: thumbRect, cornerRadius: thumbRadius, isDark: isDark)
     }
 
     deinit {

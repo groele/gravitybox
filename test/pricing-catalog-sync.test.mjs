@@ -6,7 +6,9 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
+import { ProtobufWriter } from '../dist/protobuf.js';
 import {
   DEFAULT_API_PRICES,
   isInternalNonChatModelId,
@@ -87,8 +89,8 @@ async function startBackend(directory, appPath) {
   throw new Error(`后台启动超时: ${stderr.slice(0, 400)}`);
 }
 
-test('资产与别名映射：ACTIVE_MODEL_KEYS 为 8 款，新增 orchestrator-neon/argon 与 M681 别名及内部模型过滤', () => {
-  assert.deepEqual([...ACTIVE_MODEL_KEYS], [
+test('资产与别名映射：ACTIVE_MODEL_KEYS / FEED_MODEL_KEYS 结构不变式，新增 orchestrator-neon/argon 与 M681 别名及内部模型过滤', () => {
+  const BASELINE_ACTIVE_MODELS = [
     'gemini-4-carbon',
     'gemini-4-argon',
     'gemini-4-neon',
@@ -97,8 +99,21 @@ test('资产与别名映射：ACTIVE_MODEL_KEYS 为 8 款，新增 orchestrator-
     'claude-opus-5-5',
     'claude-sonnet-5-5',
     'gpt-oss-120b',
-  ]);
-  assert.equal(FEED_MODEL_KEYS.length, 21);
+  ];
+  assert.ok(ACTIVE_MODEL_KEYS.length >= BASELINE_ACTIVE_MODELS.length);
+  assert.equal(new Set(ACTIVE_MODEL_KEYS).size, ACTIVE_MODEL_KEYS.length, 'ACTIVE_MODEL_KEYS 不得包含重复项');
+  assert.equal(new Set(FEED_MODEL_KEYS).size, FEED_MODEL_KEYS.length, 'FEED_MODEL_KEYS 不得包含重复项');
+  assert.ok(FEED_MODEL_KEYS.length >= ACTIVE_MODEL_KEYS.length && FEED_MODEL_KEYS.length >= 21);
+  for (const baseKey of BASELINE_ACTIVE_MODELS) {
+    assert.ok(ACTIVE_MODEL_KEYS.includes(baseKey), `ACTIVE_MODEL_KEYS 必须包含基线模型 ${baseKey}`);
+  }
+  for (const activeKey of ACTIVE_MODEL_KEYS) {
+    assert.ok(FEED_MODEL_KEYS.includes(activeKey), `ACTIVE_MODEL_KEYS 中的 ${activeKey} 必须存在于 FEED_MODEL_KEYS`);
+    assert.ok(DEFAULT_API_PRICES[activeKey], `ACTIVE_MODEL_KEYS 中的 ${activeKey} 必须存在定价`);
+  }
+  for (const feedKey of FEED_MODEL_KEYS) {
+    assert.ok(DEFAULT_API_PRICES[feedKey], `FEED_MODEL_KEYS 中的 ${feedKey} 必须存在定价`);
+  }
   assert.equal(matchPricingKeys('gemini-pro-orchestrator-argon'), 'gemini-4-argon');
   assert.equal(matchPricingKeys('gemini-pro-orchestrator-neon'), 'gemini-4-neon');
   assert.equal(matchPricingKeys('Orchestrator (Neon)'), 'gemini-4-neon');
@@ -136,7 +151,23 @@ test('资产与别名映射：ACTIVE_MODEL_KEYS 为 8 款，新增 orchestrator-
   assert.equal(normalizeCatalogTierLabel('unknown-tier'), '');
 });
 
-test('Live ULTRA：8 款活跃模型 + 13 款已下架模型 + orchestrator 别名归并，严禁泄露内部实验键', () => {
+test('Live ULTRA：活跃模型与已下架模型随目录不变式归类 + orchestrator 别名归并，严禁泄露内部实验键', () => {
+  const baselineCovered = new Set([
+    'gemini-4-carbon',
+    'gemini-4-argon',
+    'gemini-4-neon',
+    'gemini-4-hydrogen',
+    'gemini-3.8-flash',
+    'claude-opus-5-5',
+    'claude-sonnet-5-5',
+    'gpt-oss-120b',
+  ]);
+  const extraActiveModels = ACTIVE_MODEL_KEYS.filter((k) => !baselineCovered.has(k)).map((id) => ({
+    model_id: id,
+    disabled: false,
+    quota_source: 'live',
+  }));
+
   const snap = resolvePricingCatalogSnapshot({
     rawPricingTable: DEFAULT_API_PRICES,
     live: {
@@ -154,6 +185,7 @@ test('Live ULTRA：8 款活跃模型 + 13 款已下架模型 + orchestrator 别�
         { model_id: 'claude-opus-5-5-thinking', display_name: 'Claude Opus 5.5', disabled: false, quota_source: 'live' },
         { model_id: 'claude-sonnet-5-5', display_name: 'Claude Sonnet 5.5', disabled: false, quota_source: 'live' },
         { model_id: 'gpt-oss-120b', display_name: 'GPT-OSS 120B', disabled: false, quota_source: 'live' },
+        ...extraActiveModels,
         { model_id: 'chat_20706', disabled: false, quota_source: 'live' },
         { model_id: 'tab_flash_lite_preview', disabled: false, quota_source: 'live' },
         { model_id: 'gemini-3.8-flash-exp-a', disabled: false, quota_source: 'live' },
@@ -163,8 +195,8 @@ test('Live ULTRA：8 款活跃模型 + 13 款已下架模型 + orchestrator 别�
     },
   });
 
-  assert.equal(Object.keys(snap.prices).length, 8);
-  assert.equal(Object.keys(snap.retiredPrices).length, 13);
+  assert.equal(Object.keys(snap.prices).length, ACTIVE_MODEL_KEYS.length);
+  assert.equal(Object.keys(snap.retiredPrices).length, FEED_MODEL_KEYS.length - ACTIVE_MODEL_KEYS.length);
   assert.deepEqual(snap.unpricedLiveModels, []);
   for (const activeKey of ACTIVE_MODEL_KEYS) {
     assert.ok(snap.prices[activeKey], `prices 应包含 ${activeKey}`);
@@ -193,42 +225,38 @@ test('PRO 套餐：gemini-4-carbon-disabled 归类为 tier_locked；account_clou
     rawPricingTable: DEFAULT_API_PRICES,
     live: {
       tier: 'PRO',
-      models: [
-        { model_id: 'gemini-4-carbon-disabled', display_name: 'Gemini 4 Carbon', disabled: true, quota_source: 'live' },
-        { model_id: 'gemini-4-argon', disabled: false, quota_source: 'live' },
-        { model_id: 'gemini-4-neon', disabled: false, quota_source: 'live' },
-        { model_id: 'gemini-4-hydrogen', disabled: false, quota_source: 'live' },
-        { model_id: 'gemini-3.8-flash', disabled: false, quota_source: 'live' },
-        { model_id: 'claude-opus-5-5', disabled: false, quota_source: 'live' },
-        { model_id: 'claude-sonnet-5-5', disabled: false, quota_source: 'live' },
-        { model_id: 'gpt-oss-120b', disabled: false, quota_source: 'live' },
-      ],
+      models: ACTIVE_MODEL_KEYS.map((id) =>
+        id === 'gemini-4-carbon'
+          ? { model_id: 'gemini-4-carbon-disabled', display_name: 'Gemini 4 Carbon', disabled: true, quota_source: 'live' }
+          : { model_id: id, disabled: false, quota_source: 'live' }
+      ),
     },
   });
-  assert.equal(Object.keys(livePro.prices).length, 8);
+  assert.equal(Object.keys(livePro.prices).length, ACTIVE_MODEL_KEYS.length);
   assert.equal(livePro.modelCatalogState['gemini-4-carbon']?.availability, 'tier_locked');
   assert.equal(livePro.modelCatalogState['gemini-4-carbon']?.activeTier, 'PRO');
+  assert.equal(livePro.modelCatalogState['gemini-4-carbon']?.hostOrder, ACTIVE_MODEL_KEYS.indexOf('gemini-4-carbon'));
   assert.equal(livePro.modelCatalogState['gemini-4-argon']?.availability, 'available');
+  assert.equal(livePro.modelCatalogState['gemini-4-argon']?.hostOrder, ACTIVE_MODEL_KEYS.indexOf('gemini-4-argon'));
   assert.equal(livePro.modelCatalogState['gemini-4-neon']?.availability, 'available');
+  assert.equal(livePro.modelCatalogState['gemini-4-neon']?.hostOrder, ACTIVE_MODEL_KEYS.indexOf('gemini-4-neon'));
+  assert.equal(livePro.modelCatalogState['gpt-oss-120b']?.hostOrder, ACTIVE_MODEL_KEYS.indexOf('gpt-oss-120b'));
 
   const cloudPro = resolvePricingCatalogSnapshot({
     rawPricingTable: DEFAULT_API_PRICES,
     activeAccount: {
       source: 'cloud',
       tier: 'Google AI Pro',
-      models: [
-        { name: 'gemini-4-argon', disabled: false, quota_source: 'cloud' },
-        { name: 'gemini-4-neon', disabled: false, quota_source: 'cloud' },
-        { name: 'gemini-4-hydrogen', disabled: false, quota_source: 'cloud' },
-        { name: 'gemini-3.8-flash', disabled: false, quota_source: 'cloud' },
-        { name: 'claude-opus-5-5', disabled: false, quota_source: 'cloud' },
-        { name: 'claude-sonnet-5-5', disabled: false, quota_source: 'cloud' },
-        { name: 'gpt-oss-120b', disabled: false, quota_source: 'cloud' },
-      ],
+      models: ACTIVE_MODEL_KEYS.filter((k) => k !== 'gemini-4-carbon').map((name) => ({
+        name,
+        disabled: false,
+        quota_source: 'cloud',
+      })),
     },
   });
   assert.equal(cloudPro.modelCatalogState['gemini-4-carbon']?.availability, 'tier_locked');
   assert.equal(cloudPro.modelCatalogState['gemini-4-carbon']?.activeTier, 'PRO');
+  assert.equal(cloudPro.modelCatalogState['gemini-4-carbon']?.hostOrder, undefined);
   assert.equal(cloudPro.modelCatalogState['gemini-4-argon']?.availability, 'available');
   assert.equal(cloudPro.modelCatalogState['gemini-4-neon']?.availability, 'available');
 });
@@ -263,8 +291,9 @@ test('多账号池：ULTRA 当前 + FREE 备用补充 claude-opus-4-6 / claude-s
     ],
   });
 
-  assert.equal(Object.keys(snap.prices).length, 10);
-  assert.equal(Object.keys(snap.retiredPrices).length, 11);
+  const extraRetiredCount = ['claude-opus-4-6', 'claude-sonnet-4-6'].filter((k) => !ACTIVE_MODEL_KEYS.includes(k)).length;
+  assert.equal(Object.keys(snap.prices).length, ACTIVE_MODEL_KEYS.length + extraRetiredCount);
+  assert.equal(Object.keys(snap.retiredPrices).length, FEED_MODEL_KEYS.length - ACTIVE_MODEL_KEYS.length - extraRetiredCount);
   for (const extra of ['claude-opus-4-6', 'claude-sonnet-4-6']) {
     assert.ok(snap.prices[extra], `${extra} 应通过 FREE 备用池进入 prices`);
     assert.equal(snap.modelCatalogState[extra]?.availability, 'other_tier_only');
@@ -298,7 +327,7 @@ test('全新未定价实时模型 unpricedLiveModels 与 UsageStatsManager.model
     },
   });
 
-  assert.equal(Object.keys(snap.prices).length, 8);
+  assert.equal(Object.keys(snap.prices).length, ACTIVE_MODEL_KEYS.length);
   assert.equal(snap.unpricedLiveModels.length, 2);
   assert.deepEqual(snap.unpricedLiveModels, [
     { key: 'gemini-5-nova', displayName: 'Gemini 5 Nova', disabled: false },
@@ -315,7 +344,7 @@ test('全新未定价实时模型 unpricedLiveModels 与 UsageStatsManager.model
   );
   const status = await manager.getPricingSyncStatus();
   assert.equal(status.modelCount, Object.keys(snap.prices).length + snap.unpricedLiveModels.length);
-  assert.equal(status.modelCount, 10);
+  assert.equal(status.modelCount, ACTIVE_MODEL_KEYS.length + 2);
 
   // 未定价新模型同族思考档位 (-low/-medium/-high/-xhigh) 与 Orchestrator 在 live 快照中自动折叠为 1 组且精确计数
   const foldedSnap = resolvePricingCatalogSnapshot({
@@ -390,7 +419,7 @@ test('远端缓存与用户自定义价格追踪 publicPricingKeys，同时屏�
     rawPricingTable: raw,
     publicPricingKeys: publicKeys,
   });
-  assert.equal(Object.keys(snap.prices).length, 8);
+  assert.equal(Object.keys(snap.prices).length, ACTIVE_MODEL_KEYS.length);
   assert.ok(snap.retiredPrices['remote-retired-model']);
   assert.ok(snap.retiredPrices['my-custom-retired']);
   assert.equal(snap.pricingStatus['my-custom-retired'], 'user');
@@ -430,14 +459,11 @@ test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js 
         subscription_tier: 'PRO',
         model_forwarding_rules: {},
         models: [
-          { name: 'gemini-4-carbon-disabled', model_id: 'gemini-4-carbon-disabled', display_name: 'Gemini 4 Carbon', disabled: true, percentage: 0, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gemini-4-argon', model_id: 'gemini-4-argon', display_name: 'Gemini 4 Argon', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gemini-4-neon', model_id: 'gemini-4-neon', display_name: 'Gemini 4 Neon', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gemini-4-hydrogen', model_id: 'gemini-4-hydrogen', display_name: 'Gemini 4 Hydrogen', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gemini-3.8-flash', model_id: 'gemini-3.8-flash', display_name: 'Gemini 3.8 Flash', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'claude-opus-5-5', model_id: 'claude-opus-5-5', display_name: 'Claude Opus 5.5', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'claude-sonnet-5-5', model_id: 'claude-sonnet-5-5', display_name: 'Claude Sonnet 5.5', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
-          { name: 'gpt-oss-120b', model_id: 'gpt-oss-120b', display_name: 'GPT-OSS 120B', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
+          ...ACTIVE_MODEL_KEYS.map((id) =>
+            id === 'gemini-4-carbon'
+              ? { name: 'gemini-4-carbon-disabled', model_id: 'gemini-4-carbon-disabled', display_name: 'Gemini 4 Carbon', disabled: true, percentage: 0, reset_time: '', quota_source: 'live', stale: false }
+              : { name: id, model_id: id, display_name: id, disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false }
+          ),
           { name: 'gemini-5-nova', model_id: 'gemini-5-nova', display_name: 'Gemini 5 Nova', model_or_alias: 'MODEL_PLACEHOLDER_M700', disabled: false, percentage: 100, reset_time: '', quota_source: 'live', stale: false },
         ],
       },
@@ -448,7 +474,7 @@ test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js 
   const serialized = JSON.stringify(sanitized);
   assert.equal(serialized.includes('secret-user@example.invalid'), false);
   assert.equal(serialized.includes('Secret Name'), false);
-  assert.equal(sanitized.schema, 1);
+  assert.equal(sanitized.schema, 2);
   assert.equal(sanitized.appVersion, '2.32.1');
   assert.equal(sanitized.tier, 'PRO');
 
@@ -457,6 +483,12 @@ test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js 
   assert.ok(await readValidLiveIdeModelsSnapshot(snapshotPath, '2.32.1'));
   assert.equal(await readValidLiveIdeModelsSnapshot(snapshotPath, '2.33.0'), null);
   assert.equal(await readValidLiveIdeModelsSnapshot(snapshotPath, ''), null);
+  // 兼容读取旧版 schema 1 快照
+  const v1Path = join(dir, 'live-ide-models-v1.json');
+  await writeFile(v1Path, JSON.stringify({ ...sanitized, schema: 1 }));
+  const v1Read = await readValidLiveIdeModelsSnapshot(v1Path, '2.32.1');
+  assert.equal(v1Read?.schema, 1);
+  assert.equal(v1Read?.models.length, sanitized.models.length);
 
   // 2) 配置本地多账号池（ULTRA 主账号 + FREE 备用账号）与本地 mock 价格源
   const accMgr = new AccountsManager(dir);
@@ -522,17 +554,18 @@ test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js 
 
   const backend = await startBackend(dir, appDir);
   try {
+    const expectedExtra = ['claude-opus-4-6', 'claude-sonnet-4-6'].filter((k) => !ACTIVE_MODEL_KEYS.includes(k)).length;
     // 2a) appVersion=2.32.1 时命中 live-ide-models.json（PRO + gemini-4-carbon tier_locked + gemini-5-nova unpricedLive）
     const resMatch = await rpc(dir, { command: 'api_pricing_get' });
     assert.equal(resMatch.ok, true);
-    assert.equal(Object.keys(resMatch.prices).length, 10); // 8 live + 2 FREE other_tier_only
+    assert.equal(Object.keys(resMatch.prices).length, ACTIVE_MODEL_KEYS.length + expectedExtra); // 活跃模型 + 备用池 extra
     assert.equal(resMatch.modelCatalogState['gemini-4-carbon']?.availability, 'tier_locked');
     assert.equal(resMatch.modelCatalogState['claude-opus-4-6']?.availability, 'other_tier_only');
     assert.deepEqual(resMatch.modelCatalogState['claude-opus-4-6']?.availableInTiers, ['FREE']);
     assert.equal(resMatch.unpricedLiveModels.length, 1);
     assert.equal(resMatch.unpricedLiveModels[0].key, 'gemini-5-nova');
     assert.equal(resMatch.status.modelCount, Object.keys(resMatch.prices).length + resMatch.unpricedLiveModels.length);
-    assert.equal(resMatch.status.modelCount, 11);
+    assert.equal(resMatch.status.modelCount, ACTIVE_MODEL_KEYS.length + expectedExtra + 1);
 
     // 2b) 模拟 Antigravity 升级至 2.33.0：旧版 2.32.1 快照必须立即失效并回退到当前保存账号 ULTRA + FREE 池
     await writePlist('2.33.0');
@@ -540,18 +573,18 @@ test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js 
     assert.equal(resUpgraded.ok, true);
     assert.equal(resUpgraded.synced, true);
     assert.deepEqual(resUpgraded.unpricedLiveModels, []);
-    assert.equal(Object.keys(resUpgraded.prices).length, 10);
+    assert.equal(Object.keys(resUpgraded.prices).length, ACTIVE_MODEL_KEYS.length + expectedExtra);
     assert.equal(resUpgraded.modelCatalogState['gemini-4-carbon']?.availability, 'available');
     assert.equal(resUpgraded.modelCatalogState['gemini-4-carbon']?.activeTier, 'ULTRA');
     assert.equal(resUpgraded.modelCatalogState['claude-opus-4-6']?.availability, 'other_tier_only');
     assert.deepEqual(resUpgraded.modelCatalogState['claude-opus-4-6']?.availableInTiers, ['FREE']);
     assert.equal(resUpgraded.prices['gemini-2.5-pro'], undefined);
     assert.ok(resUpgraded.retiredPrices['gemini-2.5-pro']);
-    assert.equal(resUpgraded.status.modelCount, 10);
+    assert.equal(resUpgraded.status.modelCount, ACTIVE_MODEL_KEYS.length + expectedExtra);
 
     const syncStatusRes = await rpc(dir, { command: 'pricing_sync_status' });
     assert.equal(syncStatusRes.ok, true);
-    assert.equal(syncStatusRes.status.modelCount, 10);
+    assert.equal(syncStatusRes.status.modelCount, ACTIVE_MODEL_KEYS.length + expectedExtra);
     assert.equal(backend.stderr(), '');
 
     await rpc(dir, { command: 'stop' });
@@ -794,4 +827,402 @@ test('已定价历史 Flash-Lite（2.5/3.5）在 live 正常计价、在云端�
   assert.deepEqual(activeCloudFoldSnap.unpricedLiveModels, [
     { key: 'gemini-4-hydrogen-sonar', displayName: 'gemini-4-hydrogen-sonar', disabled: false },
   ]);
+});
+
+test('远端完整目录热更新：全权接管公开 feedModels/aliases/activeModels/capacityTokens 并保留内部兜底条目', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-remote-takeover-'));
+  t.after(async () => {
+    resetAndRegisterRemoteModelMetadata({});
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const {
+    executeRemotePricingSync,
+    loadRawPricingTable,
+    loadPricingSyncState,
+    compareFeedFreshness,
+  } = await import('../dist/usage-pricing.js');
+  const { getEffectiveFeedModelKeys, getEffectiveModelPriceAlias, getEffectiveModelDisplayName } = await import('../dist/model-catalog.js');
+  const { resolveModelCapacity } = await import('../dist/hud.js');
+
+  assert.equal(compareFeedFreshness(
+    { version: '2026-11-19-r2', updatedAt: '2026-11-19T08:00:00Z' },
+    { version: '2026-11-19-r2', updatedAt: '2026-11-19T05:00:00Z' }
+  ), 1);
+  assert.equal(compareFeedFreshness(
+    { version: '2026-11-19-r2', updatedAt: '2026-11-19T04:00:00Z' },
+    { version: '2026-11-19-r2', updatedAt: '2026-11-19T05:00:00Z' }
+  ), -1);
+
+  const remoteCachePath = join(dir, 'remote_pricing.json');
+  const customCachePath = join(dir, 'api_pricing.json');
+  const syncStatePath = join(dir, 'pricing-sync-status.json');
+
+  // 1) 兼容老格式缓存（无 feedModels / feedUpdatedAt / sha256）
+  await writeFile(remoteCachePath, JSON.stringify({
+    version: 1,
+    syncedAt: '2026-11-18T00:00:00Z',
+    sourceUrl: 'https://raw.githubusercontent.com/Enzoo404/gravitybox/main/assets/pricing-feed.json',
+    feedVersion: '2026-11-18',
+    prices: { 'legacy-only-model': { model: 'legacy-only-model', input: 1, output: 2, cached: 0.1 } },
+  }));
+  await writeFile(syncStatePath, JSON.stringify({
+    lastCheckAt: Date.parse('2026-11-18T00:00:00Z'),
+    lastCheckSuccess: true,
+    lastSyncError: null,
+  }));
+
+  const state = {
+    lastRemoteSyncAt: 0,
+    lastSyncSuccess: false,
+    lastCheckAt: 0,
+    lastCheckSuccess: false,
+    nextAutoSyncAt: 0,
+    lastSyncError: null,
+    lastSyncedSourceUrl: '',
+    lastSyncedVersion: '',
+    lastSyncedUpdatedAt: '',
+    lastSyncedEtag: '',
+    lastSyncedSha256: '',
+  };
+  await loadPricingSyncState(remoteCachePath, syncStatePath, state);
+  assert.equal(state.lastSyncedVersion, '2026-11-18');
+  assert.equal(state.lastSyncSuccess, true);
+
+  // 2) 远端全权接管快照：新增 gemini-5-omega、新增别名 M999、移除旧别名 M681、下线公开 gpt-4o-mini
+  const feedV2 = {
+    version: '2026-11-20',
+    schema: 1,
+    updatedAt: '2026-11-20T06:00:00Z',
+    aliases: {
+      'MODEL_PLACEHOLDER_M999': 'gemini-5-omega',
+    },
+    activeModels: ['gemini-4-carbon', 'gemini-5-omega'],
+    feedModels: ['gemini-4-carbon', 'gemini-5-omega', 'gemini-3.8-flash'],
+    models: {
+      'gemini-4-carbon': { displayName: 'Gemini 4 Carbon', capacityTokens: 200000 },
+      'gemini-5-omega': { displayName: 'Gemini 5 Omega', capacityTokens: 512000 },
+      'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash', capacityTokens: 200000 },
+    },
+    prices: {
+      'gemini-4-carbon': { model: 'gemini-4-carbon', input: 2.0, output: 10.0, cached: 0.1 },
+      'gemini-5-omega': { model: 'gemini-5-omega', input: 1.8, output: 9.0, cached: 0.18 },
+      'gemini-3.8-flash': { model: 'gemini-3.8-flash', input: 0.75, output: 3.75, cached: 0.075 },
+    },
+  };
+  const staleFeedV1 = {
+    version: '2026-11-19-r2',
+    schema: 1,
+    updatedAt: '2026-11-19T05:00:00Z',
+    prices: { 'gemini-4-carbon': { model: 'gemini-4-carbon', input: 2.0, output: 10.0, cached: 0.1 } },
+  };
+  let mode = 'normal';
+  let hits = { stale: 0, main: 0, ghApi: 0 };
+  const srv = createServer((req, res) => {
+    if (req.url === '/stale-cdn') {
+      hits.stale += 1;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(staleFeedV1));
+      return;
+    }
+    if (req.url === '/gh-api') {
+      hits.ghApi += 1;
+      const body = JSON.stringify(feedV2);
+      res.writeHead(200, { 'Content-Type': 'application/json', ETag: '"etag-v2"' });
+      res.end(JSON.stringify({ encoding: 'base64', content: Buffer.from(body, 'utf8').toString('base64') }));
+      return;
+    }
+    hits.main += 1;
+    if (mode === '304' && req.headers['if-none-match'] === '"etag-v2"') {
+      res.writeHead(304, { ETag: '"etag-v2"' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', ETag: '"etag-v2"' });
+    res.end(JSON.stringify(feedV2));
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const port = srv.address().port;
+
+  try {
+    // 2a) 先通过 GitHub Contents API base64 包络同步 feedV2
+    const sync1 = await executeRemotePricingSync({
+      candidateUrls: [`http://127.0.0.1:${port}/gh-api`],
+      remotePricingCachePath: remoteCachePath,
+      pricingSyncStatePath: syncStatePath,
+      state,
+      now: Date.parse('2026-11-20T06:10:00Z'),
+    });
+    assert.equal(sync1.synced, true);
+    assert.equal(sync1.unchanged, false);
+    assert.equal(sync1.version, '2026-11-20');
+    assert.equal(state.lastSyncedEtag, '"etag-v2"');
+
+    // 验证远端全权接管
+    assert.deepEqual([...getEffectiveFeedModelKeys()], ['gemini-4-carbon', 'gemini-5-omega', 'gemini-3.8-flash']);
+    assert.deepEqual([...getEffectiveActiveModelKeys()], ['gemini-4-carbon', 'gemini-5-omega']);
+    assert.equal(getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M999'), 'gemini-5-omega');
+    assert.equal(getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M681'), undefined, '被远端撤回的内置别名必须失效');
+    assert.equal(getEffectiveModelDisplayName('gemini-5-omega'), 'Gemini 5 Omega');
+    assert.equal(resolveModelCapacity('MODEL_PLACEHOLDER_M999').capacityTokens, 512000);
+
+    const { merged, billingPrices, publicKeys } = await loadRawPricingTable(remoteCachePath, customCachePath);
+    assert.ok(merged['gemini-5-omega']);
+    assert.ok(merged['gemini-3.8-flash-control'], '内置内部衍生条目必须继续兜底保留');
+    assert.equal(merged['gpt-4o-mini'], undefined, '被远端移除出 feedModels 的旧公开模型应退出公开表');
+    assert.ok(billingPrices['gpt-4o-mini'], 'billingPrices 必须保留内置历史定价供未落盘账本回溯计价');
+    assert.equal(publicKeys.has('gpt-4o-mini'), false);
+    assert.ok(publicKeys.has('gemini-5-omega'));
+
+    const snap = resolvePricingCatalogSnapshot({
+      rawPricingTable: merged,
+      publicPricingKeys: publicKeys,
+    });
+    assert.deepEqual(Object.keys(snap.prices).sort(), ['gemini-4-carbon', 'gemini-5-omega']);
+    assert.deepEqual(Object.keys(snap.retiredPrices), ['gemini-3.8-flash']);
+
+    // 2b) 命中陈旧 CDN 镜像时应拒绝并自动回退到后续最新源；同时验证 SHA-256 去重返回 unchanged: true
+    const sync2 = await executeRemotePricingSync({
+      candidateUrls: [`http://127.0.0.1:${port}/stale-cdn`, `http://127.0.0.1:${port}/main`],
+      remotePricingCachePath: remoteCachePath,
+      pricingSyncStatePath: syncStatePath,
+      state,
+      now: Date.parse('2026-11-20T07:00:00Z'),
+    });
+    assert.equal(sync2.synced, true);
+    assert.equal(sync2.unchanged, true);
+    assert.equal(hits.stale, 1);
+    assert.equal(hits.main, 1);
+
+    // 2c) 命中 ETag 304 Not Modified 时直接返回 unchanged: true
+    mode = '304';
+    const sync3 = await executeRemotePricingSync({
+      candidateUrls: [`http://127.0.0.1:${port}/main`],
+      remotePricingCachePath: remoteCachePath,
+      pricingSyncStatePath: syncStatePath,
+      state,
+      now: Date.parse('2026-11-20T08:00:00Z'),
+    });
+    assert.equal(sync3.synced, true);
+    assert.equal(sync3.unchanged, true);
+  } finally {
+    await new Promise((resolve) => srv.close(resolve));
+  }
+});
+
+test('P2-C: 远端移出旧公开模型时 UI 公开表同步剔除，但历史未落锁 SQLite 用量仍按内置历史费率准确计价', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-billing-fallback-'));
+  t.after(async () => {
+    resetAndRegisterRemoteModelMetadata({});
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  await writeFile(
+    join(dir, 'remote_pricing.json'),
+    JSON.stringify({
+      version: 1,
+      syncedAt: '2026-11-20T00:00:00Z',
+      sourceUrl: 'https://raw.githubusercontent.com/Enzoo404/gravitybox/main/assets/pricing-feed.json',
+      feedVersion: '2026-11-20',
+      feedUpdatedAt: '2026-11-20T00:00:00Z',
+      activeModels: ['gemini-4-carbon'],
+      feedModels: ['gemini-4-carbon'],
+      models: {
+        'gemini-4-carbon': { displayName: 'Gemini 4 Carbon', capacityTokens: 200000 },
+      },
+      prices: {
+        'gemini-4-carbon': { model: 'gemini-4-carbon', input: 1.8, output: 9.0, cached: 0.09 },
+      },
+    })
+  );
+
+  const convDir = join(dir, 'antigravity', 'conversations');
+  await mkdir(convDir, { recursive: true });
+  const dbPath = join(convDir, 'legacy-gpt4o-mini.db');
+  const novSec = Math.floor(Date.parse('2026-11-18T12:00:00Z') / 1000);
+  const mkBlob = (modelId, inputTok, outputTok, cachedTok, stamp) => {
+    const usageMsg = Buffer.concat([
+      ProtobufWriter.encodeVarintField(2, inputTok),
+      ProtobufWriter.encodeVarintField(3, outputTok),
+      ProtobufWriter.encodeVarintField(5, cachedTok),
+    ]);
+    const timing = ProtobufWriter.encodeLengthDelimited(4, ProtobufWriter.encodeVarintField(1, stamp));
+    return ProtobufWriter.encodeLengthDelimited(
+      1,
+      Buffer.concat([
+        ProtobufWriter.encodeString(19, modelId),
+        ProtobufWriter.encodeLengthDelimited(4, usageMsg),
+        ProtobufWriter.encodeLengthDelimited(9, timing),
+      ])
+    );
+  };
+
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);');
+    db.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);');
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(1, mkBlob('gpt-4o-mini', 1_000_000, 0, 0, novSec));
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(2, mkBlob('gemini-4-carbon', 1_000_000, 0, 0, novSec));
+  } finally {
+    db.close();
+  }
+
+  const manager = new UsageStatsManager({ stateDir: dir, geminiDir: dir });
+  const { raw, publicKeys } = await manager.getRawPricingCatalog();
+  assert.equal(raw['gpt-4o-mini'], undefined);
+  assert.equal(publicKeys.has('gpt-4o-mini'), false);
+
+  const billing = await manager.getBillingPricingTable();
+  assert.ok(billing['gpt-4o-mini']);
+  assert.equal(billing['gemini-4-carbon']?.input, 1.8);
+
+  const summary = await manager.getUsageSummary(true);
+  assert.equal(summary.all_time.unpriced_models, 0);
+  assert.equal(summary.all_time.priced_models, 2);
+  const byModel = new Map(summary.all_time.by_model.map((r) => [r.model, r]));
+  assert.equal(byModel.get('gpt-4o-mini')?.estimated_usd, 0.15);
+  assert.equal(byModel.get('gemini-4-carbon')?.estimated_usd, 1.8);
+  assert.equal(summary.all_time.estimated_usd, 1.95);
+});
+
+test('main.js 后端启动预热 remote_pricing.json、默认关闭静默外联，并在同步更新后推进 pricingRevision', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-pricing-rev-'));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+
+  const appDir = join(dir, 'MockAntigravity.app');
+  await mkdir(join(appDir, 'Contents'), { recursive: true });
+  await mkdir(join(dir, '词典'), { recursive: true });
+  await mkdir(join(dir, 'profile'), { recursive: true });
+  await mkdir(join(dir, 'home'), { recursive: true });
+  await mkdir(join(dir, 'appsupport'), { recursive: true });
+  await mkdir(join(dir, 'gemini'), { recursive: true });
+  await writeFile(
+    join(appDir, 'Contents', 'Info.plist'),
+    '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>2.34.0</string></dict></plist>'
+  );
+
+  // 预先写入一份较新的 remote_pricing.json，验证冷启动即完成模型元数据预热
+  await writeFile(join(dir, 'remote_pricing.json'), JSON.stringify({
+    version: 1,
+    syncedAt: '2026-11-20T00:00:00Z',
+    sourceUrl: 'http://127.0.0.1:1/feed.json',
+    feedVersion: '2026-11-20',
+    feedUpdatedAt: '2026-11-20T00:00:00Z',
+    aliases: { 'MODEL_PLACEHOLDER_M888': 'gemini-5-aurora' },
+    activeModels: ['gemini-4-carbon', 'gemini-5-aurora'],
+    feedModels: ['gemini-4-carbon', 'gemini-5-aurora'],
+    models: {
+      'gemini-4-carbon': { displayName: 'Gemini 4 Carbon', capacityTokens: 200000 },
+      'gemini-5-aurora': { displayName: 'Gemini 5 Aurora', capacityTokens: 256000 },
+    },
+    prices: {
+      'gemini-4-carbon': { model: 'gemini-4-carbon', input: 2.0, output: 10.0, cached: 0.1 },
+      'gemini-5-aurora': { model: 'gemini-5-aurora', input: 1.5, output: 7.5, cached: 0.15 },
+    },
+  }));
+
+  const updatedFeed = {
+    version: '2026-11-21',
+    schema: 1,
+    updatedAt: '2026-11-21T00:00:00Z',
+    aliases: { 'MODEL_PLACEHOLDER_M888': 'gemini-5-aurora' },
+    activeModels: ['gemini-4-carbon', 'gemini-5-aurora'],
+    feedModels: ['gemini-4-carbon', 'gemini-5-aurora'],
+    models: {
+      'gemini-4-carbon': { displayName: 'Gemini 4 Carbon', capacityTokens: 200000 },
+      'gemini-5-aurora': { displayName: 'Gemini 5 Aurora', capacityTokens: 256000 },
+    },
+    prices: {
+      'gemini-4-carbon': { model: 'gemini-4-carbon', input: 1.8, output: 9.0, cached: 0.09 },
+      'gemini-5-aurora': { model: 'gemini-5-aurora', input: 1.5, output: 7.5, cached: 0.15 },
+    },
+  };
+  let requestCount = 0;
+  const feedServer = createServer((_req, res) => {
+    requestCount += 1;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(updatedFeed));
+  });
+  await new Promise((resolve) => feedServer.listen(0, '127.0.0.1', resolve));
+  const port = feedServer.address().port;
+
+  const backend = await startBackend(dir, appDir);
+  try {
+    const status1 = await rpc(dir, { command: 'status', includeTasks: false });
+    assert.equal(status1.ok, true);
+    assert.match(status1.status.pricingRevision, /^2026-11-20\|/);
+    assert.equal(requestCount, 0, '默认关闭自动同步时不得静默发起外部请求');
+
+    const syncRes = await rpc(dir, { command: 'pricing_sync_check', feedUrl: `http://127.0.0.1:${port}/feed.json` });
+    assert.equal(syncRes.ok, true);
+    assert.equal(syncRes.synced, true);
+    assert.equal(syncRes.prices['gemini-4-carbon']?.input, 1.8);
+    assert.equal(syncRes.prices['gemini-5-aurora']?.input, 1.5);
+
+    const status2 = await rpc(dir, { command: 'status', includeTasks: false });
+    assert.equal(status2.ok, true);
+    assert.match(status2.status.pricingRevision, /^2026-11-21\|/);
+    assert.notEqual(status2.status.pricingRevision, status1.status.pricingRevision);
+
+    // 再次拉取相同内容（SHA-256 一致）时 pricingRevision 保持稳定不抖动
+    const syncRepeat = await rpc(dir, { command: 'pricing_sync_check', feedUrl: `http://127.0.0.1:${port}/feed.json` });
+    assert.equal(syncRepeat.ok, true);
+    assert.equal(syncRepeat.synced, true);
+    assert.equal(syncRepeat.unchanged, true);
+    const status3 = await rpc(dir, { command: 'status', includeTasks: false });
+    assert.equal(status3.status.pricingRevision, status2.status.pricingRevision);
+
+    await rpc(dir, { command: 'stop' });
+    await new Promise((resolve) => {
+      if (backend.child.exitCode !== null) resolve();
+      else backend.child.once('exit', resolve);
+    });
+  } finally {
+    if (backend.child.exitCode === null) backend.child.kill('SIGTERM');
+    await new Promise((resolve) => feedServer.close(resolve));
+  }
+});
+
+test('autoHealUnpricedHistory 仅计入实际获得有效新定价的记录，不把仍未定价的 $0 哨兵计入 healedCount', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-heal-count-'));
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+
+  const convDir = join(dir, 'antigravity', 'conversations');
+  await mkdir(convDir, { recursive: true });
+  const nowSec = Math.floor(Date.now() / 1000) - 60;
+  const mkBlob = (modelId, inputTok, outputTok) => ProtobufWriter.encodeLengthDelimited(
+    1,
+    Buffer.concat([
+      ProtobufWriter.encodeString(19, modelId),
+      ProtobufWriter.encodeLengthDelimited(4, Buffer.concat([
+        ProtobufWriter.encodeVarintField(2, inputTok),
+        ProtobufWriter.encodeVarintField(3, outputTok),
+      ])),
+      ProtobufWriter.encodeLengthDelimited(9, ProtobufWriter.encodeLengthDelimited(4, ProtobufWriter.encodeVarintField(1, nowSec))),
+    ])
+  );
+  const db = new DatabaseSync(join(convDir, 'heal-mixed.db'));
+  try {
+    db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);');
+    db.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);');
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(1, mkBlob('unpriced-future-alpha', 1_000_000, 0));
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(2, mkBlob('unpriced-future-beta', 1_000_000, 0));
+  } finally {
+    db.close();
+  }
+
+  const mgr = new UsageStatsManager({ geminiDir: dir, stateDir: dir });
+  const before = await mgr.getUsageSummary(true);
+  assert.equal(before.all_time.unpriced_models, 2);
+
+  // 仅更新 alpha 的价格，beta 依然未定价；autoHealUnpricedHistory 应返回 1（而非 2）
+  await mgr.savePricingTable({
+    'unpriced-future-alpha': { model: 'unpriced-future-alpha', input: 2.0, output: 8.0, cached: 0.2 },
+  });
+  const healed = await mgr.autoHealUnpricedHistory();
+  assert.equal(healed, 1, '仅 1 条记录真正获得有效费率锁，不得把仍未定价的 beta $0 哨兵计入 healedCount');
+
+  // 再次执行时无新定价落锁，应精确返回 0
+  const healedAgain = await mgr.autoHealUnpricedHistory();
+  assert.equal(healedAgain, 0, '仍未定价模型不得重复虚报补齐数量');
 });

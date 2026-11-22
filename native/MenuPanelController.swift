@@ -71,8 +71,8 @@ final class MenuPanelController: NSViewController {
 
     // Debug-Port-Missing Guidance Banner
     let debugPortTitleLabel = text(L10n.t("status.debug_port_missing", fallback: "未开启调试端口"), size: 12, weight: .semibold, color: .labelColor)
-    let debugPortBodyLabel = text(L10n.t("debug_port_missing.banner_body", fallback: "检测到 Antigravity 已运行但未开启调试端口，汉化与对话状态栏暂不可连接。请先保存工作后再安全重启。"), size: 11, color: Design.secondary, wrap: true)
-    let safeRelaunchBtn = button(L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启 Antigravity 以连接"), target: nil, action: #selector(safeRelaunchAntigravityFromBanner))
+    let debugPortBodyLabel = text(L10n.t("debug_port_missing.banner_body", fallback: "Antigravity 未带调试端口运行，请先保存工作后安全重启以连接。"), size: 11, color: Design.secondary, wrap: true)
+    let safeRelaunchBtn = button(L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启以连接"), target: nil, action: #selector(safeRelaunchAntigravityFromBanner))
     let debugPortBannerBox: NSBox
 
     // Bottom Bar
@@ -80,6 +80,7 @@ final class MenuPanelController: NSViewController {
     let openMainBtn = button(L10n.t("menu_panel.footer.open_main", fallback: "打开主界面 ↗"), target: nil, action: #selector(openMainFromFooter))
 
     // State
+    private(set) var measuredPanelSize = NSSize(width: MenuPanelController.panelWidth, height: MenuPanelController.defaultPanelHeight)
     private(set) var selectedTab: Int = 0
     private(set) var selectedPeriod: Int = 0
     private(set) var selectedChartDimension: MenuTrendChartView.Dimension = .tokens
@@ -135,21 +136,37 @@ final class MenuPanelController: NSViewController {
         self.costTile = MenuMetricTileView(key: "cost", title: L10n.t("menu_panel.tile.cost", fallback: "API 费用估算"))
         self.cacheTile = MenuMetricTileView(key: "cache", title: L10n.t("menu_panel.tile.cache", fallback: "缓存命中率"))
 
-        let warnIcon = symbol("exclamationmark.triangle.fill", size: 13, color: accessibleWarningColor())
-        let debugHeader = horizontal([warnIcon, debugPortTitleLabel, flexibleSpace()], spacing: 6)
-        debugHeader.alignment = .centerY
-        let debugBtnRow = horizontal([safeRelaunchBtn, flexibleSpace()], spacing: 6)
-        debugBtnRow.alignment = .centerY
-        let debugContent = vertical([debugHeader, debugPortBodyLabel, debugBtnRow], spacing: 6)
-        debugContent.detachesHiddenViews = true
-        fillWidth(debugHeader, in: debugContent)
-        fillWidth(debugPortBodyLabel, in: debugContent)
-        fillWidth(debugBtnRow, in: debugContent)
-        let bannerBox = group([debugContent], inset: 10)
+        let warnTint = accessibleWarningColor()
+        let warnIconBox = tintedIconBox(
+            size: 26,
+            cornerRadius: 7,
+            tint: warnTint,
+            darkFillAlpha: 0.18,
+            lightFillAlpha: 0.11,
+            darkBorderAlpha: 0.30,
+            lightBorderAlpha: 0.16
+        )
+        let warnIcon = symbol("exclamationmark.triangle.fill", size: 12.5, color: warnTint)
+        warnIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        warnIconBox.addSubview(warnIcon)
+        NSLayoutConstraint.activate([
+            warnIcon.centerXAnchor.constraint(equalTo: warnIconBox.centerXAnchor),
+            warnIcon.centerYAnchor.constraint(equalTo: warnIconBox.centerYAnchor)
+        ])
+        debugPortTitleLabel.lineBreakMode = .byTruncatingTail
+        debugPortBodyLabel.maximumNumberOfLines = 2
+        debugPortBodyLabel.lineBreakMode = .byTruncatingTail
+        debugPortBodyLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let debugTextCol = vertical([debugPortTitleLabel, debugPortBodyLabel], spacing: 1.5)
+        debugTextCol.alignment = .leading
+        debugTextCol.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let debugRow = horizontal([warnIconBox, debugTextCol, flexibleSpace(), safeRelaunchBtn], spacing: 9)
+        debugRow.alignment = .centerY
+        let bannerBox = group([debugRow], inset: 10)
         bannerBox.cornerRadius = Design.Radius.popover
         bannerBox.borderWidth = 1
-        bannerBox.borderColor = Design.dynamicAlpha(accessibleWarningColor(), 0.35)
-        bannerBox.fillColor = Design.dynamicAlpha(accessibleWarningColor(), 0.09, 0.14)
+        bannerBox.borderColor = Design.dynamicAlpha(warnTint, 0.26, 0.34)
+        bannerBox.fillColor = Design.dynamicAlpha(warnTint, 0.065, 0.12)
         bannerBox.isHidden = true
         self.debugPortBannerBox = bannerBox
 
@@ -173,9 +190,13 @@ final class MenuPanelController: NSViewController {
         quotaEmptyButton.controlSize = .small
         safeRelaunchBtn.target = self
         safeRelaunchBtn.controlSize = .small
-        safeRelaunchBtn.bezelColor = .controlAccentColor
+        safeRelaunchBtn.font = .systemFont(ofSize: 11, weight: .medium)
+        safeRelaunchBtn.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+        safeRelaunchBtn.imagePosition = .imageLeading
+        safeRelaunchBtn.setContentHuggingPriority(.required, for: .horizontal)
+        safeRelaunchBtn.setContentCompressionResistancePriority(.required, for: .horizontal)
         safeRelaunchBtn.toolTip = nil
-        safeRelaunchBtn.setAccessibilityLabel(L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启 Antigravity 以连接"))
+        safeRelaunchBtn.setAccessibilityLabel(L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启以连接"))
         openAntigravityBtn.title = L10n.t("sidebar.open_antigravity", fallback: "打开 Antigravity")
         openAntigravityBtn.target = self
         openAntigravityBtn.controlSize = .small
@@ -221,7 +242,9 @@ final class MenuPanelController: NSViewController {
         let fixedHeight = resolvedTargetHeight()
         let rootSurface = MenuPanelRootView()
         rootSurface.frame = NSRect(x: 0, y: 0, width: Self.panelWidth, height: fixedHeight)
-        self.preferredContentSize = NSSize(width: Self.panelWidth, height: fixedHeight)
+        let initialSize = NSSize(width: Self.panelWidth, height: fixedHeight)
+        self.measuredPanelSize = initialSize
+        self.preferredContentSize = initialSize
 
         // 1. Header Bar
         let brandIcon: NSImageView = {
@@ -342,6 +365,7 @@ final class MenuPanelController: NSViewController {
             footerHost.trailingAnchor.constraint(equalTo: rootSurface.trailingAnchor),
             footerHost.bottomAnchor.constraint(equalTo: rootSurface.bottomAnchor)
         ])
+        rootSurface.installRimOverlay()
         self.view = rootSurface
         syncDebugPortBanner()
         applyActiveTabVisibility()
@@ -484,13 +508,15 @@ final class MenuPanelController: NSViewController {
         }
     }
 
-    private func performWithoutAnimation(_ block: () -> Void) {
+    private func performWithoutAnimation(updateSize: Bool = true, animateSize: Bool = false, _ block: () -> Void) {
         let savedOrigin = contentScroll.contentView.bounds.origin
         NSAnimationContext.beginGrouping()
         NSAnimationContext.current.duration = 0
         NSAnimationContext.current.allowsImplicitAnimation = false
         block()
-        updatePreferredPanelSize()
+        if updateSize {
+            updatePreferredPanelSize(animate: animateSize)
+        }
         let maxY = max(0, documentContainer.bounds.height - contentScroll.contentView.bounds.height)
         let clampedY = max(0, min(savedOrigin.y, maxY))
         if abs(contentScroll.contentView.bounds.origin.y - clampedY) > 0.5 {
@@ -515,9 +541,9 @@ final class MenuPanelController: NSViewController {
         periodSelector.setSelected(selectedPeriod)
         chartDimensionToggle.setSelected(selectedChartDimension == .requests ? 1 : 0)
         trendChart.dimension = selectedChartDimension
-        performWithoutAnimation {
-            applyActiveTabVisibility(resetScroll: true)
-            syncFromAssistant()
+        applyActiveTabVisibility(resetScroll: true)
+        performWithoutAnimation(updateSize: true, animateSize: false) {
+            syncFromAssistant(updateSize: false)
         }
         ensureDataForActiveTab(force: false)
     }
@@ -536,11 +562,11 @@ final class MenuPanelController: NSViewController {
             app.configuration?.value.menuSelectedTab = clamped
             app.scheduleConfigurationSave()
         }
-        let shouldAnimate = Design.shouldAnimate(in: view) && app.menuPopover?.isShown == true
+        let shouldAnimate = Design.shouldAnimate(in: view) && app.isMenuPanelShown
         if shouldAnimate {
             applyActiveTabVisibility(resetScroll: true)
-            syncFromAssistant()
-            updatePreferredPanelSize()
+            syncFromAssistant(updateSize: false)
+            updatePreferredPanelSize(animate: true)
             let activeRoot: NSView = selectedTab == 0 ? usageRoot : (selectedTab == 1 ? quotaRoot : accountsRoot)
             activeRoot.wantsLayer = true
             let slideOffset: CGFloat = clamped > prevTab ? 16.0 : (clamped < prevTab ? -16.0 : 0.0)
@@ -553,9 +579,9 @@ final class MenuPanelController: NSViewController {
                 activeRoot.layer?.transform = CATransform3DIdentity
             }
         } else {
-            performWithoutAnimation {
-                applyActiveTabVisibility(resetScroll: true)
-                syncFromAssistant()
+            applyActiveTabVisibility(resetScroll: true)
+            performWithoutAnimation(updateSize: true, animateSize: false) {
+                syncFromAssistant(updateSize: false)
                 let activeRoot: NSView = selectedTab == 0 ? usageRoot : (selectedTab == 1 ? quotaRoot : accountsRoot)
                 activeRoot.alphaValue = 1.0
                 activeRoot.layer?.transform = CATransform3DIdentity
@@ -574,7 +600,7 @@ final class MenuPanelController: NSViewController {
         }
         renderedUsageSnapshotKey = ""
         renderedUsageModelKey = ""
-        performWithoutAnimation {
+        performWithoutAnimation(updateSize: true, animateSize: app.isMenuPanelShown) {
             syncUsageTabFromCache()
         }
         let periodKey = Self.periods[clamped]
@@ -590,7 +616,7 @@ final class MenuPanelController: NSViewController {
             app.scheduleConfigurationSave()
         }
         renderedUsageSnapshotKey = ""
-        performWithoutAnimation {
+        performWithoutAnimation(updateSize: true, animateSize: app.isMenuPanelShown) {
             syncUsageTabFromCache()
         }
     }
@@ -598,11 +624,13 @@ final class MenuPanelController: NSViewController {
     @objc func toggleAllModelsPressed() {
         showAllModels.toggle()
         renderedUsageModelKey = ""
-        if Design.shouldAnimate(in: view) && app.menuPopover?.isShown == true {
-            syncUsageTabFromCache()
-            updatePreferredPanelSize()
+        if Design.shouldAnimate(in: view) && app.isMenuPanelShown {
+            performWithoutAnimation(updateSize: false) {
+                syncUsageTabFromCache()
+            }
+            updatePreferredPanelSize(animate: true)
         } else {
-            performWithoutAnimation {
+            performWithoutAnimation(updateSize: true, animateSize: false) {
                 syncUsageTabFromCache()
             }
         }
@@ -657,6 +685,7 @@ final class MenuPanelController: NSViewController {
             } else if needsAccountSync {
                 app.fetchAccountList(notifyPage: true)
             }
+            app.refreshRecommendedAccountIfNeeded(force: force)
         }
     }
 
@@ -686,8 +715,8 @@ final class MenuPanelController: NSViewController {
     func syncDebugPortBanner() {
         let showBanner = app.statusValue.mode == "debug-port-missing"
         debugPortTitleLabel.stringValue = L10n.t("status.debug_port_missing", fallback: "未开启调试端口")
-        debugPortBodyLabel.stringValue = L10n.t("debug_port_missing.banner_body", fallback: "检测到 Antigravity 已运行但未开启调试端口，汉化与对话状态栏暂不可连接。请先保存工作后再安全重启。")
-        let btnTitle = L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启 Antigravity 以连接")
+        debugPortBodyLabel.stringValue = L10n.t("debug_port_missing.banner_body", fallback: "Antigravity 未带调试端口运行，请先保存工作后安全重启以连接。")
+        let btnTitle = L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启以连接")
         safeRelaunchBtn.title = btnTitle
         safeRelaunchBtn.setAccessibilityLabel(btnTitle)
         safeRelaunchBtn.toolTip = nil
@@ -714,7 +743,7 @@ final class MenuPanelController: NSViewController {
     func onUsageReportUpdated(period: String, result: Result<[String: Any], Error>) {
         guard isViewLoaded else { return }
         let currentPeriodKey = Self.periods[selectedPeriod]
-        performWithoutAnimation {
+        performWithoutAnimation(updateSize: true, animateSize: app.isMenuPanelShown) {
             if period == currentPeriodKey, selectedTab == 0 {
                 syncUsageTabFromCache()
             }
@@ -722,9 +751,9 @@ final class MenuPanelController: NSViewController {
         }
     }
 
-    func syncFromAssistant() {
+    func syncFromAssistant(updateSize: Bool = true) {
         guard isViewLoaded else { return }
-        performWithoutAnimation {
+        performWithoutAnimation(updateSize: updateSize, animateSize: app.isMenuPanelShown) {
             syncDebugPortBanner()
             syncHeaderRefreshState()
             switch selectedTab {
@@ -740,10 +769,14 @@ final class MenuPanelController: NSViewController {
                 if !renderedQuotaTabKey.isEmpty { syncQuotaTab() }
             }
         }
-        if app.reachable && (app.menuTracking || app.menuPopover?.isShown == true) && selectedTab == 0 {
+        if app.reachable && (app.menuTracking || app.isMenuPanelShown) && selectedTab == 0 {
             let periodKey = Self.periods[selectedPeriod]
-            let needsInitialOrLiveUsage = app.cachedUsageReportsByPeriod[periodKey] == nil || app.bootstrappedUsagePeriods.contains(periodKey)
-            if needsInitialOrLiveUsage && app.usageInFlightByPeriod[periodKey] != true && app.usageFetchErrorsByPeriod[periodKey] == nil {
+            let lastFetch = app.usageLastFetchTimeByPeriod[periodKey] ?? .distantPast
+            let isStale = Date().timeIntervalSince(lastFetch) >= 15.0
+            let needsUsageRefresh = app.cachedUsageReportsByPeriod[periodKey] == nil
+                || app.bootstrappedUsagePeriods.contains(periodKey)
+                || isStale
+            if needsUsageRefresh && app.usageInFlightByPeriod[periodKey] != true && app.usageFetchErrorsByPeriod[periodKey] == nil {
                 app.fetchUsageSummary(period: periodKey, force: false)
             }
         }
@@ -858,8 +891,15 @@ final class MenuPanelController: NSViewController {
             updateMenuTrendBuckets(report: report, summary: summary)
         }
 
-        let models = (report["byModel"] as? [[String: Any]]) ?? (report["models"] as? [[String: Any]]) ?? []
-        let modelKey = "\(L10n.shared.currentLocale):\(report["snapshotId"] ?? ""):\(periodKey):\(models.count):\(pricedCount):\(unpricedCount):\(showAllModels):\(total)"
+        let models = ModelUsageFold.sortByUsage(ModelUsageFold.foldThinkingVariants((report["byModel"] as? [[String: Any]]) ?? (report["models"] as? [[String: Any]]) ?? []))
+        let displayUnpricedCount = models.isEmpty
+            ? unpricedCount
+            : models.filter { row in
+                let usd = doubleVal(row, "estimatedUsd", fallback: doubleVal(row, "estimated_usd"))
+                let isPriced = (row["priced"] as? Bool) ?? (usd > 0)
+                return !isPriced
+            }.count
+        let modelKey = "\(L10n.shared.currentLocale):\(report["snapshotId"] ?? ""):\(periodKey):\(models.count):\(pricedCount):\(displayUnpricedCount):\(showAllModels):\(total)"
         if modelKey != renderedUsageModelKey {
             renderedUsageModelKey = modelKey
             rebuildMenuModelList(models: models, totalTokens: total)
@@ -875,8 +915,12 @@ final class MenuPanelController: NSViewController {
         } else if failed > 0 {
             footerParts.append(L10n.t("menu_panel.usage.failed_dbs", ["count": failed], fallback: "\(failed) 个会话库异常"))
         }
-        if unpricedCount > 0 {
-            footerParts.append(L10n.t("menu_panel.usage.unpriced_footer", ["count": unpricedCount], fallback: "\(unpricedCount) 款模型待定价"))
+        if displayUnpricedCount > 0 {
+            footerParts.append(L10n.t("menu_panel.usage.unpriced_footer", ["count": displayUnpricedCount], fallback: "\(displayUnpricedCount) 款模型待定价"))
+        }
+        let expiredCount = models.filter { ($0["pricingStatus"] as? String ?? "") == "expired" }.count
+        if expiredCount > 0 {
+            footerParts.append(L10n.t("usage.cost.outdated_models", ["count": expiredCount], fallback: "\(expiredCount) 款模型定价已过期"))
         }
         usageFooterLabel.stringValue = footerParts.joined(separator: " · ")
         usageFooterLabel.textColor = (app.usageFetchErrorsByPeriod[periodKey] != nil || failed > 0 || availability == "cached")
@@ -1151,14 +1195,17 @@ final class MenuPanelController: NSViewController {
         let unknownText = L10n.t("common.unknown", fallback: "未知")
         let unavailableText = L10n.t("common.unavailable", fallback: "不可用")
         let modelQuotaText = L10n.t("quota.model_quota", fallback: "模型配额")
+        let now = Date()
+        let standbyMode = app.standbyRefreshMode(account)
         let contract = QuotaPresentation.contract(account)
 
         let quotaRowsFingerprint = [
             L10n.shared.currentLocale,
             id,
             email,
+            standbyMode ?? "",
             contract.displayGroups.map { g in
-                let ws = g.windows.map { "\($0.localizedLabel):\($0.percentage.map(String.init) ?? "-"):\($0.placeholder(availability: g.availability)):\($0.resetText):\($0.stale)" }.joined(separator: ",")
+                let ws = g.windows.map { "\($0.localizedLabel):\($0.percentage.map(String.init) ?? "-"):\($0.placeholder(availability: g.availability)):\($0.effectiveResetText(at: now, standbyMode: standbyMode, compact: true)):\($0.effectiveStale(at: now))" }.joined(separator: ",")
                 return "\(g.key)|\(g.displayName)|\(g.availability)|\(ws)"
             }.joined(separator: ";")
         ].joined(separator: "#")
@@ -1196,11 +1243,12 @@ final class MenuPanelController: NSViewController {
                     for win in quotaGroup.windows {
                         let row = MenuMeterRow(title: win.localizedLabel)
                         row.accessibilityGroupName = quotaGroup.displayName
+                        let effStale = win.effectiveStale(at: now)
                         row.apply(
                             percentage: win.percentage,
                             placeholder: win.placeholder(availability: quotaGroup.availability),
-                            reset: win.percentage == nil ? "" : win.resetText,
-                            stale: win.stale
+                            reset: win.percentage == nil ? "" : win.effectiveResetText(at: now, standbyMode: standbyMode, compact: true),
+                            stale: effStale
                         )
                         groupViews.append(row)
                         rowsForGroup.append(row)
@@ -1245,24 +1293,52 @@ final class MenuPanelController: NSViewController {
             let namesStr = names.isEmpty ? L10n.t("menu_panel.quota.partial_groups", fallback: "部分分组") : names.joined(separator: sep)
             warnings.append(L10n.t("menu_panel.quota.stale_groups", ["names": namesStr], fallback: "部分分组沿用上次记录：\(namesStr)"))
         }
-        quotaWarningLabel.stringValue = warnings.joined(separator: L10n.shared.isEnglish ? "; " : "；")
-        quotaWarningLabel.isHidden = warnings.isEmpty
+        let contractWarn = QuotaPresentation.warningSummary(contract, excluding: warnings)
+        if !contractWarn.isEmpty {
+            warnings.append(contractWarn)
+        }
+        if !warnings.isEmpty {
+            quotaWarningLabel.stringValue = warnings.joined(separator: L10n.shared.isEnglish ? "; " : "；")
+            quotaWarningLabel.textColor = accessibleWarningColor()
+            quotaWarningLabel.isHidden = false
+        } else if let singleNotice = app.singleAccountRefreshNotices[id]?.trimmingCharacters(in: .whitespacesAndNewlines), !singleNotice.isEmpty {
+            quotaWarningLabel.stringValue = singleNotice
+            quotaWarningLabel.textColor = .secondaryLabelColor
+            quotaWarningLabel.isHidden = false
+        } else {
+            quotaWarningLabel.stringValue = ""
+            quotaWarningLabel.isHidden = true
+        }
 
         let quota = account["quota"] as? [String: Any]
         let stamp = QuotaPresentation.number(quota?["last_updated"]) ?? QuotaPresentation.number(account["quota_last_updated"]) ?? 0
+        let offlinePrefix = !app.reachable ? L10n.t("menu_panel.quota.offline_prefix", fallback: "本机服务离线 · ") : ""
         if app.quotaRefreshing || (!id.isEmpty && app.refreshingAccountIds.contains(id)) {
             quotaFooterLabel.stringValue = L10n.t("menu_panel.quota.refreshing", fallback: "正在刷新配额…")
             quotaFooterLabel.textColor = .secondaryLabelColor
+            quotaFooterLabel.toolTip = nil
+        } else if standbyMode == "snapshot_cooldown_elapsed" {
+            quotaFooterLabel.stringValue = offlinePrefix + L10n.t("accounts.standby.reset_passed", fallback: "已到重置时间 · 切换后更新")
+            quotaFooterLabel.textColor = Design.blue
+            quotaFooterLabel.toolTip = L10n.t("accounts.standby.multi_device_hint")
+        } else if standbyMode == "snapshot_cooling", stamp > 0 {
+            let date = Date(timeIntervalSince1970: stamp)
+            let fmt = Calendar.current.isDateInToday(date) ? Self.timeFormatter : Self.dateTimeFormatter
+            quotaFooterLabel.stringValue = offlinePrefix + L10n.t("accounts.standby.recorded_at", ["time": fmt.string(from: date)], fallback: "记录于 \(fmt.string(from: date)) · 切换后同步")
+            quotaFooterLabel.textColor = .secondaryLabelColor
+            quotaFooterLabel.toolTip = L10n.t("accounts.standby.multi_device_hint")
         } else if stamp > 0 {
             let date = Date(timeIntervalSince1970: stamp)
             let fmt = Calendar.current.isDateInToday(date) ? Self.timeFormatter : Self.dateTimeFormatter
-            let isStale = Date().timeIntervalSince(date) > 15 * 60
+            let isStale = Date().timeIntervalSince(date) > app.quotaStaleThresholdSeconds
             let updatedStr = L10n.t("common.updated_at", ["time": fmt.string(from: date)], fallback: "更新于 \(fmt.string(from: date))")
-            quotaFooterLabel.stringValue = (!app.reachable ? L10n.t("menu_panel.quota.offline_prefix", fallback: "本机服务离线 · ") : "") + updatedStr + (isStale ? L10n.t("menu_panel.quota.stale_suffix", fallback: " · 待刷新") : "")
+            quotaFooterLabel.stringValue = offlinePrefix + updatedStr + (isStale ? L10n.t("menu_panel.quota.stale_suffix", fallback: " · 待刷新") : "")
             quotaFooterLabel.textColor = isStale ? accessibleWarningColor() : .secondaryLabelColor
+            quotaFooterLabel.toolTip = nil
         } else {
             quotaFooterLabel.stringValue = L10n.t("menu_panel.quota.no_record", fallback: "尚未取得配额记录")
             quotaFooterLabel.textColor = .secondaryLabelColor
+            quotaFooterLabel.toolTip = standbyMode == "snapshot_cooling" ? L10n.t("accounts.standby.multi_device_hint") : nil
         }
     }
 
@@ -1274,11 +1350,13 @@ final class MenuPanelController: NSViewController {
         } else {
             expandedAccountIds.insert(id)
         }
-        if Design.shouldAnimate(in: view) && app.menuPopover?.isShown == true {
-            syncAccountsTab()
-            updatePreferredPanelSize()
+        if Design.shouldAnimate(in: view) && app.isMenuPanelShown {
+            performWithoutAnimation(updateSize: false) {
+                syncAccountsTab()
+            }
+            updatePreferredPanelSize(animate: true)
         } else {
-            performWithoutAnimation {
+            performWithoutAnimation(updateSize: true, animateSize: false) {
                 syncAccountsTab()
             }
         }
@@ -1320,7 +1398,7 @@ final class MenuPanelController: NSViewController {
         accountCardsById = accountCardsById.filter { validSet.contains($0.key) }
 
         let liveEmail = app.statusValue.liveAccountEmail.trimmingCharacters(in: .whitespacesAndNewlines)
-        let recommendedId = app.accountsPage?.recommendedAccountId ?? app.cachedRecommendedAccountId
+        let recommendedId = app.cachedRecommendedAccountId
 
         for item in ordered {
             guard let id = item["id"] as? String, !id.isEmpty else { continue }
@@ -1345,7 +1423,8 @@ final class MenuPanelController: NSViewController {
                 switchInFlight: app.accountSwitchInFlight,
                 globalBusy: app.quotaRefreshing,
                 singleBusy: app.refreshingAccountIds.contains(id),
-                singleError: app.singleAccountRefreshErrors[id]
+                singleError: app.singleAccountRefreshErrors[id],
+                singleNotice: app.singleAccountRefreshNotices[id]
             )
         }
 
@@ -1365,7 +1444,7 @@ final class MenuPanelController: NSViewController {
 
     // MARK: - Dynamic Content-Fitted Panel Height (Zero bottom blank gap, smooth micro-interpolation)
 
-    func updatePreferredPanelSize(force: Bool = false) {
+    func updatePreferredPanelSize(force: Bool = false, animate: Bool? = nil) {
         guard isViewLoaded else { return }
         let activeScreen = app.item?.button?.window?.screen ?? viewIfLoaded?.window?.screen ?? NSScreen.main
         let screenMax = (activeScreen?.visibleFrame.height ?? 820) - 48
@@ -1389,10 +1468,11 @@ final class MenuPanelController: NSViewController {
         let measureFingerprint = "\(selectedTab):\(L10n.shared.currentLocale):\(Int(screenMax)):\(debugPortBannerBox.isHidden):\(tabFingerprint)"
         if !force && measureFingerprint == lastMeasuredContentFingerprint {
             let sizeInSync: Bool
-            if let popover = app.menuPopover {
-                sizeInSync = abs(popover.contentSize.height - preferredContentSize.height) <= 0.5 && abs(popover.contentSize.width - preferredContentSize.width) <= 0.5
+            if let panel = app.menuPanel, app.isMenuPanelShown {
+                let referenceSize = app.menuPanelTargetSize ?? panel.frame.size
+                sizeInSync = abs(referenceSize.height - measuredPanelSize.height) <= 0.5 && abs(referenceSize.width - measuredPanelSize.width) <= 0.5
             } else {
-                sizeInSync = abs(view.frame.height - preferredContentSize.height) <= 0.5 && abs(view.frame.width - preferredContentSize.width) <= 0.5
+                sizeInSync = abs(view.frame.height - measuredPanelSize.height) <= 0.5 && abs(view.frame.width - measuredPanelSize.width) <= 0.5
             }
             if sizeInSync {
                 return
@@ -1417,33 +1497,29 @@ final class MenuPanelController: NSViewController {
         let rawTotal = chromeHeight + contentHeight
         let targetHeight = min(max(300, rawTotal), min(686, screenMax))
         let newSize = NSSize(width: Self.panelWidth, height: targetHeight)
-        preferredContentSize = newSize
-        let shouldAnimate = Design.shouldAnimate(in: view) && app.menuPopover?.isShown == true
+        measuredPanelSize = newSize
+        let hostedInFloatingPanel = (app.menuPanel != nil && view.window === app.menuPanel)
+        if hostedInFloatingPanel {
+            if preferredContentSize != .zero {
+                preferredContentSize = .zero
+            }
+        } else {
+            preferredContentSize = newSize
+        }
+        let shouldAnimate = (animate ?? true) && Design.shouldAnimate(in: view) && app.isMenuPanelShown
         var sizeDidChange = false
-        if let popover = app.menuPopover {
-            if abs(popover.contentSize.height - newSize.height) > 0.5 || abs(popover.contentSize.width - newSize.width) > 0.5 {
+        if let panel = app.menuPanel, app.isMenuPanelShown {
+            let currentMatches = abs(panel.frame.height - newSize.height) <= 0.5 && abs(panel.frame.width - newSize.width) <= 0.5
+            let targetMatches = app.menuPanelTargetSize.map {
+                abs($0.height - newSize.height) <= 0.5 && abs($0.width - newSize.width) <= 0.5
+            } ?? currentMatches
+            if !currentMatches || !targetMatches {
                 sizeDidChange = true
-                if shouldAnimate {
-                    NSAnimationContext.runAnimationGroup { ctx in
-                        ctx.duration = 0.18
-                        ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                        popover.contentSize = newSize
-                    }
-                } else {
-                    popover.contentSize = newSize
-                }
+                app.resizeMenuPanel(to: newSize, animate: shouldAnimate)
             }
         } else if abs(view.frame.height - newSize.height) > 0.5 || abs(view.frame.width - newSize.width) > 0.5 {
             sizeDidChange = true
-            if shouldAnimate {
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.18
-                    ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                    view.animator().frame.size = newSize
-                }
-            } else {
-                view.frame.size = newSize
-            }
+            view.frame.size = newSize
         }
         if sizeDidChange || view.needsLayout {
             view.layoutSubtreeIfNeeded()

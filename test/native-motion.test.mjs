@@ -16,7 +16,7 @@ test('原生 DesignMotion CADisplayLink 取消幂等性、弱代理防泄漏与�
   const binary = join(temp, 'native-motion-test');
   // 刻意不传 -D NATIVE_UI_TEST，以验证真实构建中 CADisplayLink 与 Timer 生命周期
   await run('/usr/bin/swiftc', [
-    '-O', '-whole-module-optimization', '-parse-as-library',
+    '-parse-as-library',
     '-target', 'arm64-apple-macosx14.0',
     '-framework', 'Cocoa',
     join(root, 'native/DesignMotion.swift'),

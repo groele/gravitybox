@@ -41,8 +41,6 @@ import { join, dirname, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const args = process.argv.slice(2);
-const option = (name, fallback) => { const i = args.indexOf(name); return i < 0 ? fallback : args[i + 1]; };
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const sha256 = buffer => createHash('sha256').update(buffer).digest('hex');
 
@@ -191,16 +189,20 @@ function stripScopedPrefix(key) {
 
 /** 专有名词违规：英文键里出现专名，但译文把这个专名丢了。 */
 export function properNounViolations(entries) {
+  const matchers = PROPER_NOUNS.map(noun => ({
+    noun,
+    lower: noun.toLowerCase(),
+    // 只检查键里确实是独立词元出现的专名，避免 "Node" 命中 "Nodejs" 之类的噪声
+    regex: new RegExp(`(?:^|[^A-Za-z])${noun.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^A-Za-z])`, 'i'),
+  }));
   const violations = [];
   for (const [key, { value, file }] of entries) {
     const rawKey = stripScopedPrefix(key).replace(/(?:https?|file):\/\/\S+/gi, ' ');
-    // 只检查键里确实是独立词元出现的专名，避免 "Node" 命中 "Nodejs" 之类的噪声
-    for (const noun of PROPER_NOUNS) {
-      const inKey = new RegExp(`(?:^|[^A-Za-z])${noun.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[^A-Za-z])`, 'i').test(rawKey);
-      if (!inKey) continue;
-      const inValue = value.toLowerCase().includes(noun.toLowerCase());
+    const lowerValue = value.toLowerCase();
+    for (const { noun, lower, regex } of matchers) {
+      if (!regex.test(rawKey)) continue;
       // 译文里出现该专名的任何形式都算保留；中文里专名通常原样保留
-      if (!inValue) { violations.push({ key, value, file, noun }); break; }
+      if (!lowerValue.includes(lower)) { violations.push({ key, value, file, noun }); break; }
     }
   }
   return violations;
@@ -288,43 +290,60 @@ export function evaluateGate(summary, gate = DEFAULT_GATE, source = { verified: 
   return { checks, advisory, pass: checks.every(check => check.pass) };
 }
 
-async function main() {
-  let version = option('--version');
-  let uiPath = option('--strings');
+/**
+ * 执行单版本覆盖率对账与门禁评估，写出覆盖率 JSON（及可选 pending 清单），返回结构化结果与拟输出日志。
+ * 支持通过 `preloadedDict` 复用已加载的词典层与专有名词校验结果，供单进程批量门禁使用。
+ */
+export async function runCoverageReport({
+  version,
+  stringsPath,
+  dictDir = join(root, 'dict'),
+  bundlePath,
+  expectSha256,
+  noVendor = false,
+  skipAdvisoryScan = false,
+  out,
+  pendingOut,
+  gate = false,
+  preloadedDict,
+} = {}) {
+  let targetVersion = version;
+  let uiPath = stringsPath;
   if (!uiPath) {
     const dir = join(root, 'ui-strings');
     const available = (await readdir(dir).catch(() => [])).filter(name => name.endsWith('.json')).sort(compareLayers);
     const installedVersion = await detectInstalledAppVersion().catch(() => undefined);
-    if (!version && installedVersion && available.includes(`${installedVersion}.json`)) version = installedVersion;
+    if (!targetVersion && installedVersion && available.includes(`${installedVersion}.json`)) targetVersion = installedVersion;
     if (!available.length) throw new Error(`ui-strings 目录里没有提取结果，请先运行 npm run i18n:extract`);
-    const pick = version ? `${version}.json` : available[available.length - 1];
+    const pick = targetVersion ? `${targetVersion}.json` : available[available.length - 1];
     if (!available.includes(pick)) throw new Error(`ui-strings/${pick} 不存在；现有：${available.join(', ')}`);
     uiPath = join(dir, pick);
-    version = pick.replace(/\.json$/, '');
+    targetVersion = pick.replace(/\.json$/, '');
   }
   const uiStrings = JSON.parse(await readFile(uiPath, 'utf8'));
-  if (version && uiStrings.appVersion !== version) throw new Error(`--version ${version} 与提取结果 appVersion ${uiStrings.appVersion} 不一致`);
-  const { entries, perFile } = await loadDictLayers(option('--dict', join(root, 'dict')));
-
-  const noVendor = args.includes('--no-vendor') || process.env.GRAVITYBOX_NO_VENDOR === '1';
+  if (targetVersion && uiStrings.appVersion !== targetVersion) throw new Error(`--version ${targetVersion} 与提取结果 appVersion ${uiStrings.appVersion} 不一致`);
+  const { entries, perFile } = preloadedDict ?? await loadDictLayers(dictDir);
 
   /* 来源校验先于任何统计：拿不到真实界面包或未开启免 vendor 模式就不产出可信结论。 */
   const sourceVerification = await verifyBundleSource(uiStrings, {
-    bundlePath: option('--bundle'),
-    expectSha256: option('--expect-bundle-sha256'),
+    bundlePath,
+    expectSha256,
     noVendor,
   });
-  if (!sourceVerification.verified) console.error(`[coverage-report] 界面包来源未验证（fail-closed）：${sourceVerification.reason}`);
-  const skipAdvisoryScan = noVendor || args.includes('--skip-advisory-scan');
+  const stderrLines = [];
+  if (!sourceVerification.verified) {
+    stderrLines.push(`[coverage-report] 界面包来源未验证（fail-closed）：${sourceVerification.reason}`);
+  }
+  const effectiveSkipAdvisoryScan = noVendor || skipAdvisoryScan;
   let bundleSource;
-  if (!skipAdvisoryScan) {
-    const bundlePath = option('--bundle') ?? sourceVerification.bundleSource ?? resolveRecordedSource(uiStrings.source);
-    if (typeof bundlePath === 'string' && existsSync(bundlePath)) {
-      try { bundleSource = await readFile(bundlePath, 'utf8'); } catch { bundleSource = undefined; }
+  if (!effectiveSkipAdvisoryScan) {
+    const resolvedBundlePath = bundlePath ?? sourceVerification.bundleSource ?? resolveRecordedSource(uiStrings.source);
+    if (typeof resolvedBundlePath === 'string' && existsSync(resolvedBundlePath)) {
+      try { bundleSource = await readFile(resolvedBundlePath, 'utf8'); } catch { bundleSource = undefined; }
     }
   }
   const { covered, missing, caseOnly, templates, fragments, obsolete, notExtracted } = reconcile(uiStrings, entries, bundleSource);
-  const violations = properNounViolations(entries);
+  const violations = preloadedDict?.violations ? [...preloadedDict.violations] : properNounViolations(entries);
   const positional = covered.length + missing.length + caseOnly.length;
   const summary = {
     appVersion: uiStrings.appVersion,
@@ -363,12 +382,11 @@ async function main() {
     fragments: fragments.slice(0, 200),
   };
 
-  const out = option('--out') ?? join(root, 'reports', `coverage-${uiStrings.appVersion}.json`);
-  await mkdir(dirname(out), { recursive: true });
-  await writeFile(out, JSON.stringify(report, null, 1) + '\n');
+  const reportOut = out ?? join(root, 'reports', `coverage-${uiStrings.appVersion}.json`);
+  await mkdir(dirname(reportOut), { recursive: true });
+  await writeFile(reportOut, JSON.stringify(report, null, 1) + '\n');
 
   // 待译清单：可以直接交给翻译环节
-  const pendingOut = option('--pending-out');
   if (pendingOut) {
     await mkdir(dirname(pendingOut), { recursive: true });
     await writeFile(pendingOut, JSON.stringify({
@@ -383,16 +401,41 @@ async function main() {
     }, null, 1) + '\n');
   }
 
-  console.log(JSON.stringify({ report: out, pending: pendingOut ?? null, summary, gate: report.gate }, null, 1));
-
-  if (args.includes('--gate') && !report.gate.pass) {
+  const stdout = JSON.stringify({ report: reportOut, pending: pendingOut ?? null, summary, gate: report.gate }, null, 1) + '\n';
+  let exitCode = 0;
+  if (gate && !report.gate.pass) {
     /* 门禁失败时把原因写到 stderr，CI 日志里能直接看到是来源问题还是覆盖率问题。 */
-    for (const check of report.gate.checks.filter(check => !check.pass)) console.error(`[coverage-report] 门禁未通过：${check.name}（实际 ${check.actual}）${check.detail ? ' · ' + check.detail : ''}`);
-    process.exitCode = 2;
+    for (const check of report.gate.checks.filter(check => !check.pass)) {
+      stderrLines.push(`[coverage-report] 门禁未通过：${check.name}（实际 ${check.actual}）${check.detail ? ' · ' + check.detail : ''}`);
+    }
+    exitCode = 2;
   }
+  const stderr = stderrLines.length ? stderrLines.join('\n') + '\n' : '';
+  return { out: reportOut, pendingOut: pendingOut ?? null, summary, report, gate: report.gate, pass: report.gate.pass, exitCode, stdout, stderr };
+}
+
+export async function runCoverageReportCli(cliArgs = process.argv.slice(2)) {
+  const option = (name, fallback) => { const i = cliArgs.indexOf(name); return i < 0 ? fallback : cliArgs[i + 1]; };
+  const noVendor = cliArgs.includes('--no-vendor') || process.env.GRAVITYBOX_NO_VENDOR === '1';
+  const result = await runCoverageReport({
+    version: option('--version'),
+    stringsPath: option('--strings'),
+    dictDir: option('--dict', join(root, 'dict')),
+    bundlePath: option('--bundle'),
+    expectSha256: option('--expect-bundle-sha256'),
+    noVendor,
+    skipAdvisoryScan: cliArgs.includes('--skip-advisory-scan'),
+    out: option('--out'),
+    pendingOut: option('--pending-out'),
+    gate: cliArgs.includes('--gate'),
+  });
+  if (result.stderr) process.stderr.write(result.stderr);
+  process.stdout.write(result.stdout);
+  if (result.exitCode !== 0) process.exitCode = result.exitCode;
+  return result;
 }
 
 const invokedDirectly = typeof process.argv[1] === 'string' && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invokedDirectly) {
-  main().catch(error => { console.error(`[coverage-report] ${error.stack ?? error.message}`); process.exitCode = 1; });
+  runCoverageReportCli().catch(error => { console.error(`[coverage-report] ${error.stack ?? error.message}`); process.exitCode = 1; });
 }

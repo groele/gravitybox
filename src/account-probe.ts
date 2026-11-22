@@ -11,10 +11,12 @@ import {
   buildArgonStatus,
   buildCarbonStatus,
   familyWindowsFromGroups,
+  isExcludedFromStandaloneModelPool,
   mergeGroupSets,
   mergeModelCatalogues,
   normalizeLiveGroups,
   normalizeLiveModels,
+  resolveModelsWithGroupDescriptions,
 } from './quota.js';
 import type { LiveLanguageServerStatus, ModelQuota, QuotaData, QuotaGroup } from './accounts.js';
 import { bt } from './i18n.js';
@@ -27,6 +29,127 @@ import {
 } from './platform.js';
 
 const execFileAsync = promisify(execFile);
+
+export type ExecFileLike = (
+  file: string,
+  args: readonly string[],
+  options?: { timeout?: number; maxBuffer?: number }
+) => Promise<{ stdout: string; stderr?: string }>;
+
+export type ProbeLiveLanguageServerOptions = {
+  forceRefresh?: boolean;
+  execFileImpl?: ExecFileLike;
+};
+
+export type LanguageServerCandidate = {
+  pid: number;
+  cmd: string;
+  appPath: string;
+};
+
+const defaultExecFile: ExecFileLike = (file, args, options) =>
+  execFileAsync(file, args, { encoding: 'utf8', ...options });
+
+/** Collect all running language_server candidates matching the supported application target. */
+export function collectLanguageServerCandidates(
+  psOut: string,
+  target: ApplicationTarget = applicationTarget()
+): LanguageServerCandidate[] {
+  const candidates: LanguageServerCandidate[] = [];
+  for (const line of psOut.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const mPid = trimmed.match(/^(\d+)\s+(.+)$/);
+    if (!mPid) continue;
+    const pidText = mPid[1];
+    const cmd = mPid[2];
+    if (!pidText || !cmd) continue;
+    const pid = Number.parseInt(pidText, 10);
+    if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+    const matchedTarget = matchingTargetForLanguageServerCommand(cmd, target);
+    if (!matchedTarget) continue;
+    candidates.push({ pid, cmd, appPath: matchedTarget.appPath });
+  }
+  return candidates;
+}
+
+/** Extract legacy (<= 2.33.0) `--csrf_token` from language_server CLI arguments. */
+export function extractCsrfTokenFromCommand(cmd: string): string | null {
+  const match = cmd.match(/(?:^|\s)--csrf_token(?:=|\s+)([^\s]+)/);
+  return match?.[1] ?? null;
+}
+
+/**
+ * Extract `ANTIGRAVITY_SERVER_CSRF_TOKEN` (>= 2.34.0) from `ps -E -p <pid> -ww -o args=` output.
+ * Strips the leading command-line prefix when present so args or spaces in preceding env vars do not interfere.
+ */
+export function extractCsrfTokenFromPsEnv(psEnvOutput: string, cmd = ''): string | null {
+  const trimmedOut = psEnvOutput.trim();
+  if (!trimmedOut) return null;
+  const trimmedCmd = cmd.trim();
+  let envSection = trimmedOut;
+  if (trimmedCmd && trimmedOut.startsWith(trimmedCmd)) {
+    const rest = trimmedOut.slice(trimmedCmd.length);
+    if (rest.length === 0 || /^\s/.test(rest)) {
+      envSection = rest;
+    }
+  }
+  const match = envSection.match(/(?:^|\s)ANTIGRAVITY_SERVER_CSRF_TOKEN=([^\s]+)/);
+  return match?.[1] ?? null;
+}
+
+/** Parse unique loopback IPv4 listening ports from `lsof -Fn` output. */
+export function parseLoopbackListenPorts(lsofOut: string): number[] {
+  const ports: number[] = [];
+  for (const match of lsofOut.matchAll(/n127\.0\.0\.1:(\d+)/g)) {
+    const portText = match[1];
+    if (!portText) continue;
+    const port = Number.parseInt(portText, 10);
+    if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+      ports.push(port);
+    }
+  }
+  return Array.from(new Set(ports));
+}
+
+async function resolveCandidateCsrfToken(
+  candidate: LanguageServerCandidate,
+  execFileFn: ExecFileLike
+): Promise<string | null> {
+  const cliToken = extractCsrfTokenFromCommand(candidate.cmd);
+  if (cliToken) return cliToken;
+  try {
+    const { stdout: psEnvOut } = await execFileFn(
+      '/bin/ps',
+      ['-E', '-p', String(candidate.pid), '-ww', '-o', 'args='],
+      { timeout: 3000 }
+    );
+    return extractCsrfTokenFromPsEnv(psEnvOut, candidate.cmd);
+  } catch {
+    return null;
+  }
+}
+
+async function resolveCandidatePorts(
+  candidate: LanguageServerCandidate,
+  useVerifiedBundlePorts: boolean,
+  execFileFn: ExecFileLike
+): Promise<number[]> {
+  if (useVerifiedBundlePorts) {
+    const verifiedPorts = await resolveVerifiedLanguageServerPorts(candidate.pid, candidate.appPath);
+    return verifiedPorts ?? [];
+  }
+  try {
+    const { stdout: lsofOut } = await execFileFn(
+      '/usr/sbin/lsof',
+      ['-nP', '-a', '-p', String(candidate.pid), '-iTCP', '-sTCP:LISTEN', '-Fn'],
+      { timeout: 3000 }
+    );
+    return parseLoopbackListenPorts(lsofOut);
+  } catch {
+    return [];
+  }
+}
 
 export type CloudProviderContext = { origin: string; userAgent: string; appVersion: string; clientSubType?: string; identityVersion?: 2 };
 const CLOUD_ORIGINS = new Set(['https://cloudcode-pa.googleapis.com', 'https://daily-cloudcode-pa.googleapis.com', 'https://daily-cloudcode-pa.sandbox.googleapis.com']);
@@ -312,7 +435,7 @@ export function mergeSubscriptionTier(
 export async function probeLiveLanguageServerOnce(
   target: ApplicationTarget,
   fetchImpl: typeof fetch,
-  options: { forceRefresh?: boolean },
+  options: ProbeLiveLanguageServerOptions,
   mappers: {
     modelQuotaFromNormalized: (model: ReturnType<typeof applyFamilyWindows>[number]) => ModelQuota;
     groupToQuotaGroup: (group: ReturnType<typeof mergeGroupSets>[number]) => QuotaGroup;
@@ -405,9 +528,9 @@ export async function probeLiveLanguageServerOnce(
         }
       } catch {}
     } else {
-      const reqBody = JSON.stringify({ forceRefresh: options.forceRefresh === true });
+      const reqBody = JSON.stringify({ forceRefresh: options?.forceRefresh === true });
       // GetUserStatus 已验证端口传输协议，严禁反向协议重试以免超时翻倍；被动探测收紧预算防止拖慢冷启动
-      const summaryTimeoutMs = options.forceRefresh === true ? 4500 : 2200;
+      const summaryTimeoutMs = options?.forceRefresh === true ? 4500 : 2200;
       try {
         const qRes = await localRpcFetch(activeProtocol, port, '/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary', csrfToken, reqBody, summaryTimeoutMs);
         quotaSummaryData = qRes?.response || qRes;
@@ -424,9 +547,14 @@ export async function probeLiveLanguageServerOnce(
       const tier = resolveProbeSubscriptionTier(userStatus, isEnterpriseVertex);
 
       const observedAt = Math.floor(Date.now() / 1000);
-      const clientConfigs = userStatus.cascadeModelConfigData?.clientModelConfigs || [];
-      const models = mergeModelCatalogues([normalizeLiveModels(clientConfigs, observedAt)]);
+      const cascadeData = userStatus.cascadeModelConfigData ?? {};
+      const clientConfigs = cascadeData.clientModelConfigs || cascadeData.client_model_configs || [];
+      const clientModelSorts = cascadeData.clientModelSorts ?? cascadeData.client_model_sorts;
       const groups = mergeGroupSets([normalizeLiveGroups(quotaSummaryData, observedAt)]);
+      const models = resolveModelsWithGroupDescriptions(
+        mergeModelCatalogues([normalizeLiveModels(clientConfigs, observedAt, { clientModelSorts })]),
+        groups,
+      );
       const windows = familyWindowsFromGroups(groups, Date.now());
       const applied = applyFamilyWindows(models, windows);
       const liveArgon = buildArgonStatus(applied, groups, windows, Date.now(), tier);
@@ -436,9 +564,9 @@ export async function probeLiveLanguageServerOnce(
         || (family === 'carbon' && (liveCarbon.mode === 'unified' || liveCarbon.mode === 'disabled'));
       const missingFamilies = (['gemini', 'claude', 'argon', 'carbon'] as const).filter(family =>
         !isIgnoredStandalone(family)
-        && models.some(model => model.family === family && model.disabled !== true)
-        && !groups.some(group => group.family === family && group.buckets.some(bucket => bucket.remaining_fraction_known))
-        && !((family === 'argon' || family === 'carbon') && models.some(m => m.family === family && m.own_percentage_known && !m.own_stale)));
+        && models.some(model => model.family === family && !isExcludedFromStandaloneModelPool(model))
+        && !groups.some(group => group.family === family && group.buckets.some(bucket => bucket.disabled !== true && bucket.remaining_fraction_known))
+        && !((family === 'argon' || family === 'carbon') && models.some(m => m.family === family && !isExcludedFromStandaloneModelPool(m) && m.own_percentage_known && !m.own_stale)));
       const quotaData: QuotaData = {
         models: applied.map(mappers.modelQuotaFromNormalized),
         quota_groups: groups.map(mappers.groupToQuotaGroup),
@@ -456,7 +584,7 @@ export async function probeLiveLanguageServerOnce(
           carriedGroups: 0,
           refreshedAt: observedAt,
         },
-        quota_warnings: models.length === 0 ? [bt('account_probe.warn.no_model_records')] : undefined,
+        quota_warnings: models.length === 0 ? [`NO_MODEL_RECORDS:${bt('account_probe.warn.no_model_records')}`] : undefined,
       };
 
       return {
@@ -489,11 +617,13 @@ export async function probeLiveLanguageServerOnce(
       cachedLiveEndpoint = null;
     }
 
-    let targetPid = 0;
-    let csrfToken = '';
-    let matchedAppPath = target.appPath;
+    const execFileFn = options?.execFileImpl ?? defaultExecFile;
+    const useVerifiedBundlePorts = fetchImpl === globalThis.fetch;
 
-    if (IS_WINDOWS) {
+    if (IS_WINDOWS && !options?.execFileImpl) {
+      let targetPid = 0;
+      let csrfToken = '';
+      let matchedAppPath = target.appPath;
       const procs = await readWindowsProcesses();
       for (const proc of procs) {
         const cmd = proc.commandLine || '';
@@ -509,55 +639,35 @@ export async function probeLiveLanguageServerOnce(
           }
         }
       }
-    } else {
-      const { stdout: psOut } = await execFileAsync('/bin/ps', ['-ax', '-ww', '-o', 'pid=,args='], { timeout: 3000 });
-      const lines = psOut.split('\n');
-
-      for (const line of lines) {
-        if (line.includes('--csrf_token')) {
-          const trimmed = line.trim();
-          const mPid = trimmed.match(/^(\d+)\s+(.+)$/);
-          if (mPid) {
-            const pid = parseInt(mPid[1]!, 10);
-            const cmd = mPid[2]!;
-            const matchedTarget = matchingTargetForLanguageServerCommand(cmd, target);
-            if (matchedTarget) {
-              const mCsrf = cmd.match(/--csrf_token[=\s]+([^\s]+)/);
-              if (mCsrf) {
-                targetPid = pid;
-                csrfToken = mCsrf[1]!;
-                matchedAppPath = matchedTarget.appPath;
-                break;
-              }
-            }
-          }
-        }
+      if (!targetPid || !csrfToken) return null;
+      let ports: number[] = [];
+      if (useVerifiedBundlePorts) {
+        const verifiedPorts = await resolveVerifiedLanguageServerPorts(targetPid, matchedAppPath);
+        if (!verifiedPorts || verifiedPorts.length === 0) return null;
+        ports = verifiedPorts;
+      } else {
+        const allPorts = await readWindowsListeningPorts();
+        ports = Array.from(new Set(allPorts.filter(p => p.pid === targetPid && p.address.startsWith('127.0.0.1:')).map(p => p.port)));
+        if (ports.length === 0) return null;
       }
+      return await tryPortList(targetPid, csrfToken, ports);
     }
 
-    if (!targetPid || !csrfToken) return null;
+    const { stdout: psOut } = await execFileFn('/bin/ps', ['-ax', '-ww', '-o', 'pid=,args='], { timeout: 3000 });
+    const candidates = collectLanguageServerCandidates(psOut, target);
 
-    let ports: number[] = [];
-    if (fetchImpl === globalThis.fetch) {
-      const verifiedPorts = await resolveVerifiedLanguageServerPorts(targetPid, matchedAppPath);
-      if (!verifiedPorts || verifiedPorts.length === 0) return null;
-      ports = verifiedPorts;
-    } else if (IS_WINDOWS) {
-      const allPorts = await readWindowsListeningPorts();
-      ports = Array.from(new Set(allPorts.filter(p => p.pid === targetPid && p.address.startsWith('127.0.0.1:')).map(p => p.port)));
-      if (ports.length === 0) return null;
-    } else {
-      const { stdout: lsofOut } = await execFileAsync(
-        '/usr/sbin/lsof',
-        ['-nP', '-a', '-p', String(targetPid), '-iTCP', '-sTCP:LISTEN', '-Fn'],
-        { timeout: 3000 }
-      );
-      const portMatches = Array.from(lsofOut.matchAll(/n127\.0\.0\.1:(\d+)/g)).map(m => parseInt(m[1]!, 10));
-      ports = Array.from(new Set(portMatches));
-      if (ports.length === 0) return null;
+    for (const candidate of candidates) {
+      const csrfToken = await resolveCandidateCsrfToken(candidate, execFileFn);
+      if (!csrfToken) continue;
+
+      const ports = await resolveCandidatePorts(candidate, useVerifiedBundlePorts, execFileFn);
+      if (ports.length === 0) continue;
+
+      const liveStatus = await tryPortList(candidate.pid, csrfToken, ports);
+      if (liveStatus) return liveStatus;
     }
 
-    return await tryPortList(targetPid, csrfToken, ports);
+    return null;
   } catch {}
   return null;
 }

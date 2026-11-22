@@ -959,6 +959,9 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
         '  <span id="v233-ssh">You\'re signing in on devbox.example. Your sign-in stays on that machine.</span>',
         '  <button id="v233-grants" aria-label="Permissions, 3 grants"></button>',
         '  <div role="alert" id="v233-bad-folders">2 folders in this project could not be loaded because their locations are invalid.</div>',
+        '  <button data-testid="tool-group-collapsible"><span id="v233-thinking-label">Thinking</span><span id="v233-elapsed-sec" data-testid="tool-group-elapsed">42s</span><span id="v233-elapsed-min" data-testid="tool-group-elapsed">1m 12s</span><span id="v233-elapsed-hr" data-testid="tool-group-elapsed">1h 2m 3s</span></button>',
+        '  <div data-testid="running-row"><span id="v233-running-min">5m</span></div>',
+        '  <span id="v233-ago-sec">42s ago</span>',
         '</div>'
       ].join('');
       await cdp.evaluate('document.body.innerHTML=' + JSON.stringify(html));
@@ -980,8 +983,16 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
       assert.equal(await text(cdp, '#v233-ssh'), '您正在 devbox.example 上登录。您的登录状态仅保留在该设备上。');
       assert.equal(await cdp.evaluate('document.querySelector("#v233-grants").getAttribute("aria-label")'), '权限，3 项授权');
       assert.equal(await text(cdp, '#v233-bad-folders'), '此项目中有 2 个文件夹因其位置无效而无法加载。');
+      assert.equal(await text(cdp, '#v233-thinking-label'), '正在思考...');
+      assert.equal(await text(cdp, '#v233-elapsed-sec'), '42秒');
+      assert.equal(await text(cdp, '#v233-elapsed-min'), '1分12秒');
+      assert.equal(await text(cdp, '#v233-elapsed-hr'), '1小时2分3秒');
+      assert.equal(await text(cdp, '#v233-running-min'), '5分');
+      assert.equal(await text(cdp, '#v233-ago-sec'), '42秒前');
       await cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.dispose()');
       assert.equal(await text(cdp, '#v233-step'), 'Step 2 of 4');
+      assert.equal(await text(cdp, '#v233-elapsed-sec'), '42s');
+      assert.equal(await text(cdp, '#v233-elapsed-min'), '1m 12s');
       assert.equal(await cdp.evaluate('document.querySelector("#v233-plan").getAttribute("aria-label")'), 'Plan, 2 of 5 steps done');
     } finally { cdp?.close(); if (target?.targetId) await browserCommand('Target.closeTarget', { targetId: target.targetId }).catch(error => { chromeErrors += '\nTarget cleanup: ' + error.message; }); }
   });
@@ -990,8 +1001,8 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     try {
       ({target,cdp}=await openIsolatedPage('/'));
       const rows=Array.from({length:320},(_,i)=>`<div data-testid="conversation-row-sidebar"><span class="truncate">Private conversation ${i}</span><span>1d</span></div>`).join('');
-      const html='<div role="dialog" aria-label="Settings" id="flash-root"><button aria-label="Close">Close</button><aside><h1 id="flash-heading">Settings</h1><button id="flash-general">General</button><button id="flash-app">Application</button><button>Appearance</button><h2>Project list</h2><button id="flash-project">Application</button>'+rows+'</aside><main><h2>General</h2><span id="flash-label">Permission Preset</span><div id="flash-description">Configure agent execution, queued message delivery, and permissions.</div><p id="flash-inline">Type <code>/</code> and select <code>plan</code> to have the agent generate a plan.</p><input id="flash-input" value="Permission Preset"><div data-gravitybox-user-content id="flash-private">Permission Preset</div></main></div>';
-      const entries={Settings:'设置',Close:'关闭',General:'通用',Application:'应用设置','App Settings':'应用设置',Appearance:'外观','Permission Preset':'权限预设','Configure agent execution, queued message delivery, and permissions.':'配置智能体执行、排队消息发送及权限。','Type {0} and select {1} to have the agent generate a plan.':'输入 {0} 并选择 {1}，让智能体生成规划。'};
+      const html='<div role="dialog" aria-label="Settings" id="flash-root"><button aria-label="Close">Close</button><aside><h1 id="flash-heading">Settings</h1><button id="flash-general">General</button><button id="flash-app">Application</button><button>Appearance</button><h2>Project list</h2><button id="flash-project">Application</button>'+rows+'</aside><main><h2>General</h2><span id="flash-label">Permission Preset</span><div id="flash-description">Configure agent execution, queued message delivery, and permissions.</div><p id="flash-inline">Type <code>/</code> and select <code>plan</code> to have the agent generate a plan.</p><div data-testid="shortcut-row-artifactStartComment"><span id="flash-shortcut-artifact">Comment on Selection</span></div><div data-testid="artifact-viewer"><span id="flash-real-artifact">Comment on Selection</span></div><input id="flash-input" value="Permission Preset"><div data-gravitybox-user-content id="flash-private">Permission Preset</div></main></div>';
+      const entries={Settings:'设置',Close:'关闭',General:'通用',Application:'应用设置','App Settings':'应用设置',Appearance:'外观','Permission Preset':'权限预设','Comment on Selection':'对选中内容添加评论','Configure agent execution, queued message delivery, and permissions.':'配置智能体执行、排队消息发送及权限。','Type {0} and select {1} to have the agent generate a plan.':'输入 {0} 并选择 {1}，让智能体生成规划。'};
       await cdp.evaluate(`document.body.innerHTML='<nav aria-label="Sidebar"><a href="/history">History</a></nav><div id="flash-mount"></div>';globalThis.__FLASH_HTML__=${JSON.stringify(html)};globalThis.__FLASH_DICT__=${JSON.stringify({schema:1,version:'settings-frames-1',entries})}`);
       const engine=await readFile(join(root,'dist/engine.js'),'utf8');
       await cdp.evaluate(`globalThis.__GRAVITYBOX_BOOT__={origin:${JSON.stringify(origin)},path:'/',dictionary:globalThis.__FLASH_DICT__,conservative:true};\n${engine}`);
@@ -1013,6 +1024,8 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
       assert.equal(await text(cdp,'#flash-private'),'Permission Preset');
       assert.equal(await text(cdp,'.truncate'),'Private conversation 0');
       assert.equal(await text(cdp,'#flash-project'),'Application','A project name matching the new navigation alias remains protected');
+      assert.equal(await text(cdp,'#flash-shortcut-artifact'),'对选中内容添加评论','Shortcut row with artifactStartComment commandId must not be blocked by artifact selector');
+      assert.equal(await text(cdp,'#flash-real-artifact'),'Comment on Selection','Real artifact viewer container must remain protected');
       assert.equal(await text(cdp,'code'),'/');
       await cdp.evaluate('globalThis.__flashObserver.disconnect();document.querySelector("#flash-mount").replaceChildren();globalThis.__GRAVITYBOX_ENGINE_V1__.refresh()');
       const reopened=await cdp.evaluate(`(async()=>{history.pushState({},'','/?settingsOpen=true&settingsScreen=General');document.querySelector('#flash-mount').innerHTML=globalThis.__FLASH_HTML__;return await globalThis.__flashFrames();})()`);
@@ -1024,6 +1037,65 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
       await cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.dispose()');
       assert.equal(await text(cdp,'#flash-inline'),'Type / and select plan to have the agent generate a plan.');
     } finally { cdp?.close();if(target?.targetId)await browserCommand('Target.closeTarget',{targetId:target.targetId}).catch(error => { chromeErrors += '\nTarget cleanup: ' + error.message; }); }
+  });
+  await check('设置面板 Orchestrator/Executor Model 行不被 data-testid*="model" 误拦截，下拉选择器仍受保护', async () => {
+    let target, cdp;
+    try {
+      ({ target, cdp } = await openIsolatedPage('/?settingsOpen=true&settingsScreen=Models'));
+      const html = `
+        <nav aria-label="Sidebar"><a href="/history">History</a></nav>
+        <div role="dialog" aria-label="Settings">
+          <aside>
+            <h1>Settings</h1>
+            <button>General</button>
+            <button>Application</button>
+            <button>Models</button>
+          </aside>
+          <main>
+            <h2>Models</h2>
+            <h3 id="orch-sec">Orchestrator Settings</h3>
+            <div data-testid="orchestrator-model-row">
+              <span id="orch-label">Orchestrator Model</span>
+              <span id="orch-desc">Plans the work, makes design decisions, and reviews the result. Pick a top-tier model. You can also pick one per conversation from the Orchestrator row in the model menu.</span>
+              <button id="orch-trigger" data-testid="model-selector-trigger">Settings</button>
+            </div>
+            <div data-testid="executor-model-row">
+              <span id="exec-label">Executor Model</span>
+              <span id="exec-desc">Carries out the plan: searches, edits, builds, and tests. Pick a faster, cheaper model.</span>
+              <button id="exec-trigger" aria-haspopup="menu">Settings</button>
+            </div>
+          </main>
+        </div>
+        <div data-testid="orchestrator-model-row"><span id="outside-model-row-text">Orchestrator Model</span></div>
+        <div role="menu">
+          <div role="menuitem"><span>Gemini 4 Carbon</span> <span id="effort-row-suffix">Medium</span></div>
+          <div role="menuitem"><span id="effort-low">Low</span></div>
+          <div role="menuitem"><span id="effort-medium">Medium</span></div>
+          <div role="menuitem"><span id="effort-high">High</span></div>
+          <div role="menuitem"><span id="effort-xhigh">Extra High</span></div>
+        </div>
+      `;
+      const baseDict = JSON.parse(await readFile(join(root, 'dict/base.json'), 'utf8'));
+      await cdp.evaluate(`document.body.innerHTML=${JSON.stringify(html)}`);
+      const engine = await readFile(join(root, 'dist/engine.js'), 'utf8');
+      await cdp.evaluate(`globalThis.__GRAVITYBOX_BOOT__=${JSON.stringify({ origin, path: '/', dictionary: { schema: 1, version: 'orch-model-row-1', entries: baseDict }, conservative: true })};\n${engine}`);
+      await until(async () => await text(cdp, '#orch-label') === 'Orchestrator 模型');
+      assert.equal(await text(cdp, '#orch-sec'), 'Orchestrator 设置');
+      assert.equal(await text(cdp, '#orch-desc'), baseDict['Plans the work, makes design decisions, and reviews the result. Pick a top-tier model. You can also pick one per conversation from the Orchestrator row in the model menu.']);
+      assert.equal(await text(cdp, '#exec-label'), 'Executor 模型');
+      assert.equal(await text(cdp, '#exec-desc'), '负责执行计划：搜索、编辑、构建与测试。建议选择速度更快、成本更低的模型。');
+      assert.equal(await text(cdp, '#orch-trigger'), 'Settings');
+      assert.equal(await text(cdp, '#exec-trigger'), 'Settings');
+      assert.equal(await text(cdp, '#outside-model-row-text'), 'Orchestrator Model');
+      assert.equal(await text(cdp, '#effort-row-suffix'), 'Medium');
+      assert.equal(await text(cdp, '#effort-low'), 'Low');
+      assert.equal(await text(cdp, '#effort-medium'), 'Medium');
+      assert.equal(await text(cdp, '#effort-high'), 'High');
+      assert.equal(await text(cdp, '#effort-xhigh'), 'Extra High');
+    } finally {
+      cdp?.close();
+      if (target?.targetId) await browserCommand('Target.closeTarget', { targetId: target.targetId }).catch(error => { chromeErrors += '\nTarget cleanup: ' + error.message; });
+    }
   });
   await check('HUD 独立挂载不覆盖输入区、窄屏单行、向上弹出及输入框零焦点争夺', async () => {
     await main.send('Page.bringToFront');
@@ -1529,6 +1601,9 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
         fullTag: sr.querySelector('#hud-ctx-model-full').textContent.trim(),
         ctxPct: sr.querySelector('#hud-txt-context').textContent.trim(),
         popPrefix: sr.querySelector('#pop-ctx-prefix').textContent,
+        popRole: sr.querySelector('#pop-ctx-role')?.textContent,
+        popRoleVisible: !sr.querySelector('#pop-ctx-role')?.hasAttribute('hidden'),
+        stagesTitle: sr.querySelector('#lbl-ctx-stages')?.textContent,
         stageCount: stageItems.length,
         stageTexts: stageItems.map(el => el.textContent.replace(/\\s+/g, ' ').trim()),
       };
@@ -1542,12 +1617,14 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     assert.equal(dualBrowserCheck.fullTag, 'Hydrogen');
     assert.equal(dualBrowserCheck.ctxPct, '91%');
     assert.equal(dualBrowserCheck.popPrefix, '当前上下文 · Hydrogen ');
-    assert.equal(dualBrowserCheck.stageCount, 2);
-    assert.match(dualBrowserCheck.stageTexts[0], /规划 · Carbon.*90\.2% · 462K \/ 512K/);
-    assert.match(dualBrowserCheck.stageTexts[1], /执行 · Hydrogen.*当前.*91\.4% · 468K \/ 512K/);
+    assert.equal(dualBrowserCheck.popRoleVisible, true);
+    assert.equal(dualBrowserCheck.popRole, '执行');
+    assert.equal(dualBrowserCheck.stagesTitle, '曾用模型上下文');
+    assert.equal(dualBrowserCheck.stageCount, 1, 'Option A 底部列表仅保留非活跃模型');
+    assert.match(dualBrowserCheck.stageTexts[0], /Carbon\s*规划.*90\.2% · 462K \/ 512K/);
 
-    // 6b. 312px 上下文卡片真实布局校验：验证通用执行阶段、本对话曾用模型分组、简化模型名与长模型名下 .hud-stage-badge 零裁切/零重叠
-    const checkLongStageLayout = async (modelDisplayName) => {
+    // 6b. 344px 上下文卡片真实布局校验：验证顶部单行防折行（标题与容量徽章同一行）、微胶囊角色标、统一“曾用模型上下文”单列表与长模型名下压缩徽章防裁切
+    const checkLongStageLayout = async ({ activeDisplayName, activeShortLabel, activeCompactLabel = 'H', activeRole = 'executor', nonActiveDisplayName }) => {
       await main.evaluate(`(() => {
         const mgr = globalThis.__GRAVITYBOX_HUD_V1__?.manager;
         const inst = mgr ? [...mgr.instances.values()][0] : null;
@@ -1563,25 +1640,25 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
           tokens: { totalTokens: 1200000, totalTokensCompact: '1.2M tok', cacheHitRate: 0.9, cacheHitRateFormatted: '90%' },
           context: {
             hasUsageData: true,
-            modelId: 'gemini-4-hydrogen',
-            modelDisplayName: ${JSON.stringify(modelDisplayName)},
-            modelShortLabel: 'Hydrogen',
-            modelCompactLabel: 'H',
+            modelId: 'gemini-4-carbon',
+            modelDisplayName: ${JSON.stringify(activeDisplayName)},
+            modelShortLabel: ${JSON.stringify(activeShortLabel)},
+            modelCompactLabel: ${JSON.stringify(activeCompactLabel)},
             isMultiModel: true,
             isOrchestrator: true,
-            usedTokens: 468000,
-            usedTokensCompact: '468K',
-            peakContextTokens: 468000,
+            usedTokens: 256000,
+            usedTokensCompact: '256K',
+            peakContextTokens: 256000,
             capacityTokens: 512000,
             capacityTokensCompact: '512K',
             isFallbackCapacity: false,
-            usedRatio: 468000 / 512000,
-            usedRatioFormatted: '91.4%',
-            breakdown: { cachedContextTokens: 465000, cachedContextRatio: 90.8, uncachedContextTokens: 3000, uncachedContextRatio: 0.6, latestOutputTokens: 3730 },
+            usedRatio: 0.5,
+            usedRatioFormatted: '50%',
+            breakdown: { cachedContextTokens: 250000, cachedContextRatio: 48.8, uncachedContextTokens: 6000, uncachedContextRatio: 1.2, latestOutputTokens: 1200 },
             modelStages: [
-              { slotKey: 'orchestrator:carbon', role: 'planner', section: 'primary', modelId: 'gemini-4-carbon', modelDisplayName: 'Orchestrator (Carbon)', shortLabel: 'Carbon', compactLabel: 'C', hasUsageData: true, isActive: false, usedTokens: 256000, peakContextTokens: 256000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 0.5, usedRatioFormatted: '50%' },
+              { slotKey: 'orchestrator:carbon', role: ${JSON.stringify(activeRole)}, section: 'primary', modelId: 'gemini-4-carbon', modelDisplayName: ${JSON.stringify(activeDisplayName)}, shortLabel: ${JSON.stringify(activeShortLabel)}, compactLabel: ${JSON.stringify(activeCompactLabel)}, hasUsageData: true, isActive: true, usedTokens: 256000, peakContextTokens: 256000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 0.5, usedRatioFormatted: '50%' },
               { slotKey: 'orchestrator:executor_pending', role: 'executor', section: 'primary', modelId: 'pending', modelDisplayName: '', shortLabel: '', compactLabel: '', hasUsageData: false, isActive: false, usedTokens: 0, peakContextTokens: 0, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 0, usedRatioFormatted: '0%' },
-              { slotKey: 'model:gemini-4-hydrogen', role: 'model', section: 'history', modelId: 'gemini-4-hydrogen', modelDisplayName: ${JSON.stringify(modelDisplayName)}, shortLabel: 'Hydrogen', compactLabel: 'H', hasUsageData: true, isActive: true, compactionCount: 2, usedTokens: 468000, peakContextTokens: 468000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 468000 / 512000, usedRatioFormatted: '91.4%' }
+              { slotKey: 'model:gemini-4-hydrogen', role: 'executor', section: 'primary', modelId: 'gemini-4-hydrogen', modelDisplayName: ${JSON.stringify(nonActiveDisplayName)}, shortLabel: ${JSON.stringify(nonActiveDisplayName)}, compactLabel: 'H', hasUsageData: true, isActive: false, compactionCount: 2, usedTokens: 468000, peakContextTokens: 468000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 468000 / 512000, usedRatioFormatted: '91.4%' }
             ]
           }
         });
@@ -1594,35 +1671,59 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
       await until(async () => await main.evaluate(`(() => {
         const sr = document.querySelector('#__gravitybox_hud_host__')?.shadowRoot;
         const pop = sr?.querySelector('#hud-popover-context');
-        const activeLabel = sr?.querySelector('#hud-ctx-stages-list .hud-stage-item.is-active .hud-stage-label');
-        if (!pop || pop.hasAttribute('hidden') || !activeLabel) return false;
-        return Math.round(pop.getBoundingClientRect().width) === 312;
+        const stageLabel = sr?.querySelector('#hud-ctx-stages-list .hud-stage-item:not(.is-pending) .hud-stage-label');
+        if (!pop || pop.hasAttribute('hidden') || !stageLabel) return false;
+        return Math.round(pop.getBoundingClientRect().width) === 344;
       })()`));
       return await main.evaluate(`(() => {
         const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
         const popCtx = sr.querySelector('#hud-popover-context');
-        const activeItem = sr.querySelector('#hud-ctx-stages-list .hud-stage-item.is-active');
-        const nameEl = activeItem?.querySelector('.hud-stage-name');
-        const labelEl = activeItem?.querySelector('.hud-stage-label');
-        const badgeEl = activeItem?.querySelector('.hud-stage-badge');
-        const compEl = activeItem?.querySelector('.hud-stage-compaction');
-        const valEl = activeItem?.querySelector('.hud-stage-val');
+        const popInner = popCtx.querySelector('.hud-popover-inner');
+        const titleEl = popCtx.querySelector('.hud-popover-title');
+        const prefixEl = sr.querySelector('#pop-ctx-prefix');
+        const roleEl = sr.querySelector('#pop-ctx-role');
+        const pctEl = sr.querySelector('#pop-ctx-pct');
+        const capEl = sr.querySelector('#pop-ctx-capacity');
+        const targetItem = sr.querySelector('#hud-ctx-stages-list .hud-stage-item:not(.is-pending)');
+        const nameEl = targetItem?.querySelector('.hud-stage-name');
+        const labelEl = targetItem?.querySelector('.hud-stage-label');
+        const itemRoleEl = targetItem?.querySelector('.hud-role-badge');
+        const compEl = targetItem?.querySelector('.hud-stage-compaction');
+        const valEl = targetItem?.querySelector('.hud-stage-val');
         const historyTitle = sr.querySelector('#hud-ctx-stages-list .hud-ctx-history-title');
         const pendingItem = sr.querySelector('#hud-ctx-stages-list .hud-stage-item.is-pending');
         const popRect = popCtx.getBoundingClientRect();
+        const innerRect = popInner.getBoundingClientRect();
+        const titleRect = titleEl.getBoundingClientRect();
+        const prefixRect = prefixEl.getBoundingClientRect();
+        const roleRect = roleEl && !roleEl.hasAttribute('hidden') ? roleEl.getBoundingClientRect() : null;
+        const pctRect = pctEl.getBoundingClientRect();
+        const capRect = capEl.getBoundingClientRect();
         const nameRect = nameEl.getBoundingClientRect();
-        const badgeRect = badgeEl.getBoundingClientRect();
         const compRect = compEl ? compEl.getBoundingClientRect() : null;
         const valRect = valEl.getBoundingClientRect();
+        const overlaps = (a, b) => !(a.right <= b.left + 0.5 || b.right <= a.left + 0.5 || a.bottom <= b.top + 0.5 || b.bottom <= a.top + 0.5);
         return {
           popWidth: Math.round(popRect.width),
+          innerOverflowX: popInner.scrollWidth > popInner.clientWidth,
+          popPrefix: prefixEl.textContent,
+          popRoleText: roleEl?.textContent ?? '',
+          popRoleVisible: Boolean(roleEl && !roleEl.hasAttribute('hidden')),
+          headerSingleLine: Math.abs(titleRect.top - capRect.top) < 8 && Math.abs(prefixRect.top - capRect.top) < 8,
+          headerZeroOverlap: !overlaps(prefixRect, pctRect) && !overlaps(prefixRect, capRect) && !overlaps(pctRect, capRect) && (!roleRect || (!overlaps(prefixRect, roleRect) && !overlaps(roleRect, pctRect) && !overlaps(roleRect, capRect))),
+          headerInsideBounds:
+            prefixRect.left >= innerRect.left - 0.5 &&
+            prefixRect.right <= innerRect.right + 0.5 &&
+            (!roleRect || roleRect.right <= innerRect.right + 0.5) &&
+            pctRect.right <= innerRect.right + 0.5 &&
+            capRect.right <= innerRect.right + 0.5,
           stagesTitle: sr.querySelector('#lbl-ctx-stages')?.textContent,
-          historyTitle: historyTitle?.textContent,
+          historyTitle: historyTitle ? historyTitle.textContent : null,
+          activeInListCount: sr.querySelectorAll('#hud-ctx-stages-list .hud-stage-item.is-active').length,
+          stageCount: sr.querySelectorAll('#hud-ctx-stages-list .hud-stage-item').length,
           pendingText: pendingItem?.textContent.replace(/\\s+/g, ' ').trim(),
           labelText: labelEl?.textContent,
-          badgeText: badgeEl?.textContent,
-          badgeWidth: badgeRect.width,
-          badgeRight: badgeRect.right,
+          itemRoleText: itemRoleEl?.textContent ?? '',
           compText: compEl?.textContent,
           compWidth: compRect?.width ?? 0,
           compRight: compRect?.right ?? 0,
@@ -1632,26 +1733,50 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
       })()`);
     };
 
-    const layoutStd = await checkLongStageLayout('Gemini 4 Hydrogen (High)');
-    assert.equal(layoutStd.popWidth, 312);
-    assert.equal(layoutStd.stagesTitle, 'Orchestrator 上下文');
-    assert.equal(layoutStd.historyTitle, '本对话曾用模型');
+    const layoutStd = await checkLongStageLayout({
+      activeDisplayName: 'Orchestrator (Carbon)',
+      activeShortLabel: 'Carbon',
+      activeCompactLabel: 'C',
+      activeRole: 'planner',
+      nonActiveDisplayName: 'Hydrogen (High)',
+    });
+    assert.equal(layoutStd.popWidth, 344);
+    assert.equal(layoutStd.innerOverflowX, false, '344px 上下文弹窗不得产生横向滚动条或溢出');
+    assert.equal(layoutStd.popPrefix, '当前上下文 · Carbon ');
+    assert.equal(layoutStd.popRoleVisible, true);
+    assert.equal(layoutStd.popRoleText, '规划');
+    assert.equal(layoutStd.headerSingleLine, true, '344px 弹窗顶部标题与容量徽章必须单行对齐不折行');
+    assert.equal(layoutStd.headerZeroOverlap, true, '344px 弹窗顶部前缀、角色徽章、百分比与容量徽章不得重叠');
+    assert.equal(layoutStd.headerInsideBounds, true, '344px 弹窗顶部元素不得超出内边距边界');
+    assert.equal(layoutStd.stagesTitle, '曾用模型上下文');
+    assert.equal(layoutStd.historyTitle, null, '统一单列表不应渲染二次 history 标题');
+    assert.equal(layoutStd.activeInListCount, 0, 'Option A 底部列表不得包含当前活跃模型');
+    assert.equal(layoutStd.stageCount, 2);
     assert.match(layoutStd.pendingText, /执行阶段.*待介入/);
     assert.equal(layoutStd.labelText, 'Hydrogen (High)');
-    assert.equal(layoutStd.badgeText, '当前');
+    assert.equal(layoutStd.itemRoleText, '执行');
     assert.equal(layoutStd.compText, '2');
-    assert.ok(layoutStd.badgeWidth > 0, '当前徽章宽度必须大于 0');
     assert.ok(layoutStd.compWidth > 0 && layoutStd.compWidth <= 20, '阶段压缩数字圆圈徽章必须保持紧凑单圆/小胶囊宽度');
-    assert.ok(layoutStd.badgeRight <= layoutStd.nameRight + 0.5, `当前徽章不得超出 .hud-stage-name 右边界 (${layoutStd.badgeRight} <= ${layoutStd.nameRight})`);
     assert.ok(layoutStd.compRight <= layoutStd.nameRight + 0.5, `压缩徽章不得超出 .hud-stage-name 右边界 (${layoutStd.compRight} <= ${layoutStd.nameRight})`);
     assert.ok(layoutStd.compRight <= layoutStd.valLeft, `压缩徽章不得与右侧数值重叠 (${layoutStd.compRight} <= ${layoutStd.valLeft})`);
 
-    const layoutLong = await checkLongStageLayout('Gemini 4 Very Long Hydrogen Preview (High Thinking)');
-    assert.equal(layoutLong.popWidth, 312);
+    const layoutLong = await checkLongStageLayout({
+      activeDisplayName: 'Gemini 4 Very Long Hydrogen Preview (High Thinking)',
+      activeShortLabel: 'Very Long Hydrogen Preview',
+      activeRole: 'executor',
+      nonActiveDisplayName: 'Very Long Hydrogen Preview (High Thinking)',
+    });
+    assert.equal(layoutLong.popWidth, 344);
+    assert.equal(layoutLong.innerOverflowX, false, '长模型名下 344px 上下文弹窗不得横向溢出');
+    assert.equal(layoutLong.popPrefix, '当前上下文 · Very Long Hydrogen Preview ');
+    assert.equal(layoutLong.popRoleVisible, true);
+    assert.equal(layoutLong.popRoleText, '执行');
+    assert.equal(layoutLong.headerSingleLine, true, '长模型名下 344px 弹窗顶部仍应单行省略不折行');
+    assert.equal(layoutLong.headerZeroOverlap, true, '长模型名下顶部前缀、角色徽章、百分比与容量徽章不得重叠');
+    assert.equal(layoutLong.headerInsideBounds, true, '长模型名下顶部元素不得超出内边距边界');
     assert.equal(layoutLong.labelText, 'Very Long Hydrogen Preview (High Thinking)');
-    assert.equal(layoutLong.badgeText, '当前');
+    assert.equal(layoutLong.itemRoleText, '执行');
     assert.equal(layoutLong.compText, '2');
-    assert.ok(layoutLong.badgeWidth > 0, '长模型名下当前徽章宽度必须大于 0');
     assert.ok(layoutLong.compRight <= layoutLong.nameRight + 0.5, `长模型名下压缩徽章不得被裁切 (${layoutLong.compRight} <= ${layoutLong.nameRight})`);
     assert.ok(layoutLong.compRight <= layoutLong.valLeft, `长模型名下压缩徽章不得与右侧数值重叠 (${layoutLong.compRight} <= ${layoutLong.valLeft})`);
 

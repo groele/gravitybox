@@ -381,7 +381,13 @@ final class PreferencesController: NSObject {
         let previous = app.configuration.value.quotaRefreshMinutes
         let idx = max(0, min(Self.refreshIntervals.count - 1, refresh.indexOfSelectedItem))
         app.configuration.value.quotaRefreshMinutes = Self.refreshIntervals[idx]
-        do { try app.configuration.save(); app.configureQuotaRefreshTimer() }
+        do {
+            try app.configuration.save()
+            app.configureQuotaRefreshTimer()
+            app.fetchAccountList(notifyPage: true)
+            app.overview?.fetch()
+            app.updateViews()
+        }
         catch {
             app.configuration.value.quotaRefreshMinutes = previous
             refresh.selectItem(at: Self.refreshIntervals.firstIndex(of: previous) ?? 0)

@@ -17,7 +17,7 @@ struct LiveStatus {
     var message = L10n.t("assistant.starting_service", fallback: "正在连接本机服务…")
     var dictionaryVersion = ""
     var dictionaryError = ""
-    var baseVersion = "2.23.0"
+    var baseVersion = ""
     var rss: Double = 0
     var updatedAt = ""
     var pending = 0
@@ -25,6 +25,7 @@ struct LiveStatus {
     var activeFiveHourQuota: Int? = nil
     var activeSubscriptionTier = "FREE"
     var accountsRevision = ""
+    var pricingRevision = ""
     var liveAccountEmail = ""
     var oauthClientConfigured = false
 
@@ -44,7 +45,7 @@ struct LiveStatus {
         message = raw["message"] as? String ?? L10n.t("assistant.starting_service", fallback: "正在连接本机服务…")
         dictionaryVersion = raw["dictionaryVersion"] as? String ?? ""
         dictionaryError = raw["dictionaryError"] as? String ?? ""
-        baseVersion = raw["dictionaryBaseVersion"] as? String ?? "2.23.0"
+        baseVersion = raw["dictionaryBaseVersion"] as? String ?? ""
         rss = (raw["rssMB"] as? NSNumber)?.doubleValue ?? 0
         updatedAt = raw["updatedAt"] as? String ?? ""
         pending = raw["newStringsCount"] as? Int ?? 0
@@ -52,6 +53,7 @@ struct LiveStatus {
         activeFiveHourQuota = raw["activeFiveHourQuota"] as? Int
         activeSubscriptionTier = raw["activeSubscriptionTier"] as? String ?? "FREE"
         accountsRevision = (raw["accountsRevision"] as? String) ?? "\(raw["accountsRevision"] ?? "")"
+        pricingRevision = raw["pricingRevision"] as? String ?? ""
         liveAccountEmail = raw["liveAccountEmail"] as? String ?? ""
         oauthClientConfigured = raw["oauthClientConfigured"] as? Bool ?? false
         if let errors = raw["errors"] as? [String], !errors.isEmpty {

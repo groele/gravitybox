@@ -150,6 +150,8 @@ test('P1-14: matchPricingKeys 识别 xhigh / extra-high 等思考后缀与远端
   const { buildPricingFeed } = await import('../tools/sync-pricing-feed.mjs');
   assert.equal(matchPricingKeys('claude-opus-5-5-xhigh'), 'claude-opus-5-5');
   assert.equal(matchPricingKeys('gemini-3.8-flash-extra-high'), 'gemini-3.8-flash');
+  assert.equal(matchPricingKeys('gemini-4-hydrogen-extra'), 'gemini-4-hydrogen');
+  assert.equal(matchPricingKeys('gemini-4-hydrogen-tiered-extra'), 'gemini-4-hydrogen');
   assert.equal(matchPricingKeys('gemini-4-neon-high', ['gemini-4-neon']), 'gemini-4-neon');
   assert.equal(matchPricingKeys('gemini-5-xenon-high', ['gemini-5-xenon']), 'gemini-5-xenon');
   assert.equal(matchPricingKeys('claude-sonnet-6-0-thinking-20270301', ['claude-sonnet-6-0']), 'claude-sonnet-6-0');

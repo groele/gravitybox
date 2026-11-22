@@ -278,7 +278,7 @@ final class BackendBridge {
         let readOnlyCommands: Set<String> = [
             "status", "task_list", "task_cancel", "usage_cancel", "ping", "stop",
             "dashboard_summary", "account_list", "account_get", "account_switch_preflight",
-            "account_oauth_status", "account_oauth_cancel", "maintenance_preflight",
+            "maintenance_preflight",
             "maintenance_scan", "maintenance_history", "usage_summary", "usage_events",
             "usage_snapshot_release", "usage_ledger_review", "auto_switch_get",
             "account_recovery_info", "api_pricing_get", "pricing_sync_status",

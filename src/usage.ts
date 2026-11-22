@@ -11,6 +11,7 @@ import { createModelQueryMatcher, formatLocalDate, isUnpricedZeroSentinel, type 
 import { UsageLedger, type LedgerEvent } from './usage-ledger.js';
 import {
   DEFAULT_PRICING_FEED_URLS,
+  PRICING_METADATA,
   calculateEstimatedUsd,
   canonicalActivePricingKeys,
   resolveContextTierPricing,
@@ -70,6 +71,7 @@ export class UsageStatsManager {
   private rateLocksLoading?: Promise<void>;
   private rateLocksDirty = false;
   private rateLocksUnavailable = false;
+  private rateLocksFileFatal = false;
   private priceRefMap = new Map<string, ApiPricing>();
   private geminiDir: string;
   private dataDirectoryNames: readonly DataDirectoryName[];
@@ -80,6 +82,8 @@ export class UsageStatsManager {
   private inFlightAccountKey = 'all';
   private pendingForced?: Promise<TokenUsageSummary>;
   private pricingMutation?: Promise<unknown>;
+  private pricingRevalueApplying?: Promise<void>;
+  private ledgerSaveQueue: Promise<unknown> = Promise.resolve();
   private discoveryErrors: NonNullable<TokenUsageSummary['database_diagnostics']> = [];
   private periodKey = '';
   private pricingWarnings:string[]=[];
@@ -138,9 +142,15 @@ export class UsageStatsManager {
   private nextAutoSyncAt = 0;
   private syncStateLoaded = false;
   private syncStatePromise?: Promise<void>;
+  private pricingSyncInFlight?: Promise<{ synced: boolean; unchanged?: boolean; error?: string; count?: number; sourceUrl?: string; version?: string; updatedAt?: string; healedCount?: number }>;
   private lastSyncError: string | null = null;
   private lastSyncedSourceUrl = '';
   private lastSyncedVersion = '';
+  private lastSyncedUpdatedAt = '';
+  private lastSyncedEtag = '';
+  private lastSyncedSha256 = '';
+  private pricingRevisionSeq = 0;
+  private onPricingUpdatedHook?: (info: { version?: string; healedCount?: number }) => void;
   private activeOfficialModels: string[] | null = null;
   private activeUnpricedOfficialModels: string[] | null = null;
 
@@ -174,6 +184,22 @@ export class UsageStatsManager {
   }
 
   setAutoRemotePricingSync(enabled: boolean) { this.autoRemotePricingSync = enabled; }
+  isAutoRemotePricingSyncEnabled(): boolean { return this.autoRemotePricingSync; }
+  async isAutoPricingSyncDue(now = Date.now()): Promise<boolean> {
+    await this.ensureSyncStateLoaded();
+    return now >= this.nextAutoSyncAt;
+  }
+  getLastPricingCheckAt(): number { return Math.max(this.lastCheckAt, this.lastRemoteSyncAt); }
+  setOnPricingUpdated(hook: ((info: { version?: string; healedCount?: number }) => void) | undefined) {
+    this.onPricingUpdatedHook = hook;
+  }
+  getPricingRevision(): string {
+    return `${this.lastSyncedVersion || PRICING_METADATA.version}|${this.lastSyncedUpdatedAt || PRICING_METADATA.updatedAt}|${this.lastSyncedSha256}|${this.pricingRevisionSeq}`;
+  }
+  async hydratePricingCatalog(): Promise<void> {
+    await this.ensureSyncStateLoaded();
+    await this.getRawPricingCatalog();
+  }
 
   /** 动态更新当前官方 Antigravity 包含模型列表（含可选未计价实时模型列表），用于价格基准展示过滤与状态计数。 */
   setActiveOfficialModels(
@@ -218,13 +244,40 @@ export class UsageStatsManager {
   async previewRevalueHistory(mode: 'force_all' | 'unpriced_only' = 'force_all') {
     await this.getUsageSummary(true);
     const liveFiles = (await this.discoverDatabaseFiles()).map(path => basename(path));
-    return this.ledger.revalue({ action: 'preview', mode, prices: await this.getRawPricingTable(), accounts: [], liveFiles, now: Math.floor(Date.now() / 1000) });
+    return this.ledger.revalue({ action: 'preview', mode, prices: await this.getBillingPricingTable(), accounts: [], liveFiles, now: Math.floor(Date.now() / 1000) });
+  }
+
+  private runSerializedLedgerSave<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.ledgerSaveQueue.catch(() => {}).then(async () => {
+      while (this.pricingRevalueApplying) {
+        await this.pricingRevalueApplying.catch(() => {});
+      }
+      return fn();
+    });
+    this.ledgerSaveQueue = run;
+    return run;
   }
 
   private async mutateHistoricalPricing<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.pricingMutation) await this.pricingMutation;
+    while (this.pricingMutation) await this.pricingMutation.catch(() => {});
     const pendingRead = this.inFlight;
-    const work = (async () => { await pendingRead?.catch(() => {}); await this.rateLocksLoading?.catch(() => {}); return operation(); })();
+    const pendingLocks = this.rateLocksLoading;
+    const work = (async () => {
+      if (pendingRead) await pendingRead.catch(() => {});
+      if (pendingLocks) await pendingLocks.catch(() => {});
+      const prevSave = this.ledgerSaveQueue;
+      let releaseApply!: () => void;
+      const applyGate = new Promise<void>(resolve => { releaseApply = resolve; });
+      this.ledgerSaveQueue = prevSave.catch(() => {}).then(() => applyGate);
+      await prevSave.catch(() => {});
+      try {
+        this.pricingRevalueApplying = applyGate;
+        return await operation();
+      } finally {
+        this.pricingRevalueApplying = undefined;
+        releaseApply();
+      }
+    })();
     this.pricingMutation = work;
     try { return await work; }
     finally { if (this.pricingMutation === work) this.pricingMutation = undefined; }
@@ -235,8 +288,9 @@ export class UsageStatsManager {
     if (!options?.previewId) throw Error(bt('usage.err.revalue_preview_required'));
     return this.mutateHistoricalPricing(async () => {
       const result = await this.ledger.revalue({ action: 'apply', confirmed, previewId: options.previewId,
-        prices: await this.getRawPricingTable(), accounts: [], now: Math.floor(Date.now() / 1000) });
+        prices: await this.getBillingPricingTable(), accounts: [], now: Math.floor(Date.now() / 1000) });
       this.rateLocksLoaded = false;
+      this.rateLocksFileFatal = false;
       this.rateLocks = Object.create(null);
       this.cachedSummariesByAccount.clear(); this.lastAggregationKeysByAccount.clear(); this.snapshots.clear();
       return result;
@@ -245,8 +299,8 @@ export class UsageStatsManager {
 
   async restoreRevalueHistory(previewId: string, confirmed = false) {
     return this.mutateHistoricalPricing(async () => {
-      const result = await this.ledger.revalue({ action: 'restore', previewId, confirmed, prices: await this.getRawPricingTable(), accounts: [], now: Math.floor(Date.now() / 1000) });
-      this.rateLocksLoaded = false; this.rateLocks = Object.create(null);
+      const result = await this.ledger.revalue({ action: 'restore', previewId, confirmed, prices: await this.getBillingPricingTable(), accounts: [], now: Math.floor(Date.now() / 1000) });
+      this.rateLocksLoaded = false; this.rateLocksFileFatal = false; this.rateLocks = Object.create(null);
       this.cachedSummariesByAccount.clear(); this.lastAggregationKeysByAccount.clear(); this.snapshots.clear();
       return result;
     });
@@ -292,6 +346,7 @@ export class UsageStatsManager {
         localFileFatal = true;
         this.rateLocksLoaded = true;
         this.rateLocksUnavailable = true;
+        this.rateLocksFileFatal = true;
         this.pricingWarnings.push(bt('usage.warn.rate_ledger_unreadable_stop'));
       }
     }
@@ -407,7 +462,7 @@ export class UsageStatsManager {
       const raw = JSON.parse(await readFile(this.persistCachePath, 'utf8'));
       if (raw && raw.version === 3 && typeof raw.entries === 'object' && raw.entries !== null) {
         for (const [k, v] of Object.entries(raw.entries as Record<string, any>)) {
-          if (v && typeof v.mtimeMs === 'number' && typeof v.size === 'number' && Array.isArray(v.events) && v.events.every((e: GenerationEvent) => typeof e.event_key === 'string' && !/\borchestrator\b|^gemini-flash-worker|^MODEL_PLACEHOLDER_M66[789]$|^Gemini\s+Flash$/i.test(e.model)) && isFileCacheEntryReusable(v) && !this.fileCache.has(k)) {
+          if (v && typeof v.mtimeMs === 'number' && typeof v.size === 'number' && Array.isArray(v.events) && v.events.every((e: GenerationEvent) => typeof e.event_key === 'string' && !/\borchestrator\b|^gemini-flash-worker|^MODEL_PLACEHOLDER_M\d+$|^Gemini\s+Flash$/i.test(e.model)) && isFileCacheEntryReusable(v) && !this.fileCache.has(k)) {
             this.setFileCacheEntry(k, {
               ...v,
               skippedLargeRecords: Number.isFinite(v.skippedLargeRecords) ? Number(v.skippedLargeRecords) : 0,
@@ -662,6 +717,47 @@ export class UsageStatsManager {
     this.legacyKeyIndex.clear();
   }
 
+  private confidenceRank(confidence?: GenerationEvent['account_confidence']): number {
+    switch (confidence) {
+      case 'observed':
+        return 3;
+      case 'unknown':
+        return 1;
+      case 'legacy':
+        return 0;
+      default:
+        return -1;
+    }
+  }
+
+  private mergeLedgerEventRecord(previous: LedgerEvent | undefined, incoming: LedgerEvent): LedgerEvent {
+    const next: LedgerEvent = {
+      ...previous,
+      ...incoming,
+      source_observed_at: Math.max(incoming.source_observed_at ?? 0, previous?.source_observed_at ?? 0) || incoming.source_observed_at,
+      timestamp_seconds: incoming.timestamp_seconds || previous?.timestamp_seconds || 0,
+      ingested_at: previous?.ingested_at ?? incoming.ingested_at ?? new Date().toISOString(),
+    };
+    if (previous) {
+      const prevRank = this.confidenceRank(previous.account_confidence);
+      const nextRank = this.confidenceRank(incoming.account_confidence);
+      const prevHasIdentity = Boolean(previous.account_id || previous.account_email || previous.account_confidence);
+      const nextHasIdentity = Boolean(incoming.account_id || incoming.account_email);
+      if (
+        (prevRank > nextRank && prevHasIdentity) ||
+        (prevRank === nextRank && !nextHasIdentity && prevHasIdentity)
+      ) {
+        next.account_id = previous.account_id;
+        next.account_email = previous.account_email;
+        next.account_confidence = previous.account_confidence;
+      }
+      if (previous.account_type && previous.account_type !== 'unknown' && (!incoming.account_type || incoming.account_type === 'unknown')) {
+        next.account_type = previous.account_type;
+      }
+    }
+    return next;
+  }
+
   private upsertLedger(event: LedgerEvent): void {
     const key = event.event_key;
     if (!key || event.db_file === 'recovered_session.db' || event.db_file === 'recovered_enterprise_session.db') return;
@@ -696,12 +792,12 @@ export class UsageStatsManager {
         if (!previous) {
           previous = candidate;
         } else {
-          if (candidate.account_confidence === 'observed' && previous.account_confidence !== 'observed') {
+          if (this.confidenceRank(candidate.account_confidence) > this.confidenceRank(previous.account_confidence)) {
             previous = {
               ...previous,
               account_id: candidate.account_id,
               account_email: candidate.account_email,
-              account_confidence: 'observed',
+              account_confidence: candidate.account_confidence,
               account_type: candidate.account_type ?? previous.account_type,
             };
           }
@@ -718,21 +814,7 @@ export class UsageStatsManager {
       }
     }
     if (sameKeyPrev && (sameKeyPrev.source_observed_at ?? 0) > (event.source_observed_at ?? 0) && migratedFromKeys.length === 0) return;
-    const next = { ...previous, ...event,
-      source_observed_at: Math.max(event.source_observed_at ?? 0, previous?.source_observed_at ?? 0) || event.source_observed_at,
-      timestamp_seconds: event.timestamp_seconds || previous?.timestamp_seconds || 0,
-      ingested_at: previous?.ingested_at ?? event.ingested_at ?? new Date().toISOString() };
-    // Absence of new attribution evidence must not erase an existing observed identity.
-    if (previous?.account_confidence === 'observed') {
-      if (!event.account_id) {
-        next.account_id = previous.account_id;
-        next.account_email = previous.account_email;
-        next.account_confidence = previous.account_confidence;
-      }
-      if (previous.account_type && previous.account_type !== 'unknown' && (!event.account_type || event.account_type === 'unknown')) {
-        next.account_type = previous.account_type;
-      }
-    }
+    const next = this.mergeLedgerEventRecord(previous, event);
     if (sameKeyPrev && migratedFromKeys.length === 0 && ledgerEventsEqual(sameKeyPrev, next)) return;
     this.setLedgerEventInMap(key, next);
     if (this.usageLedgerEvents.size > 50_000) this.largeLedger = true;
@@ -743,17 +825,25 @@ export class UsageStatsManager {
   private async saveUsageLedger(): Promise<void> {
     if (!this.usageLedgerDirty) return;
     if (this.ledgerUnavailable || this.archivedUnavailable) return;
-    const pending = [...this.pendingLedgerEvents.values()];
-    try {
-      await this.ledger.save(pending);
-      for (const event of pending) {
-        if (this.pendingLedgerEvents.get(event.event_key!) === event) this.pendingLedgerEvents.delete(event.event_key!);
+    await this.runSerializedLedgerSave(async () => {
+      if (!this.usageLedgerDirty) return;
+      if (this.ledgerUnavailable || this.archivedUnavailable) return;
+      const pending = [...this.pendingLedgerEvents.values()];
+      if (pending.length === 0) {
+        this.usageLedgerDirty = false;
+        return;
       }
-      this.usageLedgerDirty = this.pendingLedgerEvents.size > 0;
-    } catch {
-      this.storageWarnings.add(bt('usage.warn.ledger_save_failed'));
-      this.ledgerUnavailable = true;
-    }
+      try {
+        await this.ledger.save(pending);
+        for (const event of pending) {
+          if (this.pendingLedgerEvents.get(event.event_key!) === event) this.pendingLedgerEvents.delete(event.event_key!);
+        }
+        this.usageLedgerDirty = this.pendingLedgerEvents.size > 0;
+      } catch {
+        this.storageWarnings.add(bt('usage.warn.ledger_save_failed'));
+        this.ledgerUnavailable = true;
+      }
+    });
   }
 
   /**
@@ -812,7 +902,7 @@ export class UsageStatsManager {
     await this.loadUsageLedger();
     await this.loadRateLocks();
     if (this.archivedUnavailable || this.ledgerUnavailable || this.rateLocksUnavailable) throw Error(bt('usage.err.clear_aborted_ledger_unreadable'));
-    const rawPricing = await this.getRawPricingTable();
+    const rawPricing = await this.getBillingPricingTable();
 
     let archivedCount = 0;
     let eventCount = 0;
@@ -870,15 +960,27 @@ export class UsageStatsManager {
 
   private calendarKey() { const d=new Date();return formatLocalDate(d)+':'+d.getTimezoneOffset()+':'+Intl.DateTimeFormat().resolvedOptions().timeZone+':'+getActiveLocale(); }
 
+  private withStickyPricingWarnings(warnings: string[]): string[] {
+    if (!this.rateLocksFileFatal) return warnings;
+    const fatalWarn = bt('usage.warn.rate_ledger_unreadable_stop');
+    return warnings.includes(fatalWarn) ? warnings : [...warnings, fatalWarn];
+  }
+
   async getRawPricingCatalog(): Promise<{ raw: Record<string, ApiPricingEntry>; publicKeys: Set<string> }> {
     const { merged, warnings, publicKeys } = await loadRawPricingTable(this.remotePricingCachePath, this.pricingCachePath);
-    this.pricingWarnings = warnings;
+    this.pricingWarnings = this.withStickyPricingWarnings(warnings);
     return { raw: merged, publicKeys };
   }
 
   async getRawPricingTable(): Promise<Record<string, ApiPricingEntry>> {
     const { raw } = await this.getRawPricingCatalog();
     return raw;
+  }
+
+  async getBillingPricingTable(): Promise<Record<string, ApiPricingEntry>> {
+    const { billingPrices, warnings } = await loadRawPricingTable(this.remotePricingCachePath, this.pricingCachePath);
+    this.pricingWarnings = this.withStickyPricingWarnings(warnings);
+    return billingPrices;
   }
 
   private resolvePricingTableFromRaw(
@@ -928,6 +1030,9 @@ export class UsageStatsManager {
       lastSyncError: this.lastSyncError,
       lastSyncedSourceUrl: this.lastSyncedSourceUrl,
       lastSyncedVersion: this.lastSyncedVersion,
+      lastSyncedUpdatedAt: this.lastSyncedUpdatedAt,
+      lastSyncedEtag: this.lastSyncedEtag,
+      lastSyncedSha256: this.lastSyncedSha256,
     };
   }
 
@@ -940,6 +1045,9 @@ export class UsageStatsManager {
     this.lastSyncError = next.lastSyncError;
     this.lastSyncedSourceUrl = next.lastSyncedSourceUrl;
     this.lastSyncedVersion = next.lastSyncedVersion;
+    this.lastSyncedUpdatedAt = next.lastSyncedUpdatedAt ?? '';
+    this.lastSyncedEtag = next.lastSyncedEtag ?? '';
+    this.lastSyncedSha256 = next.lastSyncedSha256 ?? '';
   }
 
   private async ensureSyncStateLoaded(): Promise<void> {
@@ -957,38 +1065,63 @@ export class UsageStatsManager {
     await this.syncStatePromise;
   }
 
-  async syncRemotePricing(feedUrl?: string, force = false): Promise<{ synced: boolean; error?: string; count?: number; sourceUrl?: string; version?: string; healedCount?: number }> {
-    await this.ensureSyncStateLoaded();
-    const candidateUrls = selectRemotePricingCandidateUrls({
-      feedUrl,
-      customRemoteUrlConfigured: this.customRemoteUrlConfigured,
-      remotePricingUrl: this.remotePricingUrl,
-      fallbackPricingUrls: this.fallbackPricingUrls,
-    });
-    const now = Date.now();
-    if (!force && now < this.nextAutoSyncAt) {
-      return { synced: false, error: bt('usage.err.sync_rate_limited') };
+  async syncRemotePricing(feedUrl?: string, force = false): Promise<{ synced: boolean; unchanged?: boolean; error?: string; count?: number; sourceUrl?: string; version?: string; updatedAt?: string; healedCount?: number }> {
+    if (this.pricingSyncInFlight) {
+      if (!force && !feedUrl) {
+        return this.pricingSyncInFlight;
+      }
+      await this.pricingSyncInFlight.catch(() => {});
     }
-    const snapshot = this.pricingSyncStateSnapshot();
-    const result = await executeRemotePricingSync({
-      candidateUrls,
-      remotePricingCachePath: this.remotePricingCachePath,
-      pricingSyncStatePath: this.pricingSyncStatePath,
-      state: snapshot,
-      now,
-    });
-    this.applyPricingSyncState(snapshot);
-    this.syncStateLoaded = true;
-    if (!result.synced) {
-      return result;
-    }
-    this.cachedSummariesByAccount.clear();
-    this.lastAggregationKeysByAccount.clear();
-    let healedCount = 0;
+    const run = (async () => {
+      await this.ensureSyncStateLoaded();
+      const candidateUrls = selectRemotePricingCandidateUrls({
+        feedUrl,
+        customRemoteUrlConfigured: this.customRemoteUrlConfigured,
+        remotePricingUrl: this.remotePricingUrl,
+        fallbackPricingUrls: this.fallbackPricingUrls,
+      });
+      const now = Date.now();
+      if (!force && now < this.nextAutoSyncAt) {
+        return { synced: false, error: bt('usage.err.sync_rate_limited') };
+      }
+      const snapshot = this.pricingSyncStateSnapshot();
+      const result = await executeRemotePricingSync({
+        candidateUrls,
+        remotePricingCachePath: this.remotePricingCachePath,
+        pricingSyncStatePath: this.pricingSyncStatePath,
+        state: snapshot,
+        now,
+        force,
+      });
+      this.applyPricingSyncState(snapshot);
+      this.syncStateLoaded = true;
+      if (!result.synced) {
+        return result;
+      }
+      if (result.unchanged) {
+        return { ...result, healedCount: 0 };
+      }
+      this.cachedSummariesByAccount.clear();
+      this.lastAggregationKeysByAccount.clear();
+      this.snapshots.clear();
+      let healedCount = 0;
+      try {
+        healedCount = await this.autoHealUnpricedHistory();
+      } catch {}
+      this.pricingRevisionSeq += 1;
+      try {
+        this.onPricingUpdatedHook?.({ version: result.version, healedCount });
+      } catch {}
+      return { ...result, healedCount };
+    })();
+    this.pricingSyncInFlight = run;
     try {
-      healedCount = await this.autoHealUnpricedHistory();
-    } catch {}
-    return { ...result, healedCount };
+      return await run;
+    } finally {
+      if (this.pricingSyncInFlight === run) {
+        this.pricingSyncInFlight = undefined;
+      }
+    }
   }
 
   async getPricingSyncStatus(): Promise<{
@@ -1032,6 +1165,10 @@ export class UsageStatsManager {
     this.cachedSummariesByAccount.clear();
     this.lastAggregationKeysByAccount.clear();
     this.snapshots.clear();
+    this.pricingRevisionSeq += 1;
+    try {
+      this.onPricingUpdatedHook?.({});
+    } catch {}
   }
 
   /**
@@ -1045,7 +1182,7 @@ export class UsageStatsManager {
     if (this.largeLedger) {
       if (this.ledgerUnavailable || this.archivedUnavailable || this.rateLocksUnavailable) return 0;
       if (this.usageLedgerDirty) await this.saveUsageLedger();
-      const rawPricing = await this.getRawPricingTable();
+      const rawPricing = await this.getBillingPricingTable();
       const dbPaths = await this.discoverDatabaseFiles();
       const aggregated = await this.ledger.aggregate({
         prices: rawPricing,
@@ -1085,7 +1222,6 @@ export class UsageStatsManager {
         beforeValidLockedKeys.add(key);
       }
     }
-    const unpricedSet = new Set(unpricedKeys);
     for (const key of unpricedKeys) {
       delete this.rateLocks[key];
     }
@@ -1097,13 +1233,13 @@ export class UsageStatsManager {
     this.snapshots.clear();
 
     await this.getUsageSummary(true);
-    let newlyLockedFromUnlocked = 0;
+    let healedCount = 0;
     for (const [key, value] of Object.entries(this.rateLocks)) {
-      if (!beforeValidLockedKeys.has(key) && !unpricedSet.has(key) && !this.isUnpricedRateLock(value)) {
-        newlyLockedFromUnlocked++;
+      if (!beforeValidLockedKeys.has(key) && !this.isUnpricedRateLock(value)) {
+        healedCount++;
       }
     }
-    return unpricedSet.size + newlyLockedFromUnlocked;
+    return healedCount;
   }
 
   private discoveredStats = new Map<string, DiscoveredDbStat>();
@@ -1222,7 +1358,7 @@ export class UsageStatsManager {
    */
   cancelRead() { this.scanAbort?.abort(new Error(bt('usage.err.read_cancelled'))); return !!this.scanAbort; }
   async getUsageSummary(forceRefresh = false, accountId?: string): Promise<TokenUsageSummary> {
-    if (this.pricingMutation) await this.pricingMutation;
+    while (this.pricingMutation) await this.pricingMutation.catch(() => {});
     const accKey = accountId || 'all';
     if(this.inFlight) {
       if(this.inFlightAccountKey===accKey && (!forceRefresh||this.inFlightForced)) return this.inFlight;
@@ -1354,14 +1490,14 @@ export class UsageStatsManager {
     }
 
     await this.loadUsageLedger();
-    if (this.autoRemotePricingSync) {
+    if (this.autoRemotePricingSync && Date.now() >= this.nextAutoSyncAt) {
       void this.syncRemotePricing().catch(() => {});
     }
     if (this.largeLedger && !this.ledgerUnavailable) {
       void this.savePersistentFileCache();
       for (const event of allEvents) this.upsertLedger(event);
       await this.saveUsageLedger();
-      const rawPricing = await this.getRawPricingTable();
+      const rawPricing = await this.getBillingPricingTable();
       if (this.rateLocksUnavailable && !this.pricingWarnings.some(w => /费率账本|rate ledger/i.test(w))) this.pricingWarnings.push(bt('usage.warn.rate_ledger_unreadable_no_reprice'));
       const revision = await this.ledger.version();
       const aggregateKey = JSON.stringify([revision, this.calendarKey(), rawPricing, accountId ?? 'all', this.knownAccounts, skippedLargeRecords]);
@@ -1479,7 +1615,7 @@ export class UsageStatsManager {
     if (this.usageLedgerDirty) {
       await this.saveUsageLedger();
     }
-    const rawPricing = await this.getRawPricingTable();
+    const rawPricing = await this.getBillingPricingTable();
     await this.loadRateLocks();
     if (this.rateLocksUnavailable && !this.pricingWarnings.some(w => /费率账本|rate ledger/i.test(w))) this.pricingWarnings.push(bt('usage.warn.rate_ledger_unreadable_no_reprice'));
     const now = Math.floor(Date.now() / 1000);

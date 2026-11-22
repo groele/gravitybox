@@ -1,6 +1,16 @@
 import type { ApiPricing } from './pricing.js';
-import { stripModelProviderPrefix } from './model-identity.js';
-import { getEffectiveModelAliasKeys, getEffectiveModelPriceAlias } from './model-catalog.js';
+import {
+  normalizeModelId,
+  stripModelProviderPrefix,
+  THINKING_EFFORT_SUFFIX_RE,
+  TIERED_OR_THINKING_EFFORT_SUFFIX_RE,
+} from './model-identity.js';
+import {
+  getEffectiveModelAliasKeys,
+  getEffectiveModelPriceAlias,
+  resolveObservedModelByEnum,
+  resolveObservedModelByIdOrAlias,
+} from './model-catalog.js';
 import type { LedgerEvent } from './usage-ledger.js';
 import { USAGE_PROJECTION_VERSION } from './protobuf-projection.js';
 import { bt } from './i18n.js';
@@ -133,11 +143,132 @@ export function isUnknownModelName(name: string | null | undefined): boolean {
   return clean === CANONICAL_UNKNOWN_MODEL || clean.toLowerCase() === 'unknown model';
 }
 
-const ORCHESTRATOR_THINKING_SUFFIX_RE = /-(?:extra-high|extra-low|xhigh|high|medium|low|thinking)$/i;
+const ORCHESTRATOR_THINKING_SUFFIX_RE = THINKING_EFFORT_SUFFIX_RE;
+const NON_GEMINI_ORCHESTRATOR_CODENAMES = new Set([
+  'opus', 'sonnet', 'haiku', 'claude', 'gpt', 'openai', 'anthropic',
+  'o1', 'o3', 'o4', 'o5', 'llama', 'mistral', 'deepseek', 'qwen', 'grok', 'command',
+]);
+const EXPLICIT_MODEL_FAMILY_PREFIX_RE =
+  /^(?:gemini|claude|gpt|gemma|o[1-9]|deepseek|qwen|llama|mistral|grok|command)-.+$/i;
+const PLACEHOLDER_ID_RE = /^MODEL_PLACEHOLDER_M\d+$/i;
+const AMBIGUOUS_ORCHESTRATOR_ID_RE =
+  /^(?:gemini-pro-orchestrator(?:-g1-pro)?|gemini-flash-worker(?:-agy)?|orchestrator)$/i;
+
+function normalizeDisplayLabelEffort(lbl: string): string {
+  let out = lbl.trim();
+  for (let i = 0; i < 3; i += 1) {
+    const next = out
+      .replace(/\s*[（(]\s*(?:extra[\s-]*high|extra[\s-]*low|xhigh|extra|high|medium|low|minimal|thinking|max)\s*[）)]\s*$/i, '')
+      .replace(/\s+(?:extra[\s-]*high|extra[\s-]*low|xhigh|extra|high|medium|low|minimal|thinking|max)\s*$/i, '')
+      .trim();
+    if (!next || next === out) break;
+    out = next;
+  }
+  return out || lbl.trim();
+}
+
+function unwrapOrchestratorModelPhrase(raw: string): string {
+  let text = raw.trim();
+  if (!text) return '';
+  // "<Model Name> (Orchestrator)" -> "<Model Name>"
+  text = text.replace(/\s*[（(]\s*orchestrator\s*[）)]\s*$/i, '').trim();
+  // "Orchestrator (<Model Name>)" -> "<Model Name>"
+  const parenMatch = text.match(/^orchestrator\s*[（(]\s*([^）)]+)\s*[）)]\s*$/i);
+  if (parenMatch?.[1]) {
+    text = parenMatch[1].trim();
+  } else {
+    // "Orchestrator <Model Name>" -> "<Model Name>"
+    const spaceMatch = text.match(/^orchestrator\s+(.+)$/i);
+    if (spaceMatch?.[1]) {
+      text = spaceMatch[1].trim();
+    }
+  }
+  return normalizeDisplayLabelEffort(text);
+}
+
+function resolveUnderlyingModelFromLabel(
+  rawLabel: string,
+  siblingModelIds?: Iterable<string>
+): string | null {
+  const trimmed = rawLabel.trim();
+  if (!trimmed) return null;
+  if (/^gemini\s+flash$/i.test(trimmed) || /^orchestrator$/i.test(trimmed)) return null;
+
+  const phrase = unwrapOrchestratorModelPhrase(trimmed);
+  if (!phrase || /^orchestrator$/i.test(phrase) || /^gemini\s+flash$/i.test(phrase) || /^gemini\s+pro$/i.test(phrase)) {
+    return null;
+  }
+
+  const directAlias =
+    getEffectiveModelPriceAlias(phrase) ??
+    getEffectiveModelPriceAlias(trimmed);
+  if (directAlias && !AMBIGUOUS_ORCHESTRATOR_ID_RE.test(directAlias)) {
+    return directAlias;
+  }
+
+  const observed = resolveObservedModelByIdOrAlias(phrase) ?? resolveObservedModelByIdOrAlias(trimmed);
+  if (observed?.modelId) {
+    const obsClean = stripModelProviderPrefix(observed.modelId).replace(/(?:^|[-_])disabled$/i, '').trim();
+    if (obsClean && !PLACEHOLDER_ID_RE.test(obsClean) && !AMBIGUOUS_ORCHESTRATOR_ID_RE.test(obsClean)) {
+      const obsAlias = getEffectiveModelPriceAlias(obsClean);
+      if (obsAlias) return obsAlias;
+      const obsNorm = normalizeModelId(obsClean).replace(TIERED_OR_THINKING_EFFORT_SUFFIX_RE, '');
+      if (obsNorm) return getEffectiveModelPriceAlias(obsNorm) ?? obsNorm;
+    }
+  }
+
+  const normPhrase = normalizeModelId(phrase).replace(TIERED_OR_THINKING_EFFORT_SUFFIX_RE, '');
+  if (normPhrase) {
+    const normAlias = getEffectiveModelPriceAlias(normPhrase);
+    if (normAlias && !AMBIGUOUS_ORCHESTRATOR_ID_RE.test(normAlias)) return normAlias;
+    if (EXPLICIT_MODEL_FAMILY_PREFIX_RE.test(normPhrase) && normPhrase !== 'gemini-flash' && normPhrase !== 'gemini-pro') {
+      return normPhrase;
+    }
+  }
+
+  // Single-word codename (e.g. "Carbon", "Hydrogen", "Neon", "Nova")
+  if (/^[a-z][a-z0-9]*$/i.test(phrase)) {
+    const codename = phrase.toLowerCase();
+    if (
+      codename === 'pro' ||
+      codename === 'flash' ||
+      codename === 'default' ||
+      codename === 'unknown' ||
+      codename === 'g1' ||
+      NON_GEMINI_ORCHESTRATOR_CODENAMES.has(codename)
+    ) {
+      return null;
+    }
+    const cap = codename.charAt(0).toUpperCase() + codename.slice(1);
+    const explicitAlias =
+      getEffectiveModelPriceAlias(`gemini-pro-orchestrator-${codename}`) ??
+      getEffectiveModelPriceAlias(`Orchestrator (${cap})`) ??
+      getEffectiveModelPriceAlias(`orchestrator (${codename})`);
+    if (explicitAlias) return explicitAlias;
+
+    const versionedRe = new RegExp(`^gemini-(\\d+(?:\\.\\d+)?)-${codename}$`, 'i');
+    if (siblingModelIds) {
+      for (const raw of siblingModelIds) {
+        const cleaned = stripModelProviderPrefix(String(raw ?? ''))
+          .trim()
+          .replace(/(?:^|[-_])disabled$/i, '')
+          .replace(ORCHESTRATOR_THINKING_SUFFIX_RE, '');
+        const m = cleaned.match(versionedRe);
+        if (m) return `gemini-${m[1]}-${codename}`;
+      }
+    }
+    for (const known of getEffectiveModelAliasKeys()) {
+      const m = known.match(versionedRe);
+      if (m) return `gemini-${m[1]}-${codename}`;
+    }
+  }
+
+  return null;
+}
 
 /**
- * 动态识别尚未入库的新代号 Orchestrator（如 gemini-pro-orchestrator-<codename> 或 Orchestrator (<Codename>)），
- * 仅合并模型身份，绝不自行伪造定价。
+ * 动态识别尚未入库的新代号 Orchestrator（如 gemini-pro-orchestrator-<codename>、Orchestrator (<Model>)、
+ * Orchestrator <Model Name> 或 <Model Name> (Orchestrator)），仅合并模型身份，绝不自行伪造定价或非 Gemini 模型前缀。
  */
 export function resolveDynamicOrchestratorModel(
   strippedId: string,
@@ -146,6 +277,16 @@ export function resolveDynamicOrchestratorModel(
 ): string | null {
   const idText = String(strippedId ?? '').trim();
   const labelText = String(cleanLabel ?? '').trim();
+
+  // Handle full model names in "Orchestrator <Model Name>", "Orchestrator (<Model Name>)", or "<Model Name> (Orchestrator)"
+  for (const candidate of [labelText, idText]) {
+    if (!candidate) continue;
+    if (/^orchestrator(?:\s*\(|\s+)/i.test(candidate) || /[（(]\s*orchestrator\s*[）)]\s*$/i.test(candidate)) {
+      const resolved = resolveUnderlyingModelFromLabel(candidate, siblingModelIds);
+      if (resolved) return resolved;
+    }
+  }
+
   const idCodename = idText.match(/^gemini-pro-orchestrator-(?!g1(?:-|$)|default$|pro$)([a-z][a-z0-9]*)$/i)?.[1];
   const labelCodename =
     idText.match(/^Orchestrator\s*\(\s*([a-z][a-z0-9]*)\s*\)$/i)?.[1] ??
@@ -153,7 +294,14 @@ export function resolveDynamicOrchestratorModel(
   const rawCodename = idCodename ?? labelCodename;
   if (!rawCodename) return null;
   const codename = rawCodename.toLowerCase();
-  if (codename === 'pro' || codename === 'flash' || codename === 'default' || codename === 'unknown' || codename === 'g1') {
+  if (
+    codename === 'pro' ||
+    codename === 'flash' ||
+    codename === 'default' ||
+    codename === 'unknown' ||
+    codename === 'g1' ||
+    NON_GEMINI_ORCHESTRATOR_CODENAMES.has(codename)
+  ) {
     return null;
   }
   const cap = codename.charAt(0).toUpperCase() + codename.slice(1);
@@ -178,7 +326,11 @@ export function resolveDynamicOrchestratorModel(
     const m = known.match(versionedRe);
     if (m) return `gemini-${m[1]}-${codename}`;
   }
-  return `gemini-4-${codename}`;
+  // Only infer gemini-4-<codename> when the upstream ID itself explicitly starts with gemini-pro-orchestrator-
+  if (idCodename) {
+    return `gemini-4-${codename}`;
+  }
+  return null;
 }
 
 export function resolveDatabaseModelFullName(
@@ -193,15 +345,76 @@ export function resolveDatabaseModelFullName(
   const rawLabel = typeof label === 'string' ? label.trim() : '';
   const cleanLabel = isUnknownModelName(rawLabel) ? '' : rawLabel;
 
-  // Antigravity Orchestrator 双阶段模型归一化：
-  // 1. 规划阶段 (Plan Mode)：旧版 response_model 恒为 "gemini-pro-orchestrator-g1-pro"，需结合 label / model_enum 区分 Carbon / Hydrogen / Argon；
-  // 2. 其他已知历史 ID 与远端热更新别名优先走 getEffectiveModelPriceAlias，未知新变体原样保留以便归入未计价统计（禁止前缀猜名伪造费用）。
+  const observedByEnum = typeof modelEnum === 'number' && Number.isSafeInteger(modelEnum) && modelEnum > 0
+    ? resolveObservedModelByEnum(modelEnum)
+    : null;
+  const observedById = strippedId ? resolveObservedModelByIdOrAlias(strippedId) : null;
+  const observedEntry = observedByEnum ?? observedById;
+
+  const resolveFromObservedEntry = (entry: NonNullable<typeof observedEntry>): string | null => {
+    const obsId = stripModelProviderPrefix(entry.modelId || '').replace(/(?:^|[-_])disabled$/i, '').trim();
+    if (obsId && !PLACEHOLDER_ID_RE.test(obsId) && !AMBIGUOUS_ORCHESTRATOR_ID_RE.test(obsId)) {
+      const obsAlias = getEffectiveModelPriceAlias(obsId);
+      if (obsAlias) return obsAlias;
+      const obsNorm = normalizeModelId(obsId).replace(TIERED_OR_THINKING_EFFORT_SUFFIX_RE, '');
+      if (obsNorm) return getEffectiveModelPriceAlias(obsNorm) ?? obsNorm;
+    }
+    if (entry.displayName) {
+      const fromObsLabel = resolveUnderlyingModelFromLabel(entry.displayName, options?.siblingModelIds);
+      if (fromObsLabel) return fromObsLabel;
+    }
+    return null;
+  };
+
+  // 1. Execution worker / M669 (gemini-flash-worker-agy / modelEnum=1669):
+  //    In Antigravity 2.34.0+, executionModel can be ANY model (Hydrogen, Neon, Carbon, Claude, etc.).
+  //    Prefer real underlying model from cleanLabel; fall back to gemini-3.8-flash ONLY when cleanLabel is empty or generic "Gemini Flash".
+  const isFlashWorker =
+    /^gemini-flash-worker(?:-agy)?$/i.test(strippedId) ||
+    /^MODEL_PLACEHOLDER_M669$/i.test(strippedId) ||
+    modelEnum === 1669 ||
+    (!strippedId && /^Gemini\s+Flash$/i.test(cleanLabel));
+
+  if (isFlashWorker) {
+    if (cleanLabel && !/^Gemini\s+Flash$/i.test(cleanLabel)) {
+      const fromLabel = resolveUnderlyingModelFromLabel(cleanLabel, options?.siblingModelIds);
+      if (fromLabel) return fromLabel;
+      const normalizedLabel = normalizeDisplayLabelEffort(unwrapOrchestratorModelPhrase(cleanLabel) || cleanLabel);
+      const labelAlias = getEffectiveModelPriceAlias(normalizedLabel);
+      if (labelAlias) return labelAlias;
+      const normId = normalizeModelId(normalizedLabel).replace(TIERED_OR_THINKING_EFFORT_SUFFIX_RE, '');
+      if (normId && normId !== 'gemini-flash') return normId;
+    }
+    if (!cleanLabel && observedEntry) {
+      const fromObs = resolveFromObservedEntry(observedEntry);
+      if (fromObs) return fromObs;
+    }
+    const workerAlias = strippedId
+      ? (getEffectiveModelPriceAlias(strippedId) ?? getEffectiveModelPriceAlias(cleanId))
+      : undefined;
+    return workerAlias ?? getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M669') ?? 'gemini-3.8-flash';
+  }
+
+  // 2. Orchestrator / Planner ambiguous IDs & empty IDs:
+  //    Consult cleanLabel & observed registry BEFORE falling back to legacy static aliases.
   const isLegacyAmbiguousOrchestratorId =
     /^gemini-pro-orchestrator(?:-g1-pro)?$/i.test(strippedId) ||
     /^MODEL_PLACEHOLDER_M66[78]$/i.test(strippedId) ||
-    /^Orchestrator\s*\(\s*(?:Carbon|Hydrogen|Argon)\s*\)$/i.test(strippedId);
+    /^Orchestrator(?:\s*\(|\s+)/i.test(strippedId);
 
   if (!strippedId || isLegacyAmbiguousOrchestratorId) {
+    if (cleanLabel) {
+      const fromLabel = resolveUnderlyingModelFromLabel(cleanLabel, options?.siblingModelIds);
+      if (fromLabel) return fromLabel;
+    }
+    if (strippedId && /^Orchestrator(?:\s*\(|\s+)/i.test(strippedId)) {
+      const fromIdLabel = resolveUnderlyingModelFromLabel(strippedId, options?.siblingModelIds);
+      if (fromIdLabel) return fromIdLabel;
+    }
+    if (observedEntry) {
+      const fromObs = resolveFromObservedEntry(observedEntry);
+      if (fromObs) return fromObs;
+    }
     if (/\bcarbon\b/i.test(cleanLabel) || /\bcarbon\b/i.test(strippedId) || modelEnum === 1667 || /M667$/i.test(strippedId)) {
       return getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M667') ?? 'gemini-4-carbon';
     }
@@ -217,46 +430,37 @@ export function resolveDatabaseModelFullName(
     }
     const dynamicOrchestrator = resolveDynamicOrchestratorModel(strippedId, cleanLabel, options?.siblingModelIds);
     if (dynamicOrchestrator) return dynamicOrchestrator;
-  }
-
-  if (
-    /^gemini-flash-worker(?:-agy)?$/i.test(strippedId) ||
-    /^MODEL_PLACEHOLDER_M669$/i.test(strippedId) ||
-    modelEnum === 1669 ||
-    (!strippedId && /^Gemini\s+Flash$/i.test(cleanLabel))
-  ) {
-    if (/\bhydrogen\b/i.test(cleanLabel) || /\bhydrogen\b/i.test(strippedId)) {
-      return 'gemini-4-hydrogen';
+    // If cleanLabel names an unrecognized model (e.g. "Orchestrator (Opus)" or a new unpriced model),
+    // do NOT fall through to legacy bare gemini-pro-orchestrator -> gemini-4-argon alias!
+    if (isLegacyAmbiguousOrchestratorId && cleanLabel && !/^orchestrator$/i.test(cleanLabel)) {
+      const normalizedLabel = normalizeDisplayLabelEffort(cleanLabel);
+      return getEffectiveModelPriceAlias(normalizedLabel) ?? normalizedLabel;
     }
-    const workerAlias = strippedId
-      ? (getEffectiveModelPriceAlias(strippedId) ?? getEffectiveModelPriceAlias(cleanId))
-      : undefined;
-    return workerAlias ?? getEffectiveModelPriceAlias('MODEL_PLACEHOLDER_M669') ?? 'gemini-3.8-flash';
   }
-
-  const normalizeDisplayLabel = (lbl: string): string =>
-    lbl
-      .replace(/\s*[（(]\s*(?:extra[\s-]*high|extra[\s-]*low|xhigh|high|medium|low|thinking|max)\s*[）)]\s*$/i, '')
-      .replace(/\s+(?:extra[\s-]*high|extra[\s-]*low|xhigh|high|medium|low|thinking|max)\s*$/i, '')
-      .trim() || lbl;
 
   if (cleanId) {
     const dynamicIdAlias = getEffectiveModelPriceAlias(strippedId) ?? getEffectiveModelPriceAlias(cleanId);
     if (dynamicIdAlias) return dynamicIdAlias;
-    if (/^(?:gemini-pro-orchestrator|gemini-pro-orchestrator-g1-pro|gemini-pro-orchestrator-argon)$/i.test(strippedId)) {
-      return 'gemini-4-argon';
+    if (PLACEHOLDER_ID_RE.test(strippedId) && observedEntry) {
+      const fromObs = resolveFromObservedEntry(observedEntry);
+      if (fromObs) return fromObs;
     }
     const dynamicOrchestrator = resolveDynamicOrchestratorModel(strippedId, cleanLabel, options?.siblingModelIds);
     if (dynamicOrchestrator) return dynamicOrchestrator;
-    if (/^MODEL_PLACEHOLDER_M\d+$/i.test(strippedId) && cleanLabel) {
-      const normalizedLabel = normalizeDisplayLabel(cleanLabel);
+    if (/^(?:gemini-pro-orchestrator|gemini-pro-orchestrator-g1-pro|gemini-pro-orchestrator-argon)$/i.test(strippedId)) {
+      return 'gemini-4-argon';
+    }
+    if (PLACEHOLDER_ID_RE.test(strippedId) && cleanLabel) {
+      const fromLabel = resolveUnderlyingModelFromLabel(cleanLabel, options?.siblingModelIds);
+      if (fromLabel) return fromLabel;
+      const normalizedLabel = normalizeDisplayLabelEffort(cleanLabel);
       return getEffectiveModelPriceAlias(normalizedLabel) ?? normalizedLabel;
     }
     if (strippedId) return strippedId;
     return cleanId;
   }
   if (cleanLabel) {
-    const normalizedLabel = normalizeDisplayLabel(cleanLabel);
+    const normalizedLabel = normalizeDisplayLabelEffort(cleanLabel);
     return getEffectiveModelPriceAlias(normalizedLabel) ?? normalizedLabel;
   }
   return options?.canonicalUnknown ? CANONICAL_UNKNOWN_MODEL : bt('usage.unknown_model');

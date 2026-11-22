@@ -2,7 +2,11 @@ name: Pricing Watch
 
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '6 22 * * *' # 北京时间 06:06 (UTC+8)
+  push:
+    branches: [main]
+    paths:
+      - 'assets/pricing-feed.json'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -12,7 +16,7 @@ on:
         default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && 'purge-cdn' || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -25,8 +29,26 @@ permissions:
   issues: write
 
 jobs:
+  purge-cdn:
+    name: Purge jsDelivr Pricing Feed Cache
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Purge jsDelivr CDN Cache
+        shell: bash
+        run: |
+          PURGE_URL="https://purge.jsdelivr.net/gh/${{ github.repository }}@main/assets/pricing-feed.json"
+          if PURGE_RESP=$(curl -fsS --max-time 15 "$PURGE_URL" 2>&1); then
+            echo "jsDelivr purge succeeded: $PURGE_RESP"
+          else
+            echo "::warning::jsDelivr CDN purge failed for $PURGE_URL: $PURGE_RESP"
+          fi
+
   pricing-audit:
     name: Auto Pricing Audit & Consensus Sync
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -47,7 +69,7 @@ jobs:
         id: audit
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.8-flash' }}
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             node tools/auto-update-pricing.mjs --dry-run
@@ -94,12 +116,21 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git checkout -B "$BRANCH"
-          git add assets/model-catalog.json assets/pricing-feed.json
-          if git diff --cached --quiet; then
-            echo "No git diff after staging; skipping PR."
-            echo "merged=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          BASE_SHA=$(git rev-parse HEAD)
+          EXISTING_PR_JSON=$(gh pr list --head "$BRANCH" --state open --json url,title,body --jq '.[0] // empty')
+          EXISTING_PR=$(node --input-type=module -e 'const s = process.argv[1]; console.log(s ? JSON.parse(s).url : "");' "$EXISTING_PR_JSON")
+          HAS_REMOTE_BRANCH=false
+          if git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null; then
+            HAS_REMOTE_BRANCH=true
+          fi
+
+          if [ "$HAS_REMOTE_BRANCH" = "true" ] && [ -n "$EXISTING_PR" ]; then
+            HUMAN_AUTHORS=$(git log "${BASE_SHA}..origin/${BRANCH}" --format='%an' | grep -vx 'github-actions\[bot\]' || true)
+            if [ -n "$HUMAN_AUTHORS" ]; then
+              echo "::warning::Open PR $EXISTING_PR on $BRANCH contains manual commits ($HUMAN_AUTHORS); skipping force-push to preserve manual work."
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
           EFFECTIVE_DECISION="$DECISION"
@@ -118,9 +149,6 @@ jobs:
             PR_TITLE="[Needs-Review] Pricing update or divergence detected"
           fi
 
-          git commit -m "$COMMIT_MSG"
-          git push --force-with-lease origin "$BRANCH"
-
           BODY_FILE="pricing-pr-body.md"
           node --input-type=module -e '
             import { readFile, writeFile } from "node:fs/promises";
@@ -130,10 +158,53 @@ jobs:
             await writeFile("pricing-pr-body.md", report.summaryMarkdown + extra, "utf8");
           '
 
-          EXISTING_PR=$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // ""')
+          NEED_PUSH=true
+          if [ "$HAS_REMOTE_BRANCH" = "true" ] && [ -n "$EXISTING_PR" ] && git merge-base --is-ancestor "$BASE_SHA" "origin/$BRANCH"; then
+            SEMANTIC_CHANGED=$(node --input-type=module -e '
+              import { execFileSync } from "node:child_process";
+              import { readFileSync } from "node:fs";
+              import { hasSemanticCatalogChanges } from "./tools/auto-update-pricing.mjs";
+              try {
+                const prev = JSON.parse(execFileSync("git", ["show", `origin/${process.argv[1]}:assets/model-catalog.json`], { encoding: "utf8" }));
+                const next = JSON.parse(readFileSync("assets/model-catalog.json", "utf8"));
+                console.log(hasSemanticCatalogChanges(prev, next) ? "true" : "false");
+              } catch {
+                console.log("true");
+              }
+            ' "$BRANCH")
+            if [ "$SEMANTIC_CHANGED" = "false" ]; then
+              NEED_PUSH=false
+              echo "Remote branch $BRANCH already contains semantically identical pricing catalog changes; skipping redundant commit and force-push."
+            fi
+          fi
+
+          if [ "$NEED_PUSH" = "true" ]; then
+            git checkout -B "$BRANCH"
+            git add assets/model-catalog.json assets/pricing-feed.json
+            if git diff --cached --quiet; then
+              echo "No git diff after staging; skipping PR."
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git commit -m "$COMMIT_MSG"
+            git push --force-with-lease origin "$BRANCH"
+          fi
+
           if [ -n "$EXISTING_PR" ]; then
             PR_URL="$EXISTING_PR"
-            gh pr edit "$PR_URL" --title "$PR_TITLE" --body-file "$BODY_FILE"
+            PR_METADATA_CHANGED=$(node --input-type=module -e '
+              import { readFileSync } from "node:fs";
+              const existing = process.argv[1] ? JSON.parse(process.argv[1]) : {};
+              const nextTitle = process.argv[2];
+              const nextBody = readFileSync(process.argv[3], "utf8").trimEnd();
+              const prevBody = String(existing.body ?? "").trimEnd();
+              console.log(existing.title !== nextTitle || prevBody !== nextBody ? "true" : "false");
+            ' "$EXISTING_PR_JSON" "$PR_TITLE" "$BODY_FILE")
+            if [ "$PR_METADATA_CHANGED" = "true" ]; then
+              gh pr edit "$PR_URL" --title "$PR_TITLE" --body-file "$BODY_FILE"
+            else
+              echo "Existing PR title and body are unchanged; skipping gh pr edit."
+            fi
           else
             PR_URL=$(gh pr create --base "${{ github.event.repository.default_branch || github.ref_name }}" --head "$BRANCH" --title "$PR_TITLE" --body-file "$BODY_FILE")
           fi
@@ -143,6 +214,12 @@ jobs:
             if gh pr merge "$PR_URL" --squash --delete-branch; then
               echo "Auto-merged immediately into ${{ github.ref_name }}."
               echo "merged=true" >> "$GITHUB_OUTPUT"
+              PURGE_URL="https://purge.jsdelivr.net/gh/${{ github.repository }}@main/assets/pricing-feed.json"
+              if PURGE_RESP=$(curl -fsS --max-time 15 "$PURGE_URL" 2>&1); then
+                echo "jsDelivr purge succeeded: $PURGE_RESP"
+              else
+                echo "::warning::jsDelivr CDN purge failed for $PURGE_URL: $PURGE_RESP"
+              fi
             elif gh pr merge "$PR_URL" --auto --squash --delete-branch; then
               echo "Enabled auto-merge pending required status checks."
               echo "merged=auto_queued" >> "$GITHUB_OUTPUT"
@@ -154,6 +231,28 @@ jobs:
           else
             echo "merged=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Auto-Close Obsolete Pricing PR When Main Is Already Synced
+        if: inputs.dry_run != true && steps.audit.outputs.files_modified != 'true' && steps.audit.outputs.decision == 'no_change'
+        env:
+          GH_TOKEN: ${{ secrets.PRICING_AUTO_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="chore/auto-pricing-sync"
+          PR_NUMBER=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // ""')
+          if [ -z "$PR_NUMBER" ]; then
+            exit 0
+          fi
+          BASE_SHA=$(git rev-parse HEAD)
+          if git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" 2>/dev/null; then
+            HUMAN_AUTHORS=$(git log "${BASE_SHA}..origin/${BRANCH}" --format='%an' | grep -vx 'github-actions\[bot\]' || true)
+            if [ -n "$HUMAN_AUTHORS" ]; then
+              echo "::warning::Open PR #$PR_NUMBER on $BRANCH contains manual commits ($HUMAN_AUTHORS); skipping auto-close."
+              exit 0
+            fi
+          fi
+          gh pr close "$PR_NUMBER" --delete-branch --comment "当前 \`main\` 分支价格资产已与上游官网及 Antigravity 宿主清单保持一致，本自动 PR 已过时，自动关闭并清理远端分支。"
 
       - name: Open, Update, or Auto-Close Pricing Drift Alert Issue
         if: inputs.dry_run != true
@@ -171,27 +270,40 @@ jobs:
               (Array.isArray(report.yellowItems) && report.yellowItems.length > 0) ||
               (Array.isArray(report.expiring) && report.expiring.length > 0) ||
               (Array.isArray(report.newModelsRadar) && report.newModelsRadar.length > 0);
+            const hasPageAlerts = Array.isArray(report.pageAlerts) && report.pageAlerts.length > 0;
             const needsIssue =
               process.env.DECISION === 'yellow_needs_review' ||
+              process.env.DECISION === 'fetch_failed' ||
               hasPendingReviewItems ||
+              hasPageAlerts ||
               process.env.GATE_PASSED !== 'true';
 
             const existing = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
               state: 'open',
-              per_page: 30,
+              per_page: 100,
             });
-            const match = existing.data.find(issue => issue.title === title);
+            const match = existing.data.find(issue => !issue.pull_request && issue.title === title);
 
             if (needsIssue) {
-              const body = [
-                'Automated daily pricing watch detected rate divergence, unverified new models, or upcoming promotional expiry.',
+              const headerLine = process.env.DECISION === 'fetch_failed'
+                ? 'Automated daily pricing watch failed to fetch or parse one or more upstream pricing pages or Antigravity model docs. Please inspect the alerts below.'
+                : 'Automated daily pricing watch detected rate divergence, unverified new models, or upcoming promotional expiry.';
+              const bodyParts = [headerLine];
+              if (process.env.GATE_PASSED !== 'true') {
+                bodyParts.push(
+                  '',
+                  '> ⚠️ **Pricing Gate Failed**: One or more pricing tests failed after updating `assets/model-catalog.json`. Auto-merge has been blocked for manual review.'
+                );
+              }
+              bodyParts.push(
                 '',
                 report.summaryMarkdown,
                 '',
-                'Please review and run `node tools/sync-pricing-feed.mjs --write` if manually adjusting `assets/model-catalog.json`.',
-              ].join('\n');
+                'Please review and run `node tools/sync-pricing-feed.mjs --write` if manually adjusting `assets/model-catalog.json`.'
+              );
+              const body = bodyParts.join('\n');
 
               if (match) {
                 if (match.body !== body) {

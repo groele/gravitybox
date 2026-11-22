@@ -81,6 +81,15 @@ enum MenuQuotaHelpers {
             icon.setAccessibilityElement(false)
             return icon
         }
+        if views.isEmpty, let fallback = ModelIcons.fallbackIcon(size: iconSize) {
+            let icon = NSImageView(image: fallback)
+            icon.imageScaling = .scaleProportionallyUpOrDown
+            icon.contentTintColor = .secondaryLabelColor
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: iconSize), icon.heightAnchor.constraint(equalToConstant: iconSize)])
+            icon.setAccessibilityElement(false)
+            views.append(icon)
+        }
         let lbl = text(title, size: fontSize, weight: .semibold, color: .secondaryLabelColor)
         lbl.alignment = .left
         views.append(lbl)
@@ -187,19 +196,23 @@ final class MenuSegmentedTabsView: NSView {
     private let slideMotion = DesignMotion()
 
     final class SegmentItemButton: NSButton {
+        override func becomeFirstResponder() -> Bool { let result = super.becomeFirstResponder(); needsDisplay = true; return result }
+        override func resignFirstResponder() -> Bool { let result = super.resignFirstResponder(); needsDisplay = true; return result }
         override var allowsVibrancy: Bool { false }
         let index: Int
         let barStyle: Style
+        weak var owner: MenuSegmentedTabsView?
         var isSelectedSegment = false { didSet { if oldValue != isSelectedSegment { needsDisplay = true } } }
         private var hoverTracking: NSTrackingArea?
         var hovered = false { didSet { if oldValue != hovered { needsDisplay = true } } }
 
-        init(title: String, index: Int, style: Style, target: AnyObject?, action: Selector) {
+        init(title: String, index: Int, style: Style, owner: MenuSegmentedTabsView, action: Selector) {
             self.index = index
             self.barStyle = style
+            self.owner = owner
             super.init(frame: .zero)
             self.title = title
-            self.target = target
+            self.target = owner
             self.action = action
             bezelStyle = .inline
             isBordered = false
@@ -220,6 +233,15 @@ final class MenuSegmentedTabsView: NSView {
         }
         override func mouseEntered(with event: NSEvent) { if isEnabled { hovered = true } }
         override func mouseExited(with event: NSEvent) { hovered = false }
+        override func keyDown(with event: NSEvent) {
+            if event.keyCode == 123 {
+                owner?.moveSelection(by: -1)
+            } else if event.keyCode == 124 {
+                owner?.moveSelection(by: 1)
+            } else {
+                super.keyDown(with: event)
+            }
+        }
 
         override func draw(_ dirtyRect: NSRect) {
             let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
@@ -282,7 +304,7 @@ final class MenuSegmentedTabsView: NSView {
         stack.distribution = style == .compactToggle ? .fillProportionally : .fillEqually
         stack.spacing = 3
         for (idx, item) in items.enumerated() {
-            let btn = SegmentItemButton(title: item, index: idx, style: style, target: self, action: #selector(segmentPressed(_:)))
+            let btn = SegmentItemButton(title: item, index: idx, style: style, owner: self, action: #selector(segmentPressed(_:)))
             btn.isSelectedSegment = (idx == self.selectedIndex)
             btn.setAccessibilityValue(idx == self.selectedIndex ? 1 : 0)
             if style == .compactToggle {
@@ -331,6 +353,17 @@ final class MenuSegmentedTabsView: NSView {
         guard sender.index != selectedIndex else { return }
         setSelected(sender.index)
         onSelect?(sender.index)
+    }
+
+    func moveSelection(by delta: Int) {
+        guard !buttons.isEmpty else { return }
+        let next = max(0, min(buttons.count - 1, selectedIndex + delta))
+        let targetBtn = buttons[next]
+        window?.makeFirstResponder(targetBtn)
+        if next != selectedIndex {
+            setSelected(next)
+            onSelect?(next)
+        }
     }
 
     private func interpolatedThumbRect() -> NSRect {
@@ -1171,7 +1204,7 @@ final class MenuExpandableAccountCardView: NSBox {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func apply(account: [String: Any], isCurrent: Bool, isLiveVerified: Bool, isRecommended: Bool, isExpanded: Bool, reachable: Bool, switchInFlight: Bool, globalBusy: Bool, singleBusy: Bool, singleError: String?) {
+    func apply(account: [String: Any], isCurrent: Bool, isLiveVerified: Bool, isRecommended: Bool, isExpanded: Bool, reachable: Bool, switchInFlight: Bool, globalBusy: Bool, singleBusy: Bool, singleError: String?, singleNotice: String? = nil) {
         let email = account["email"] as? String ?? L10n.t("menu_panel.account_card.unnamed", fallback: "未命名账号")
         fullEmail = email
         let rawName = account["name"] as? String
@@ -1228,6 +1261,8 @@ final class MenuExpandableAccountCardView: NSBox {
         let roleText = isCurrent ? roleCurrentTitle : L10n.t("menu_panel.account_card.backup_account", fallback: "备用账号")
         headerButton.setAccessibilityLabel(L10n.t("menu_panel.account_card.a11y", ["name": display, "email": email, "role": roleText, "summary": summary], fallback: "\(display)，\(email)，\(roleText)，\(summary)"))
 
+        let now = Date()
+        let standbyMode = ((account["standbyRefreshStatus"] as? [String: Any])?["mode"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let contract = QuotaPresentation.contract(account)
         struct DynamicMeterSpec {
             let title: String
@@ -1257,8 +1292,8 @@ final class MenuExpandableAccountCardView: NSBox {
                         groupName: group.displayName,
                         percentage: win.percentage,
                         placeholder: win.placeholder(availability: group.availability),
-                        reset: win.percentage == nil ? "" : win.resetText,
-                        stale: win.stale
+                        reset: win.percentage == nil ? "" : win.effectiveResetText(at: now, standbyMode: standbyMode, compact: true),
+                        stale: win.effectiveStale(at: now)
                     ))
                 }
             }
@@ -1297,18 +1332,48 @@ final class MenuExpandableAccountCardView: NSBox {
             let namesStr = names.isEmpty ? L10n.t("menu_panel.quota.partial_groups", fallback: "部分分组") : names.joined(separator: sep)
             warnings.append(L10n.t("menu_panel.quota.stale_groups", ["names": namesStr], fallback: "部分分组沿用上次记录：\(namesStr)"))
         }
-        warningLabel.stringValue = warnings.joined(separator: L10n.shared.isEnglish ? "; " : "；")
-        warningLabel.isHidden = warnings.isEmpty
+        let contractWarn = QuotaPresentation.warningSummary(contract, excluding: warnings)
+        if !contractWarn.isEmpty {
+            warnings.append(contractWarn)
+        }
+        if !warnings.isEmpty {
+            warningLabel.stringValue = warnings.joined(separator: L10n.shared.isEnglish ? "; " : "；")
+            warningLabel.textColor = accessibleWarningColor()
+            warningLabel.isHidden = false
+        } else if let singleNotice = singleNotice?.trimmingCharacters(in: .whitespacesAndNewlines), !singleNotice.isEmpty {
+            warningLabel.stringValue = singleNotice
+            warningLabel.textColor = .secondaryLabelColor
+            warningLabel.isHidden = false
+        } else {
+            warningLabel.stringValue = ""
+            warningLabel.isHidden = true
+        }
 
         let quota = account["quota"] as? [String: Any]
         let stamp = QuotaPresentation.number(quota?["last_updated"]) ?? QuotaPresentation.number(account["quota_last_updated"]) ?? 0
-        if stamp > 0 {
+        if standbyMode == "snapshot_cooldown_elapsed" {
+            timestampLabel.stringValue = L10n.t("accounts.standby.reset_passed", fallback: "已到重置时间 · 切换后更新")
+            timestampLabel.textColor = Design.blue
+            timestampLabel.toolTip = L10n.t("accounts.standby.multi_device_hint")
+            timestampLabel.isHidden = false
+        } else if standbyMode == "snapshot_cooling", stamp > 0 {
+            let date = Date(timeIntervalSince1970: stamp)
+            let fmt = Calendar.current.isDateInToday(date) ? Self.todayFormatter : Self.dateFormatter
+            timestampLabel.stringValue = L10n.t("accounts.standby.recorded_at", ["time": fmt.string(from: date)], fallback: "记录于 \(fmt.string(from: date)) · 切换后同步")
+            timestampLabel.textColor = .secondaryLabelColor
+            timestampLabel.toolTip = L10n.t("accounts.standby.multi_device_hint")
+            timestampLabel.isHidden = false
+        } else if stamp > 0 {
             let date = Date(timeIntervalSince1970: stamp)
             let fmt = Calendar.current.isDateInToday(date) ? Self.todayFormatter : Self.dateFormatter
             timestampLabel.stringValue = L10n.t("common.updated_at", ["time": fmt.string(from: date)], fallback: "更新于 \(fmt.string(from: date))")
+            timestampLabel.textColor = Design.secondary
+            timestampLabel.toolTip = nil
             timestampLabel.isHidden = false
         } else {
             timestampLabel.stringValue = ""
+            timestampLabel.textColor = Design.secondary
+            timestampLabel.toolTip = nil
             timestampLabel.isHidden = true
         }
 
@@ -1348,7 +1413,77 @@ final class MenuExpandableAccountCardView: NSBox {
     }
 }
 
+final class MenuPanelRimOverlayView: NSView {
+    private let cornerRadius: CGFloat
+
+    init(cornerRadius: CGFloat) {
+        self.cornerRadius = cornerRadius
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+    override var isOpaque: Bool { false }
+    override var allowsVibrancy: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard bounds.width > 2, bounds.height > 2 else { return }
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let outerColor = isDark
+                ? NSColor.black.withAlphaComponent(0.45)
+                : NSColor.black.withAlphaComponent(0.11)
+            let outerRadius = max(1, cornerRadius - 0.25)
+            let outerPath = NSBezierPath(
+                roundedRect: bounds.insetBy(dx: 0.25, dy: 0.25),
+                xRadius: outerRadius,
+                yRadius: outerRadius
+            )
+            outerPath.lineWidth = 0.5
+            outerColor.setStroke()
+            outerPath.stroke()
+
+            let innerColor = isDark
+                ? NSColor.white.withAlphaComponent(0.16)
+                : NSColor.white.withAlphaComponent(0.55)
+            let innerRadius = max(1, cornerRadius - 0.75)
+            let innerPath = NSBezierPath(
+                roundedRect: bounds.insetBy(dx: 0.75, dy: 0.75),
+                xRadius: innerRadius,
+                yRadius: innerRadius
+            )
+            innerPath.lineWidth = 0.5
+            innerColor.setStroke()
+            innerPath.stroke()
+        }
+    }
+}
+
 final class MenuPanelRootView: NSVisualEffectView {
+    static let cornerRadius: CGFloat = Design.Radius.card
+
+    private static let cachedCornerMaskImage: NSImage = {
+        let r = cornerRadius
+        let dim = r * 2 + 2
+        let img = NSImage(size: NSSize(width: dim, height: dim), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: r, yRadius: r).fill()
+            return true
+        }
+        img.capInsets = NSEdgeInsets(top: r, left: r, bottom: r, right: r)
+        img.resizingMode = .stretch
+        img.isTemplate = false
+        return img
+    }()
+
+    let rimOverlay = MenuPanelRimOverlayView(cornerRadius: MenuPanelRootView.cornerRadius)
+
     override var allowsVibrancy: Bool { false }
     init() {
         super.init(frame: .zero)
@@ -1356,15 +1491,66 @@ final class MenuPanelRootView: NSVisualEffectView {
         blendingMode = .behindWindow
         state = .active
         wantsLayer = true
+        maskImage = Self.cachedCornerMaskImage
     }
     required init?(coder: NSCoder) { fatalError() }
     override var isOpaque: Bool { false }
+
+    func installRimOverlay() {
+        if rimOverlay.superview === self {
+            if subviews.last !== rimOverlay {
+                rimOverlay.removeFromSuperview()
+            } else {
+                return
+            }
+        }
+        rimOverlay.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(rimOverlay)
+        NSLayoutConstraint.activate([
+            rimOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            rimOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            rimOverlay.topAnchor.constraint(equalTo: topAnchor),
+            rimOverlay.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        rimOverlay.needsDisplay = true
+    }
 }
 
 final class MenuPanelFooterHostView: NSView {
     override var allowsVibrancy: Bool { false }
     override var isOpaque: Bool { false }
     override func draw(_ dirtyRect: NSRect) {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        let r = min(MenuPanelRootView.cornerRadius, min(bounds.width / 2, bounds.height))
+        if r > 0 {
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: bounds.minX, y: bounds.maxY))
+            path.line(to: NSPoint(x: bounds.minX, y: bounds.minY + r))
+            path.appendArc(
+                withCenter: NSPoint(x: bounds.minX + r, y: bounds.minY + r),
+                radius: r,
+                startAngle: 180,
+                endAngle: 270,
+                clockwise: false
+            )
+            path.line(to: NSPoint(x: bounds.maxX - r, y: bounds.minY))
+            path.appendArc(
+                withCenter: NSPoint(x: bounds.maxX - r, y: bounds.minY + r),
+                radius: r,
+                startAngle: 270,
+                endAngle: 360,
+                clockwise: false
+            )
+            path.line(to: NSPoint(x: bounds.maxX, y: bounds.maxY))
+            path.close()
+            path.addClip()
+        }
         Design.popoverFooterBackground.setFill()
         bounds.fill()
     }

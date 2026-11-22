@@ -50,6 +50,8 @@ export const HUD_STYLES_CSS = `
   --hud-compaction-danger-fg: #FFFFFF;
   --hud-compaction-danger-border: transparent;
   --hud-compaction-danger-shadow: 0 1px 2px rgba(185, 28, 28, 0.30), inset 0 0.5px 0 rgba(255, 255, 255, 0.24);
+  --hud-role-badge-bg: rgba(10, 10, 12, 0.055);
+  --hud-role-badge-fg: #52525B;
 
   /* 骨架屏扫描动效 Tokens (Light) */
   --hud-skeleton-base: rgba(10, 10, 12, 0.04);
@@ -113,6 +115,8 @@ export const HUD_STYLES_CSS = `
   --hud-compaction-danger-fg: #FFFFFF;
   --hud-compaction-danger-border: transparent;
   --hud-compaction-danger-shadow: 0 1px 3px rgba(239, 68, 68, 0.36), inset 0 0.5px 0 rgba(255, 255, 255, 0.26);
+  --hud-role-badge-bg: rgba(255, 255, 255, 0.08);
+  --hud-role-badge-fg: #A1A1AA;
 
   /* 骨架屏扫描动效 Tokens (Dark) */
   --hud-skeleton-base: rgba(255, 255, 255, 0.05);
@@ -842,6 +846,52 @@ export const HUD_STYLES_CSS = `
   font-weight: 600;
   color: var(--hud-text-primary);
   font-variant-numeric: tabular-nums;
+}
+
+#hud-popover-context .hud-popover-header {
+  flex-wrap: nowrap;
+  gap: 6px;
+}
+
+#hud-popover-context .hud-popover-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+#hud-popover-context #pop-ctx-prefix {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#hud-popover-context #pop-ctx-pct,
+#hud-popover-context #pop-ctx-capacity {
+  flex: 0 0 auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.hud-role-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1.5px 5px;
+  border-radius: 4px;
+  background-color: var(--hud-role-badge-bg);
+  color: var(--hud-role-badge-fg);
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  flex-shrink: 0;
+}
+
+.hud-role-badge[hidden] {
+  display: none !important;
 }
 
 .hud-popover-badge {

@@ -1,7 +1,18 @@
 import Cocoa
 import UniformTypeIdentifiers
 
+#if NATIVE_UI_TEST
+var saveUsageJSONTestHook: (([String: Any], String) -> Bool)?
+#endif
+
 func saveUsageJSON(_ report: [String: Any], name: String, window: NSWindow, app: Assistant, onCompletion: ((Bool) -> Void)? = nil) {
+    #if NATIVE_UI_TEST
+    if let hook = saveUsageJSONTestHook {
+        let ok = hook(report, name)
+        onCompletion?(ok)
+        return
+    }
+    #endif
     let panel = NSSavePanel(); panel.allowedContentTypes = [.json]; panel.nameFieldStringValue = name
     panel.beginSheetModal(for: window) { response in
         guard response == .OK, let url = panel.url else {
@@ -33,7 +44,7 @@ func saveUsageJSON(_ report: [String: Any], name: String, window: NSWindow, app:
 typealias PageNumberField = PolicyNumberField
 
 final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSTextFieldDelegate {
-    unowned let app: Assistant
+    weak var app: Assistant?
     let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 540), styleMask: [.titled], backing: .buffered, defer: false)
     let search = NSSearchField()
     let searchSpinner = NSProgressIndicator()
@@ -201,6 +212,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         table.reloadData()
     }
     func show(in window: NSWindow, onDismiss: @escaping () -> Void) {
+        guard let app else { onDismiss(); return }
         self.onDismiss = onDismiss
         app.presentRetainedSheet(controller: self, sheet: sheet, in: window) { [weak self] _ in
             self?.onDismiss?()
@@ -209,11 +221,11 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
     }
     @objc func reloadSnapshot() {
         guard !loading, !exporting else { return }
-        if let snapshotID { app.bridge.send(["command":"usage_snapshot_release","snapshotId":snapshotID]) { _ in } }
+        if let snapshotID { app?.bridge.send(["command":"usage_snapshot_release","snapshotId":snapshotID]) { _ in } }
         snapshotID = nil; offset = 0; fetch(force: true)
     }
     @objc func closeSheet() {
-        if let snapshotID { app.bridge.send(["command":"usage_snapshot_release","snapshotId":snapshotID]) { _ in } }
+        if let snapshotID { app?.bridge.send(["command":"usage_snapshot_release","snapshotId":snapshotID]) { _ in } }
         snapshotID = nil; closed = true; requestRevision += 1; searchDebounce?.cancel(); sheet.sheetParent?.endSheet(sheet) }
     @objc func periodChanged() { offset = 0; fetch() }
     func controlTextDidChange(_ obj: Notification) {
@@ -290,6 +302,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
     }
 
     func fetch(force: Bool = false, fromSearch: Bool = false) {
+        guard let app else { return }
         searchDebounce?.cancel(); loading = true; pageNumber.isEnabled = false
         refreshButton.setBusy(true, available: app.reachable)
         if fromSearch {
@@ -313,11 +326,11 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         app.bridge.send(payload) { [weak self] response in
             guard let self else { return }
             guard !self.closed, revision == self.requestRevision else {
-                if acquiring, case .success(let value) = response, let id = value["snapshot_id"] as? String { self.app.bridge.send(["command":"usage_snapshot_release","snapshotId":id]) { _ in } }
+                if acquiring, case .success(let value) = response, let id = value["snapshot_id"] as? String { self.app?.bridge.send(["command":"usage_snapshot_release","snapshotId":id]) { _ in } }
                 return
             }
             self.loading = false
-            self.refreshButton.setBusy(false, available: self.app.reachable)
+            self.refreshButton.setBusy(false, available: self.app?.reachable ?? false)
             self.searchSpinner.stopAnimation(nil); self.searchSpinner.isHidden = true
             switch response {
             case .failure(let error):
@@ -366,14 +379,14 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
                 self.exportButton.isEnabled = self.total > 0 && self.snapshotID != nil && (value["availability"] as? String) != "unavailable"
                 self.updateEmptyState(); self.scroll.contentView.scroll(to:.zero); self.scroll.reflectScrolledClipView(self.scroll.contentView)
                 if force {
-                    self.app.usagePage?.update(force: false)
+                    self.app?.usagePage?.update(force: false)
                 }
             }
         }
     }
     private var exporting = false
     @objc func exportRows() {
-        guard !exporting, !loading, total > 0 else { return }
+        guard !exporting, !loading, total > 0, app != nil else { return }
         exporting = true
         refreshButton.isEnabled = false
         exportButton.isEnabled = false
@@ -386,7 +399,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
         var collected: [[String: Any]] = []; var generation: Int?; var snapshotID: String? = self.snapshotID; var scope = ""
         func finishExport(errorMsg: String? = nil) {
             exporting = false
-            refreshButton.setBusy(false, available: app.reachable)
+            refreshButton.setBusy(false, available: app?.reachable ?? false)
             exportButton.isEnabled = total > 0 && self.snapshotID != nil
             pageNumber.isEnabled = total > 0
             period.isEnabled = true
@@ -398,14 +411,27 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
             }
         }
         func readPage() {
+            guard !closed, let activeApp = app else {
+                finishExport(errorMsg: L10n.t("usage_log.export.snapshot_changed"))
+                return
+            }
             var payload:[String:Any] = ["command":"usage_events","period":chosenPeriod,"query":query,"offset":collected.count,"limit":500]
             if let snapshotID { payload["snapshotId"] = snapshotID }
-            app.bridge.send(payload) { [weak self] result in
+            activeApp.bridge.send(payload) { [weak self] result in
                 guard let self, !self.closed else { return }
+                guard let currentApp = self.app else {
+                    finishExport(errorMsg: L10n.t("usage_log.export.snapshot_changed"))
+                    return
+                }
                 switch result {
                 case .failure(let error):
                     finishExport(errorMsg: L10n.t("usage_log.export.failed", ["error": error.localizedDescription]))
                 case .success(let value):
+                    let retPeriod = (value["period"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !retPeriod.isEmpty && retPeriod != chosenPeriod {
+                        finishExport(errorMsg: L10n.t("usage_log.export.snapshot_changed"))
+                        return
+                    }
                     let returnedID = value["snapshot_id"] as? String
                     guard let returnedID, !returnedID.isEmpty, snapshotID == nil || snapshotID == returnedID else { finishExport(errorMsg: L10n.t("usage_log.export.snapshot_changed")); return }
                     snapshotID = returnedID
@@ -424,7 +450,7 @@ final class UsageLogController: NSObject, NSTableViewDataSource, NSTableViewDele
                         let exportedCount = collected.count
                         let fallbackScope = scope.isEmpty ? L10n.t("usage_log.scope.default") : scope
                         self.status.stringValue = L10n.t("usage_log.export.choose_location", ["count": InterfaceText.formatInteger(exportedCount)])
-                        saveUsageJSON(["period": chosenPeriod, "query": query, "scope": scope, "generatedAt": stamp, "snapshotId":snapshotID ?? "", "rows": collected], name: L10n.t("usage_log.export.filename", ["period": chosenPeriod]), window: self.sheet, app: self.app) { [weak self] saved in
+                        saveUsageJSON(["period": chosenPeriod, "query": query, "scope": scope, "generatedAt": stamp, "snapshotId":snapshotID ?? "", "rows": collected], name: L10n.t("usage_log.export.filename", ["period": chosenPeriod]), window: self.sheet, app: currentApp) { [weak self] saved in
                             guard let self, !self.closed else { return }
                             finishExport()
                             if saved {

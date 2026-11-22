@@ -138,25 +138,23 @@ export function decodeKeyringPayload(pass: string | null | undefined): any | nul
 }
 
 /**
- * 将指定账号写入系统 Keychain (gemini/antigravity) 免密持久化
+ * 构造官方 Go 端 (macOS Keychain & agy CLI) 通用 oauth2.Token JSON 载荷
  */
-export async function syncAccountToKeychain(
-  acc: KeychainSyncAccount,
-  keychain: KeychainAdapter = new SystemKeychainAdapter()
-): Promise<void> {
+export function buildGoOauthPayload(acc: KeychainSyncAccount): string {
   // 官方 Go 端按 oauth2.Token 解析：缺少 `expiry` 会被视为永不过期，从而永不刷新（约 1 小时后 401 并跳登录页）。
   // 因此必须写入 RFC3339 `expiry`；旧字段保留供 GravityBox 自身读取与回滚。
   const expirySec = Number(acc.token.expiry_timestamp);
-  const expiry = Number.isFinite(expirySec) && expirySec > 0 ? new Date(expirySec * 1000).toISOString() : undefined;
-  const expiresIn = expirySec > 0 ? Math.max(0, Math.floor(expirySec - Date.now() / 1000)) : acc.token.expires_in;
-  const payload = JSON.stringify({
+  const expiry = Number.isFinite(expirySec) && expirySec > 0 ? new Date(expirySec * 1000).toISOString() : new Date(0).toISOString();
+  const expiresIn = expirySec > 0 ? Math.max(0, Math.floor(expirySec - Date.now() / 1000)) : (acc.token.expires_in ?? 0);
+  const accessToken = acc.token.access_token && acc.token.access_token !== 'pending_refresh' ? acc.token.access_token : '';
+  return JSON.stringify({
     token: {
-      access_token: acc.token.access_token,
+      access_token: accessToken,
       token_type: acc.token.token_type || 'Bearer',
       refresh_token: acc.token.refresh_token,
       expiry,
       expires_in: expiresIn,
-      expiry_timestamp: acc.token.expiry_timestamp,
+      expiry_timestamp: Number.isFinite(expirySec) && expirySec > 0 ? expirySec : 0,
       email: acc.email,
       project_id: acc.token.project_id,
       is_gcp_tos: acc.token.is_gcp_tos,
@@ -165,6 +163,16 @@ export async function syncAccountToKeychain(
     ...(acc.token.is_gcp_tos ? {} : { auth_method: 'consumer' }),
     id_token_email: acc.email,
   });
+}
+
+/**
+ * 将指定账号写入系统 Keychain (gemini/antigravity) 免密持久化
+ */
+export async function syncAccountToKeychain(
+  acc: KeychainSyncAccount,
+  keychain: KeychainAdapter = new SystemKeychainAdapter()
+): Promise<void> {
+  const payload = buildGoOauthPayload(acc);
   if (IS_WINDOWS && keychain instanceof SystemKeychainAdapter) {
     // Windows go-keyring stores raw UTF-8 JSON in Generic CredentialBlob without base64 wrapper.
     await keychain.writePassword('gemini', 'antigravity', payload);

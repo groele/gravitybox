@@ -5,10 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountsManager } from '../dist/accounts.js';
 import {
+  accountCredentialReadiness,
   buildAccountQuotaOverview,
   computeAccountRemaining,
   resolveEffectiveMonitoredModel,
+  subscriptionTierRank,
 } from '../dist/account-quota.js';
+import { normalizeCatalogTierLabel } from '../dist/pricing.js';
+import { resolveUnsavedLiveSubscriptionTier } from '../dist/main.js';
 import {
   projectAccountForIpcNormalized,
   projectQuotaContract,
@@ -335,7 +339,7 @@ test('旧快照中遗留的 ARGON_MODEL_QUOTA / MISSING_FAMILY:argon 在 unified
       ],
       models: [
         { name: 'gemini-4-argon', model_id: 'gemini-4-argon', display_name: 'Gemini 4 Argon', family: 'argon', is_argon: true, quota_bucket_name: 'Gemini Models', percentage: 85, percentage_known: true, own_percentage: 85, own_percentage_known: true, own_reset_time: reset, reset_time: reset },
-        { name: 'gemini-4-xenon', model_id: 'gemini-4-xenon', display_name: 'Gemini 4 Xenon', family: 'other', percentage: 42, percentage_known: true, own_percentage: 42, own_percentage_known: true, own_reset_time: reset, reset_time: reset },
+        { name: 'gemini-4-xenon', model_id: 'gemini-4-xenon', display_name: 'Gemini 4 Xenon', family: 'other', quota_bucket_name: 'Gemini 4 Xenon', percentage: 42, percentage_known: true, own_percentage: 42, own_percentage_known: true, own_reset_time: reset, reset_time: reset },
       ],
     },
   });
@@ -539,7 +543,7 @@ test('Ultra 账号实机双接口漂移回归：120s 满额重置偏移、对话
         { name: 'gemini-3.8-flash-high', model_id: 'gemini-3.8-flash-high', display_name: 'Gemini 3.8 Flash (High)', family: 'gemini', percentage: 88, percentage_known: true, own_percentage: 88, own_percentage_known: true, own_reset_time: resetWeekly, own_observed_at: nowSec, reset_time: resetWeekly, quota_source: 'cloud' },
         { name: 'gemini-4-argon', model_id: 'gemini-4-argon', display_name: 'Gemini 4 Argon', family: 'argon', is_argon: true, quota_bucket_name: 'Gemini 4 Argon', percentage: 88, percentage_known: true, own_percentage: 88, own_percentage_known: true, own_reset_time: resetWeekly, own_observed_at: nowSec, reset_time: resetWeekly, quota_source: 'cloud' },
         { name: 'gemini-4-carbon', model_id: 'gemini-4-carbon', display_name: 'Gemini 4 Carbon', family: 'carbon', is_carbon: true, quota_bucket_name: null, percentage: 55, percentage_known: true, own_percentage: 55, own_percentage_known: true, own_reset_time: reset7d, own_observed_at: nowSec, reset_time: reset7d, quota_source: 'cloud' },
-        { name: 'gemini-4-xenon', model_id: 'gemini-4-xenon', display_name: 'Gemini 4 Xenon', family: 'other', quota_bucket_name: null, percentage: 42, percentage_known: true, own_percentage: 42, own_percentage_known: true, own_reset_time: reset7d, own_observed_at: nowSec, reset_time: reset7d, quota_source: 'cloud' },
+        { name: 'gemini-4-xenon', model_id: 'gemini-4-xenon', display_name: 'Gemini 4 Xenon', family: 'other', quota_bucket_name: 'Gemini 4 Xenon', percentage: 42, percentage_known: true, own_percentage: 42, own_percentage_known: true, own_reset_time: reset7d, own_observed_at: nowSec, reset_time: reset7d, quota_source: 'cloud' },
       ],
     },
   };
@@ -923,7 +927,678 @@ test('1.1.1 终审回归: computeAccountRemaining 含 Argon 别名对齐与云�
   assert.equal(partialRefreshed.quota?.subscription_tier, 'PRO', '不完整云端回退刷新不得把已存 PRO 误降级为 FREE');
 });
 
+test('新代号模型归入 Gemini 池（不再凭代号硬踢为 other）、编排器元模型识别与跨套餐动态兜底', async t => {
+  const { classifyFamily, isOrchestratorMetaModel } = await import('../dist/quota.js');
+  assert.equal(classifyFamily({ modelId: 'gemini-4-neon', displayName: 'Gemini 4 Neon' }), 'gemini');
+  assert.equal(classifyFamily({ modelId: 'gemini-5-nova', displayName: 'Gemini 5 Nova' }), 'gemini');
+  assert.equal(classifyFamily({ modelId: 'gemini-pro-orchestrator-neon', displayName: 'Orchestrator (Neon)' }), 'gemini');
+  assert.equal(classifyFamily({ modelId: 'gemini-pro-orchestrator-neon' }), 'gemini');
+  assert.equal(classifyFamily({ modelId: 'opaque-google-id', modelProvider: 'MODEL_PROVIDER_GOOGLE' }), 'gemini');
+  assert.equal(classifyFamily({ modelId: 'opaque-anthropic-id', modelProvider: 'MODEL_PROVIDER_ANTHROPIC' }), 'claude');
+  assert.equal(classifyFamily({ modelId: 'opaque-openai-id', modelProvider: 'MODEL_PROVIDER_OPENAI' }), 'claude');
 
+  assert.equal(isOrchestratorMetaModel('gemini-pro-coordinator'), true);
+  assert.equal(isOrchestratorMetaModel('gemini-pro-orchestrator'), true);
+  assert.equal(isOrchestratorMetaModel('gemini-pro-orchestrator-neon', 'Orchestrator (Neon)'), true);
+  assert.equal(isOrchestratorMetaModel('any-id', 'Orchestrator (Carbon)'), true);
+  assert.equal(isOrchestratorMetaModel('any-id', 'Orchestrator Neon'), true);
+  assert.equal(isOrchestratorMetaModel('gemini-4-neon', 'Gemini 4 Neon'), false);
 
+  const nowSec = Math.floor(Date.now() / 1000);
+  const reset5h = new Date((nowSec + 3600) * 1000).toISOString();
+  const reset7d = new Date((nowSec + 7 * 86400) * 1000).toISOString();
 
+  // 1. Pro 下拥有显式独立 quota_bucket_name: "Gemini 4 Neon" 时仍识别为独立池
+  const proWithNeon = {
+    id: 'pro-neon',
+    email: 'pro-neon@example.invalid',
+    disabled: false,
+    protected_models: [],
+    created_at: nowSec,
+    last_used: nowSec,
+    quota: {
+      subscription_tier: 'PRO',
+      source: 'cloud',
+      last_updated: nowSec,
+      is_forbidden: false,
+      model_forwarding_rules: {},
+      quota_groups: [
+        {
+          display_name: 'Gemini Models',
+          family: 'gemini',
+          buckets: [{ bucket_id: 'g-5h', window: '5h', remaining_fraction: 1, remaining_fraction_known: true, reset_time: '' }],
+        },
+      ],
+      models: [
+        { name: 'gemini-3.8-flash', model_id: 'gemini-3.8-flash', family: 'gemini', percentage: 100, percentage_known: true, own_percentage: 100, own_percentage_known: true, own_reset_time: '', reset_time: '' },
+        { name: 'gemini-4-neon-high', model_id: 'gemini-4-neon-high', display_name: 'Gemini 4 Neon (High)', quota_bucket_name: 'Gemini 4 Neon', percentage: 100, percentage_known: true, own_percentage: 100, own_percentage_known: true, own_reset_time: '', reset_time: '' },
+      ],
+    },
+  };
+  const proOverview = buildAccountQuotaOverview(proWithNeon);
+  assert.deepEqual(proOverview.standaloneModels.map(m => m.key), ['gemini-4-neon']);
+  assert.equal(resolveEffectiveMonitoredModel(proWithNeon, 'gemini-4-neon'), 'gemini-4-neon');
+  assert.equal(computeAccountRemaining(proWithNeon, 'gemini-4-neon'), 100);
 
+  // 2. 切到 Ultra（Neon 已并入 Gemini 池）与 Free（无 Neon 权限）时，运行时自动映射/兜底至 gemini，且编排器绝不生成独立池
+  const ultraWithPooledNeon = {
+    id: 'ultra-neon',
+    email: 'ultra-neon@example.invalid',
+    disabled: false,
+    protected_models: [],
+    created_at: nowSec,
+    last_used: nowSec,
+    quota: {
+      subscription_tier: 'ULTRA',
+      source: 'live',
+      last_updated: nowSec,
+      is_forbidden: false,
+      model_forwarding_rules: {},
+      quota_groups: [
+        {
+          display_name: 'Gemini Models',
+          description: 'Models within this group: Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Argon, Gemini 3.8 Flash',
+          family: 'gemini',
+          buckets: [{ bucket_id: 'g-5h', window: '5h', remaining_fraction: 0.72, remaining_fraction_known: true, reset_time: reset5h }],
+        },
+      ],
+      models: [
+        { name: 'gemini-3.8-flash', model_id: 'gemini-3.8-flash', family: 'gemini', percentage: 72, percentage_known: true, own_percentage: 72, own_percentage_known: true, own_reset_time: reset5h, reset_time: reset5h },
+        { name: 'gemini-4-neon-high', model_id: 'gemini-4-neon-high', display_name: 'Gemini 4 Neon (High)', percentage: 72, percentage_known: true, own_percentage: 72, own_percentage_known: true, own_reset_time: reset5h, reset_time: reset5h },
+        { name: 'gemini-pro-orchestrator-neon', model_id: 'gemini-pro-orchestrator-neon', display_name: 'Orchestrator (Neon)', percentage: 100, percentage_known: true, own_percentage: 100, own_percentage_known: true, own_reset_time: reset7d, reset_time: reset7d },
+      ],
+    },
+  };
+  const freeWithoutNeon = {
+    id: 'free-no-neon',
+    email: 'free@example.invalid',
+    disabled: false,
+    protected_models: [],
+    created_at: nowSec,
+    last_used: nowSec,
+    quota: {
+      subscription_tier: 'FREE',
+      source: 'cloud',
+      last_updated: nowSec,
+      is_forbidden: false,
+      model_forwarding_rules: {},
+      quota_groups: [
+        {
+          display_name: 'Gemini Models',
+          family: 'gemini',
+          buckets: [{ bucket_id: 'g-wk', window: 'weekly', remaining_fraction: 0.05, remaining_fraction_known: true, reset_time: reset7d }],
+        },
+      ],
+      models: [
+        { name: 'gemini-3.8-flash', model_id: 'gemini-3.8-flash', family: 'gemini', percentage: 5, percentage_known: true, own_percentage: 5, own_percentage_known: true, own_reset_time: reset7d, reset_time: reset7d },
+        { name: 'gemini-4-neon', model_id: 'gemini-4-neon', disabled: true, percentage: 0, percentage_known: false, reset_time: '' },
+      ],
+    },
+  };
+
+  assert.deepEqual(buildAccountQuotaOverview(ultraWithPooledNeon).standaloneModels, []);
+  assert.equal(resolveEffectiveMonitoredModel(ultraWithPooledNeon, 'gemini-4-neon'), 'gemini');
+  assert.equal(resolveEffectiveMonitoredModel(freeWithoutNeon, 'gemini-4-neon'), 'gemini');
+  assert.equal(computeAccountRemaining(ultraWithPooledNeon, 'gemini-4-neon'), 72);
+  assert.equal(computeAccountRemaining(freeWithoutNeon, 'gemini-4-neon'), null);
+});
+
+test('OPT-03 & OPT-10：错误码透传防超时误判重新授权、PRO 词边界、hydrogen 品牌与未保存层级对称对齐', async (t) => {
+  const { manager, acc } = await createTempManager(t);
+  acc.quota_refresh_error = 'context deadline expired';
+  acc.quota_refresh_error_code = 'network';
+  await manager.saveAccount(acc);
+
+  // 验证 saveAccount -> loadIndex -> listAccounts 全链路保留 quota_refresh_error_code 且不误判 needs_authorization
+  const listed = await manager.listAccounts();
+  const item = listed.accounts.find(a => a.id === acc.id);
+  assert.equal(item?.quota_refresh_error_code, 'network');
+  assert.notEqual(item?.credentialReadiness?.state, 'needs_authorization');
+
+  // 显式鉴权失败码仍判 needs_authorization
+  assert.equal(
+    accountCredentialReadiness({
+      ...acc,
+      quota_refresh_error_code: 'refresh_failed',
+      quota_refresh_error: 'transient text',
+    }).state,
+    'needs_authorization'
+  );
+  // 无结构化错误码时，TLS 证书过期不误判，refresh token 过期正确判 needs_authorization
+  assert.notEqual(
+    accountCredentialReadiness({
+      ...acc,
+      quota_refresh_error_code: null,
+      quota_refresh_error: 'TLS certificate has expired',
+    }).state,
+    'needs_authorization'
+  );
+  assert.equal(
+    accountCredentialReadiness({
+      ...acc,
+      quota_refresh_error_code: null,
+      quota_refresh_error: 'refresh token has expired',
+    }).state,
+    'needs_authorization'
+  );
+
+  // OPT-10：PRO 词边界防护 & hydrogen 品牌映射 & 未保存账号层级对称判定
+  assert.equal(normalizeCatalogTierLabel('Prototype Internal'), '');
+  assert.equal(normalizeCatalogTierLabel('Google AI Pro'), 'PRO');
+  assert.notEqual(subscriptionTierRank({ quota: { subscription_tier: 'Prototype' } }), 3);
+  assert.equal(subscriptionTierRank({ quota: { subscription_tier: 'PRO' } }), 3);
+
+  assert.equal(
+    resolveUnsavedLiveSubscriptionTier(
+      { tier: 'FREE', accountType: 'consumer' },
+      { subscriptionTier: 'FREE', models: [{ name: 'gemini-3.8-flash' }] }
+    ),
+    'FREE'
+  );
+  assert.equal(
+    resolveUnsavedLiveSubscriptionTier(
+      { tier: 'FREE', accountType: 'enterprise_vertex' },
+      { subscriptionTier: 'FREE', models: [{ name: 'gemini-3.8-flash' }] }
+    ),
+    '待确认'
+  );
+});
+
+test('2.34.0 实机污染快照零刷新自愈：Orchestrator (Neon) 与 family:other 的 Gemini 4 Neon 立即收敛为 2 组核心池', async () => {
+  const { computeAccountRevision } = await import('../dist/account-quota.js');
+  const nowSec = Math.floor(Date.now() / 1000);
+  const nowMs = nowSec * 1000;
+  const reset5h = new Date(nowMs + 4 * 3600 * 1000 + 25 * 60 * 1000).toISOString();
+  const resetWeekly = new Date(nowMs + 4 * 86400 * 1000).toISOString();
+  const staleOrchReset = new Date(nowMs + 3 * 3600 * 1000 + 48 * 60 * 1000).toISOString();
+  const staleObserved = nowSec - 1200;
+
+  // 精确复现 #5 实机 accounts/<id>.json 污染结构
+  const pollutedAccount = {
+    id: '2e6ef14c-polluted',
+    email: 'ultra-real@example.invalid',
+    disabled: false,
+    protected_models: [],
+    created_at: nowSec - 86400,
+    last_used: nowSec,
+    quota: {
+      subscription_tier: 'ULTRA',
+      source: 'cloud',
+      last_updated: nowSec,
+      is_forbidden: false,
+      model_forwarding_rules: {},
+      quota_groups: [
+        {
+          display_name: 'Gemini Models',
+          description: 'Models within this group: Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, Gemini 3.8 Flash',
+          family: 'gemini',
+          observed_at: nowSec,
+          source: 'cloud',
+          buckets: [
+            { bucket_id: 'gemini-5h', window: '5h', remaining_fraction: 0.98, remaining_fraction_known: true, reset_time: reset5h, observed_at: nowSec, source: 'cloud' },
+            { bucket_id: 'gemini-weekly', window: 'weekly', remaining_fraction: 0.46, remaining_fraction_known: true, reset_time: resetWeekly, observed_at: nowSec, source: 'cloud' },
+          ],
+        },
+        {
+          display_name: 'Claude and GPT models',
+          description: 'Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B',
+          family: 'claude',
+          observed_at: nowSec,
+          source: 'cloud',
+          buckets: [
+            { bucket_id: '3p-5h', window: '5h', remaining_fraction: 1, remaining_fraction_known: true, reset_time: reset5h, observed_at: nowSec, source: 'cloud' },
+            { bucket_id: '3p-weekly', window: 'weekly', remaining_fraction: 0.92, remaining_fraction_known: true, reset_time: resetWeekly, observed_at: nowSec, source: 'cloud' },
+          ],
+        },
+      ],
+      models: [
+        {
+          name: 'gemini-pro-orchestrator-neon',
+          model_id: 'gemini-pro-orchestrator-neon',
+          model_or_alias: 'MODEL_PLACEHOLDER_M537',
+          display_name: 'Orchestrator (Neon)',
+          family: 'other',
+          quota_source: 'carried',
+          stale: true,
+          own_stale: true,
+          recommended: false,
+          disabled: null,
+          own_percentage: 100,
+          own_percentage_known: true,
+          percentage: 0,
+          percentage_known: false,
+          own_observed_at: staleObserved,
+          own_reset_time: staleOrchReset,
+          reset_time: '',
+          family_5h: null,
+          family_weekly: null,
+        },
+        {
+          name: 'gemini-4-neon-high',
+          model_id: 'gemini-4-neon-high',
+          model_or_alias: 'MODEL_PLACEHOLDER_M534',
+          display_name: 'Gemini 4 Neon (High)',
+          family: 'other',
+          quota_source: 'cloud',
+          stale: false,
+          own_stale: false,
+          disabled: false,
+          own_percentage: 98,
+          own_percentage_known: true,
+          percentage: 98,
+          percentage_known: true,
+          own_observed_at: nowSec,
+          own_reset_time: reset5h,
+          reset_time: reset5h,
+          family_5h: null,
+          family_weekly: null,
+        },
+        {
+          name: 'gemini-4-argon-high',
+          model_id: 'gemini-4-argon-high',
+          display_name: 'Gemini 4 Argon (High)',
+          family: 'argon',
+          is_argon: true,
+          quota_source: 'cloud',
+          stale: false,
+          own_stale: false,
+          disabled: false,
+          own_percentage: 98,
+          own_percentage_known: true,
+          own_observed_at: nowSec,
+          own_reset_time: reset5h,
+          reset_time: reset5h,
+        },
+        {
+          name: 'gemini-4-carbon-high',
+          model_id: 'gemini-4-carbon-high',
+          display_name: 'Gemini 4 Carbon (High)',
+          family: 'carbon',
+          is_carbon: true,
+          quota_source: 'cloud',
+          stale: false,
+          own_stale: false,
+          disabled: false,
+          own_percentage: 98,
+          own_percentage_known: true,
+          own_observed_at: nowSec,
+          own_reset_time: reset5h,
+          reset_time: reset5h,
+        },
+        {
+          name: 'claude-opus-5-5',
+          model_id: 'claude-opus-5-5',
+          display_name: 'Claude Opus 5.5',
+          family: 'claude',
+          quota_source: 'cloud',
+          stale: false,
+          own_stale: false,
+          disabled: false,
+          own_percentage: 100,
+          own_percentage_known: true,
+          own_observed_at: nowSec,
+          own_reset_time: reset5h,
+          reset_time: reset5h,
+        },
+      ],
+    },
+  };
+
+  // 不经任何刷新直接读取：立即自愈
+  const overview = buildAccountQuotaOverview(pollutedAccount, { nowMs });
+  assert.deepEqual(overview.standaloneModels, []);
+  assert.deepEqual(overview.projectedQuotaGroups.map(g => g.key), ['gemini', 'claude']);
+  assert.match(overview.projectedQuotaGroups[0].description ?? '', /Gemini 4 Neon/);
+  assert.equal(overview.argonStatus.mode, 'unified');
+  assert.equal(overview.carbonStatus.mode, 'unified');
+  const neonModel = overview.models.find(m => m.model_id === 'gemini-4-neon-high');
+  assert.equal(neonModel?.family, 'gemini');
+  assert.equal(neonModel?.family_5h?.remaining, 0.98);
+  assert.equal(neonModel?.family_weekly?.remaining, 0.46);
+  assert.equal(neonModel?.effective_percentage, 46);
+  const rev = computeAccountRevision(pollutedAccount);
+  assert.equal(typeof rev, 'string');
+  assert.equal(rev.length, 16);
+});
+
+test('下次刷新彻底清除已下线编排器僵尸模型与撤销的非核心独立组，且有权威 groups[] 时不探测 :retrieveUserQuota', async t => {
+  const { manager, acc } = await createTempManager(t);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const nowMs = nowSec * 1000;
+  const reset5h = new Date(nowMs + 4 * 3600 * 1000).toISOString();
+  const resetWeekly = new Date(nowMs + 5 * 86400 * 1000).toISOString();
+
+  // 预置带历史僵尸模型与历史非核心组的快照
+  acc.quota = {
+    subscription_tier: 'ULTRA',
+    source: 'cloud',
+    last_updated: nowSec - 600,
+    is_forbidden: false,
+    model_forwarding_rules: {},
+    quota_groups: [
+      {
+        display_name: 'Gemini Models',
+        family: 'gemini',
+        observed_at: nowSec - 600,
+        buckets: [{ bucket_id: 'gemini-5h', window: '5h', remaining_fraction: 0.9, remaining_fraction_known: true, reset_time: reset5h, observed_at: nowSec - 600 }],
+      },
+      {
+        display_name: 'Legacy Promo Models',
+        family: 'other',
+        observed_at: nowSec - 600,
+        buckets: [{ bucket_id: 'promo-weekly', window: 'weekly', remaining_fraction: 0.5, remaining_fraction_known: true, reset_time: resetWeekly, observed_at: nowSec - 600 }],
+      },
+    ],
+    models: [
+      {
+        name: 'gemini-pro-orchestrator-neon',
+        model_id: 'gemini-pro-orchestrator-neon',
+        display_name: 'Orchestrator (Neon)',
+        family: 'other',
+        quota_source: 'carried',
+        stale: true,
+        own_stale: true,
+        own_percentage: 100,
+        own_percentage_known: true,
+        own_observed_at: nowSec - 1200,
+        own_reset_time: reset5h,
+        percentage: 0,
+        percentage_known: false,
+        reset_time: '',
+      },
+      {
+        name: 'legacy-vanished-model',
+        model_id: 'legacy-vanished-model',
+        display_name: 'Legacy Vanished',
+        family: 'other',
+        quota_source: 'carried',
+        stale: true,
+        own_stale: true,
+        own_percentage: 50,
+        own_percentage_known: true,
+        own_observed_at: nowSec - 1200,
+        own_reset_time: resetWeekly,
+        percentage: 0,
+        percentage_known: false,
+        reset_time: '',
+      },
+    ],
+  };
+  await manager.saveAccount(acc);
+
+  const seenUrls = [];
+  const refreshed = await manager.refreshQuota(acc.id, async (url) => {
+    const u = String(url);
+    seenUrls.push(u);
+    if (u.includes('loadCodeAssist')) {
+      return Response.json({ paidTier: { id: 'g1-ultra-tier', name: 'Google AI Ultra' } });
+    }
+    if (u.includes('fetchAvailableModels')) {
+      return Response.json({
+        models: {
+          'gemini-4-neon-high': { displayName: 'Gemini 4 Neon (High)', modelProvider: 'MODEL_PROVIDER_GOOGLE', quotaInfo: { remainingFraction: 0.95, resetTime: reset5h } },
+          'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash', modelProvider: 'MODEL_PROVIDER_GOOGLE', quotaInfo: { remainingFraction: 0.95, resetTime: reset5h } },
+          'claude-sonnet-5-5': { displayName: 'Claude Sonnet 5.5', modelProvider: 'MODEL_PROVIDER_ANTHROPIC', quotaInfo: { remainingFraction: 0.88, resetTime: resetWeekly } },
+          'opaque-unlisted-model': { displayName: 'Opaque Model', quotaInfo: {} },
+        },
+      });
+    }
+    return Response.json({
+      groups: [
+        {
+          displayName: 'Gemini Models',
+          description: 'Models within this group: Gemini 4 Neon, Gemini 3.8 Flash',
+          buckets: [
+            { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.95, resetTime: reset5h },
+            { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.7, resetTime: resetWeekly },
+          ],
+        },
+        {
+          displayName: 'Claude and GPT models',
+          description: 'Models within this group: Claude Sonnet 5.5',
+          buckets: [
+            { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 0.88, resetTime: resetWeekly },
+          ],
+        },
+      ],
+    });
+  });
+
+  assert.equal(seenUrls.some(u => u.endsWith(':retrieveUserQuota')), false, '权威 groups[] 存在时不得为 other/orchestrator 探测 :retrieveUserQuota');
+  assert.equal(refreshed.quota.models.some(m => m.model_id === 'gemini-pro-orchestrator-neon'), false);
+  assert.equal(refreshed.quota.models.some(m => m.model_id === 'legacy-vanished-model'), false);
+  assert.equal(refreshed.quota.refresh_state.carriedModels, 0);
+  assert.equal(refreshed.quota.refresh_state.carriedGroups, 0);
+  assert.equal(refreshed.quota.quota_groups.some(g => g.display_name === 'Legacy Promo Models'), false);
+  assert.equal(refreshed.quota.refresh_state.complete, true);
+
+  const overview = manager.getAccountQuotaOverview(refreshed);
+  assert.deepEqual(overview.standaloneModels, []);
+  assert.deepEqual(overview.projectedQuotaGroups.map(g => g.key), ['gemini', 'claude']);
+});
+
+test('未来未知官方 QuotaSummaryGroup 自动适配：保留全部 5h/daily/weekly 窗口、resetTime 与 description，自动跳过全 disabled 组', async () => {
+  const { classifyWindow, normalizeCloudGroups } = await import('../dist/quota.js');
+  assert.equal(classifyWindow('daily', 'nova-daily'), 'daily');
+  assert.equal(classifyWindow('24h', 'pool-24h'), 'daily');
+  assert.equal(classifyWindow('1d', 'pool-1d'), 'daily');
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const nowMs = nowSec * 1000;
+  const reset5h = new Date(nowMs + 3 * 3600 * 1000).toISOString();
+  const resetDaily = new Date(nowMs + 18 * 3600 * 1000).toISOString();
+  const resetWeekly = new Date(nowMs + 5 * 86400 * 1000).toISOString();
+
+  const parsedGroups = normalizeCloudGroups({
+    groups: [
+      {
+        groupId: 'gemini-core',
+        displayName: 'Gemini Models',
+        description: 'Models within this group: Gemini 4 Neon, Gemini 3.8 Flash',
+        buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.9, resetTime: reset5h }],
+      },
+      {
+        groupId: 'nova-pool',
+        displayName: 'Nova Models',
+        description: 'Models within this group: Nova 1 Pro, Nova 1 Flash',
+        buckets: [
+          { bucketId: 'nova-5h', window: '5h', remainingFraction: 0.82, resetTime: reset5h },
+          { bucketId: 'nova-weekly', window: 'weekly', remainingFraction: 0.4, resetTime: resetWeekly },
+          { bucketId: 'nova-disabled', window: 'daily', remainingFraction: 0, disabled: true, resetTime: resetDaily },
+        ],
+      },
+      {
+        groupId: 'pulse-daily',
+        displayName: 'Pulse Daily Pool',
+        description: 'Models within this group: Pulse 2',
+        buckets: [
+          { bucketId: 'pulse-24h', window: 'daily', remainingFraction: 0.65, resetTime: resetDaily },
+        ],
+      },
+      {
+        groupId: 'gemini-orion',
+        displayName: 'Gemini 5 Orion',
+        description: 'Models within this group: Gemini 5 Orion',
+        buckets: [
+          { bucketId: 'orion-weekly', window: 'weekly', remainingFraction: 0.55, resetTime: resetWeekly },
+        ],
+      },
+      {
+        groupId: 'disabled-exp',
+        displayName: 'Disabled Experimental',
+        buckets: [
+          { bucketId: 'exp-weekly', window: 'weekly', remainingFraction: 0, disabled: true, resetTime: resetWeekly },
+        ],
+      },
+    ],
+  }, nowSec);
+
+  assert.equal(parsedGroups.find(g => g.display_name === 'Nova Models')?.group_id, 'nova-pool');
+  assert.equal(parsedGroups.find(g => g.display_name === 'Gemini 5 Orion')?.family, 'other');
+
+  const overview = buildAccountQuotaOverview({
+    quota: {
+      subscription_tier: 'PRO',
+      source: 'cloud',
+      last_updated: nowSec,
+      is_forbidden: false,
+      model_forwarding_rules: {},
+      quota_groups: parsedGroups.map(g => ({
+        group_id: g.group_id,
+        display_name: g.display_name,
+        description: g.description,
+        family: g.family,
+        observed_at: nowSec,
+        source: 'cloud',
+        buckets: g.buckets.map(b => ({
+          bucket_id: b.bucket_id,
+          window: b.window,
+          remaining_fraction: b.remaining_fraction ?? 0,
+          remaining_fraction_known: b.remaining_fraction_known,
+          reset_time: b.reset_time ?? '',
+          disabled: b.disabled,
+          observed_at: nowSec,
+          source: 'cloud',
+        })),
+      })),
+      models: [
+        { name: 'gemini-4-neon', model_id: 'gemini-4-neon', display_name: 'Gemini 4 Neon', family: 'gemini', percentage: 90, percentage_known: true, own_percentage: 90, own_percentage_known: true, own_reset_time: reset5h, reset_time: reset5h },
+        { name: 'nova-1-pro', model_id: 'nova-1-pro', display_name: 'Nova 1 Pro', family: 'other', percentage: 82, percentage_known: true, own_percentage: 82, own_percentage_known: true, own_reset_time: reset5h, reset_time: reset5h },
+        { name: 'pulse-2', model_id: 'pulse-2', display_name: 'Pulse 2', family: 'other', percentage: 65, percentage_known: true, own_percentage: 65, own_percentage_known: true, own_reset_time: resetDaily, reset_time: resetDaily },
+      ],
+    },
+  }, { nowMs });
+
+  const keys = overview.projectedQuotaGroups.map(g => g.key);
+  assert.deepEqual(keys, ['gemini', 'nova-models', 'pulse-daily-pool', 'gemini-5-orion']);
+  assert.equal(keys.includes('disabled-experimental'), false, '全 disabled 桶的官方组应自动跳过');
+
+  const nova = overview.projectedQuotaGroups.find(g => g.key === 'nova-models');
+  assert.equal(nova.isStandalone, true);
+  assert.equal(nova.description, 'Models within this group: Nova 1 Pro, Nova 1 Flash');
+  assert.deepEqual(nova.windows.map(w => w.period), ['5h', 'weekly']);
+  assert.equal(nova.windows[0].remaining, 0.82);
+  assert.equal(nova.windows[0].resetTime, reset5h);
+  assert.equal(nova.windows[1].remaining, 0.4);
+  assert.equal(nova.windows[1].resetTime, resetWeekly);
+
+  const pulse = overview.projectedQuotaGroups.find(g => g.key === 'pulse-daily-pool');
+  assert.deepEqual(pulse.windows.map(w => w.period), ['daily']);
+  assert.equal(pulse.windows[0].remaining, 0.65);
+  assert.equal(pulse.windows[0].resetTime, resetDaily);
+
+  const orion = overview.projectedQuotaGroups.find(g => g.key === 'gemini-5-orion');
+  assert.deepEqual(orion.windows.map(w => w.period), ['weekly']);
+  assert.equal(orion.windows[0].remaining, 0.55);
+  assert.equal(orion.windows[0].resetTime, resetWeekly);
+});
+
+test('上游元数据过滤：isInternal、deprecatedModelIds、非对话专用清单与编排器元模型绝不成为独立池', async () => {
+  const { normalizeIndependentArgonQuota, buildStandaloneModels, familyWindowsFromGroups, applyFamilyWindows } = await import('../dist/quota.js');
+  const nowSec = Math.floor(Date.now() / 1000);
+  const nowMs = nowSec * 1000;
+  const reset = new Date(nowMs + 3600 * 1000).toISOString();
+
+  // 1. normalizeIndependentArgonQuota 拒绝所有编排器条目
+  const indRows = normalizeIndependentArgonQuota({
+    buckets: [
+      { modelId: 'gemini-pro-orchestrator-neon', displayName: 'Orchestrator (Neon)', remainingFraction: 1, resetTime: reset },
+      { modelId: 'gemini-pro-orchestrator-argon', displayName: 'Orchestrator (Argon)', remainingFraction: 1, resetTime: reset },
+      { modelId: 'gemini-pro-coordinator', displayName: 'Orchestrator', remainingFraction: 1, resetTime: reset },
+      { modelId: 'gemini-4-neon', displayName: 'Gemini 4 Neon', remainingFraction: 0.9, resetTime: reset },
+      { modelId: 'gemini-4-argon', displayName: 'Gemini 4 Argon', remainingFraction: 0.4, resetTime: reset },
+    ],
+  }, nowSec);
+  assert.deepEqual(indRows.map(r => r.model_id), ['gemini-4-argon']);
+
+  // 2. normalizeCloudModels 提取 isInternal / deprecated / non_chat_specialized / beyondModelInfo / agentModelSorts
+  const cloudModels = normalizeCloudModels({
+    deprecatedModelIds: { 'legacy-dep-1': { newModelId: 'gemini-4-neon' } },
+    tabModelIds: ['tab-autocomplete-v2'],
+    imageGenerationModelIds: ['imagen-special-v1'],
+    webSearchModelIds: ['web-search-helper'],
+    agentModelSorts: [{ groups: [{ modelIds: ['gemini-4-neon', 'custom-user-model'] }] }],
+    models: {
+      'internal-secret-model': { displayName: 'Internal Secret', isInternal: true, quotaBucketName: 'Internal Bucket', quotaInfo: { remainingFraction: 0.5, resetTime: reset } },
+      'legacy-dep-1': { displayName: 'Legacy Dep', quotaBucketName: 'Legacy Bucket', quotaInfo: { remainingFraction: 0.5, resetTime: reset } },
+      'tab-autocomplete-v2': { displayName: 'Tab Complete', quotaBucketName: 'Tab Bucket', quotaInfo: { remainingFraction: 0.5, resetTime: reset } },
+      'imagen-special-v1': { displayName: 'Imagen Special', quotaBucketName: 'Imagen Bucket', quotaInfo: { remainingFraction: 0.5, resetTime: reset } },
+      'web-search-helper': { displayName: 'Web Search', quotaBucketName: 'Search Bucket', quotaInfo: { remainingFraction: 0.5, resetTime: reset } },
+      'gemini-pro-coordinator': { displayName: 'Orchestrator', quotaBucketName: 'Orch Bucket', quotaInfo: { remainingFraction: 1, resetTime: reset } },
+      'gemini-pro-orchestrator-neon': { displayName: 'Orchestrator (Neon)', quotaBucketName: 'Orch Neon Bucket', quotaInfo: { remainingFraction: 1, resetTime: reset } },
+      'custom-user-model': { displayName: 'Custom User Model', beyondModelInfo: { quotaBucketName: 'Custom Beyond Bucket' }, quotaInfo: { remainingFraction: 0.77, resetTime: reset } },
+      'gemini-4-neon': { displayName: 'Gemini 4 Neon', modelProvider: 'MODEL_PROVIDER_GOOGLE', quotaInfo: { remainingFraction: 0.9, resetTime: reset } },
+    },
+  }, nowSec);
+
+  assert.equal(cloudModels.find(m => m.model_id === 'internal-secret-model')?.is_internal, true);
+  assert.equal(cloudModels.find(m => m.model_id === 'legacy-dep-1')?.deprecated, true);
+  assert.equal(cloudModels.find(m => m.model_id === 'tab-autocomplete-v2')?.non_chat_specialized, true);
+  assert.equal(cloudModels.find(m => m.model_id === 'custom-user-model')?.quota_bucket_name, 'Custom Beyond Bucket');
+  assert.equal(cloudModels.find(m => m.model_id === 'custom-user-model')?.in_model_selector, true);
+  assert.equal(cloudModels.find(m => m.model_id === 'internal-secret-model')?.in_model_selector, false);
+
+  // 即使 groups 为空（最宽松的降级模式），上述内部/废弃/非对话/编排器模型也绝不成为独立池，仅 custom-user-model 保留
+  const emptyWin = familyWindowsFromGroups([], nowMs);
+  const standalonesEmpty = buildStandaloneModels(applyFamilyWindows(cloudModels, emptyWin), [], emptyWin, nowMs);
+  assert.deepEqual(standalonesEmpty.map(s => s.key), ['custom-user-model']);
+  assert.equal(standalonesEmpty[0].resetTime, reset);
+
+  // 3. normalizeLiveModels 提取 provider / isInternal / beyondModelInfo / clientModelSorts
+  const liveModels = normalizeLiveModels(
+    [
+      { modelId: 'live-google-m1', label: 'Mystery Google', provider: 'MODEL_PROVIDER_GOOGLE', quotaInfo: { remainingFraction: 0.8, resetTime: reset } },
+      { modelId: 'live-internal', label: 'Internal', isInternal: true, quotaInfo: { remainingFraction: 0.5, resetTime: reset } },
+    ],
+    nowSec,
+    { clientModelSorts: [{ groups: [{ modelIds: ['live-google-m1'] }] }] },
+  );
+  assert.equal(liveModels[0].family, 'gemini');
+  assert.equal(liveModels[0].model_provider, 'MODEL_PROVIDER_GOOGLE');
+  assert.equal(liveModels[0].in_model_selector, true);
+  assert.equal(liveModels[1].is_internal, true);
+  assert.equal(liveModels[1].in_model_selector, false);
+});
+
+test('Argon/Carbon 独立池遵循动态 staleAfterSeconds 阈值，30 分钟刷新周期下 20 分钟采样不误判 stale', async (t) => {
+  const { manager, acc } = await createTempManager(t);
+  const nowMs = Date.now();
+  const observed20mAgoIso = new Date(nowMs - 20 * 60 * 1000).toISOString();
+  const resetIso = new Date(nowMs + 4 * 24 * 3600 * 1000).toISOString();
+
+  acc.subscription_tier = 'PRO';
+  acc.quota = manager.fuseQuota(
+    {
+      models: {
+        'gemini-3.8-flash': { displayName: 'Gemini 3.8 Flash', quotaInfo: { remainingFraction: 0.9, resetTime: resetIso } },
+        'gemini-4-argon': { displayName: 'Gemini 4 Argon', quotaInfo: { remainingFraction: 0.72, resetTime: resetIso } },
+      },
+    },
+    {
+      groups: [
+        {
+          groupId: 'gemini',
+          displayName: 'Gemini',
+          observedAt: observed20mAgoIso,
+          buckets: [{ window: 'five_hour', remainingFraction: 0.9, resetTime: resetIso }],
+        },
+        {
+          groupId: 'argon',
+          displayName: 'Gemini 4 Argon',
+          observedAt: observed20mAgoIso,
+          buckets: [{ window: 'weekly', remainingFraction: 0.72, resetTime: resetIso }],
+        },
+      ],
+    }
+  );
+  await manager.saveAccount(acc);
+
+  // staleAfterSeconds = 1920（对应 30 分钟刷新间隔 + 2 分钟）
+  const overview = buildAccountQuotaOverview(acc, nowMs, { staleAfterSeconds: 1920 });
+  assert.equal(overview.argonStatus?.quotaState, 'known', '20 分钟采样在 1920s 阈值下不得误判为 stale');
+  const argonPool = overview.standaloneModels?.find(m => m.key === 'argon');
+  assert.equal(argonPool?.quotaState, 'known');
+  assert.equal(argonPool?.windows?.[0]?.status?.stale, false);
+  assert.equal((overview.quotaWarningCodes ?? []).includes('ARGON_STALE'), false, '不得误报 ARGON_STALE 警告');
+  assert.equal(computeAccountRemaining(acc, 'argon', nowMs, 1920), 72, 'Argon 监控范围应返回有效剩余百分比 72');
+});

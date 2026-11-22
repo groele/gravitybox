@@ -8,13 +8,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const run = promisify(execFile);
 
-/** UI harness and release binary use the same optimized native build settings. */
-export async function nativeBuildArgs(root, output, { uiTest = false, typecheck = false } = {}) {
+/** Release builds use -O -whole-module-optimization; UI harness defaults to -Onone for fast iteration. */
+export async function nativeBuildArgs(root, output, { uiTest = false, typecheck = false, optimize = !uiTest } = {}) {
   const sources = (await readdir(join(root, 'native')))
     .filter(name => name.endsWith('.swift')).sort().map(name => join(root, 'native', name));
   const threads = String(Math.max(2, Math.min(16, cpus().length || 4)));
+  const modeFlags = typecheck
+    ? ['-typecheck']
+    : (optimize
+      ? ['-O', '-whole-module-optimization', '-num-threads', threads]
+      : ['-Onone', '-num-threads', threads]);
   return [
-    ...(typecheck ? ['-typecheck'] : ['-O', '-whole-module-optimization', '-num-threads', threads]),
+    ...modeFlags,
     ...(uiTest ? ['-D', 'NATIVE_UI_TEST'] : []),
     '-parse-as-library', '-target', 'arm64-apple-macosx14.0',
     ...['Cocoa', 'ServiceManagement', 'Security', 'ApplicationServices'].flatMap(name => ['-framework', name]),
@@ -24,9 +29,7 @@ export async function nativeBuildArgs(root, output, { uiTest = false, typecheck 
   ];
 }
 
-/** 计算 Swift 原生发布构建的全部输入指纹，用于跳过未变更时的重复全量重编。 */
-export async function computeSwiftInputsDigest(root) {
-  const hash = createHash('sha256');
+async function hashCommonSwiftInputs(hash, root) {
   try {
     const { stdout } = await run('/usr/bin/swiftc', ['--version'], { cwd: root });
     hash.update(`swiftc:${stdout.trim()}\n`);
@@ -40,6 +43,21 @@ export async function computeSwiftInputsDigest(root) {
   for (const name of sources) {
     hash.update(`native/${name}\0`).update(await readFile(join(root, 'native', name)));
   }
+}
+
+/** 计算 Swift 原生发布构建的全部输入指纹，用于跳过未变更时的重复全量重编。 */
+export async function computeSwiftInputsDigest(root) {
+  const hash = createHash('sha256');
+  await hashCommonSwiftInputs(hash, root);
+  return hash.digest('hex');
+}
+
+/** 计算原生 UI 夹具（含 test/native-ui.swift）的编译输入指纹，支持区分 uiTest-Onone / uiTest-O。 */
+export async function computeUiTestSwiftInputsDigest(root, { optimize = false } = {}) {
+  const hash = createHash('sha256');
+  hash.update(`mode:${optimize ? 'uiTest-O' : 'uiTest-Onone'}\n`);
+  await hashCommonSwiftInputs(hash, root);
+  hash.update('test/native-ui.swift\0').update(await readFile(join(root, 'test/native-ui.swift')));
   return hash.digest('hex');
 }
 

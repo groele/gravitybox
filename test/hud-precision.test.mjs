@@ -9,9 +9,17 @@ import {
   formatHudUsd,
   formatTurnDurationCard,
   formatTurnDurationCompact,
+  parseExecutorMetadataBlob,
   parseLatestGenMetadataBlob,
+  parseStepMetadataBlob,
+  resolveModelCapacity,
   ConversationMetricsEngine,
 } from '../dist/hud.js';
+import {
+  clearObservedIdeModelsForTest,
+  registerObservedIdeModels,
+} from '../dist/model-catalog.js';
+import { runHudDbScanInWorker } from '../dist/sqlite-read.js';
 
 const { DatabaseSync } = await import('node:sqlite');
 
@@ -1659,7 +1667,7 @@ test('多模型与曾用模型 (history) 压缩归因、当前模型峰值解耦
   const opusHistoryStage = atCarbon.context.modelStages?.find((s) => s.shortLabel === 'Opus');
   assert.equal(carbonStage1?.isActive, true);
   assert.equal(carbonStage1?.compactionCount, undefined);
-  assert.equal(opusHistoryStage?.section, 'history');
+  assert.equal(opusHistoryStage?.section, 'primary');
   assert.equal(opusHistoryStage?.compactionCount, 2);
 
   // Hydrogen 执行器介入并触发 1 次压缩后：总压缩 3 次，当前活跃 Hydrogen 压缩 1 次，曾用模型 Opus 保持 2 次
@@ -1686,10 +1694,10 @@ test('多模型与曾用模型 (history) 压缩归因、当前模型峰值解耦
   assert.equal(carbonStage2?.compactionCount, undefined);
   assert.equal(hydrogenStage2?.isActive, true);
   assert.equal(hydrogenStage2?.compactionCount, 1);
-  assert.equal(opusHistory2?.section, 'history');
+  assert.equal(opusHistory2?.section, 'primary');
   assert.equal(opusHistory2?.compactionCount, 2);
 
-  // 场景 2：Orchestrator Hydrogen 压缩 1 次后切回独立 Gemini 4 Hydrogen (High)，去重合并时压缩次数守恒不丢失
+  // 场景 2：Orchestrator Hydrogen 压缩 1 次后切回独立 Gemini 4 Hydrogen (High)，去重合并时压缩次数守恒不丢失，且保留 executor 角色
   const standaloneHydrogenStep = step({
     idx: 10,
     rawInputTokens: 30000,
@@ -1717,7 +1725,8 @@ test('多模型与曾用模型 (history) 压缩归因、当前模型峰值解耦
   assert.equal(deduped.session.compactionCount, 1);
   assert.equal(deduped.context.activeModelCompactionCount, 1);
   assert.equal(deduped.context.modelStages?.length, 2);
-  assert.equal(deduped.context.modelStages?.[1]?.slotKey, 'model:gemini-4-hydrogen');
+  assert.equal(deduped.context.modelStages?.[1]?.slotKey, 'orchestrator:hydrogen');
+  assert.equal(deduped.context.modelStages?.[1]?.role, 'executor');
   assert.equal(deduped.context.modelStages?.[1]?.compactionCount, 1);
 });
 
@@ -2107,7 +2116,776 @@ test('Swarm 1 Working + 2 Standing by (swarm_wait / WAITING) + Needs you 仅计 
   assert.equal(resumedAfterPriorSwarmWait.runningSubagentCount, 1);
 });
 
+test('OPT-02：尾部透明交接步 (stepType=101/98) 不破坏轮次闭合、中止识别与子库终结判定', async (t) => {
+  const nowSec = Date.now() / 1000;
+  // 1. 主轮次已明确以 stepType=2 收尾，末尾紧跟透明步 101 时，即使 isStreaming=true 也不得外推跑表
+  const closedWithTransparentTail = buildConversationHudMetrics({
+    conversationId: 'opt02-closed-tail',
+    isStreaming: true,
+    steps: [
+      { idx: 0, stepType: 14, status: 3, startTimeSeconds: nowSec - 60, endTimeSeconds: nowSec - 60 },
+      { idx: 1, stepType: 15, status: 3, startTimeSeconds: nowSec - 60, endTimeSeconds: nowSec - 55, outputTokens: 100 },
+      { idx: 2, stepType: 2, status: 3, startTimeSeconds: nowSec - 55, endTimeSeconds: nowSec - 54 },
+      { idx: 3, stepType: 101, status: 3, startTimeSeconds: nowSec - 54 },
+    ],
+  });
+  assert.ok(
+    closedWithTransparentTail.session.currentTurnDurationSeconds <= 6.5,
+    `尾部透明步 101 不得让已闭合轮次跑表外推至 60s (实际 ${closedWithTransparentTail.session.currentTurnDurationSeconds})`
+  );
 
+  // 2. 用户中止后末尾紧跟透明步 101，仍必须准确识别 turnAborted === true
+  const abortedWithTransparentTail = buildConversationHudMetrics({
+    conversationId: 'opt02-aborted-tail',
+    isStreaming: false,
+    steps: [
+      { idx: 0, stepType: 14, status: 3, startTimeSeconds: nowSec - 20, endTimeSeconds: nowSec - 20 },
+      { idx: 1, stepType: 15, status: 4, startTimeSeconds: nowSec - 20, endTimeSeconds: nowSec - 15 },
+      { idx: 2, stepType: 101, status: 3, startTimeSeconds: nowSec - 15 },
+    ],
+  });
+  assert.equal(abortedWithTransparentTail.session.turnAborted, true);
 
+  // 3. 独立子智能体分栏尾部为 stepType=2(status=3) + stepType=98(status=2) 时，即使 summaries 暂报 RUNNING 也应停流
+  const subDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-opt02-sub-'));
+  const dbs = [];
+  t.after(() => {
+    for (const db of dbs) db.close();
+    fs.rmSync(subDir, { recursive: true, force: true });
+  });
+  const mainId = '77777777-7777-4777-8777-777777777777';
+  const subId = '88888888-8888-4888-8888-888888888888';
+  const sumDb = new DatabaseSync(path.join(subDir, 'conversation_summaries.db'));
+  dbs.push(sumDb);
+  sumDb.exec(`
+    CREATE TABLE conversation_summaries (
+      conversation_id TEXT PRIMARY KEY,
+      parent_conversation_id TEXT,
+      root_conversation_id TEXT,
+      status TEXT,
+      updated_at INTEGER
+    );
+  `);
+  sumDb.prepare('INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?)').run(
+    subId, mainId, mainId, 'CASCADE_RUN_STATUS_RUNNING', Math.floor(nowSec)
+  );
+  const subDb = new DatabaseSync(path.join(subDir, `${subId}.db`));
+  dbs.push(subDb);
+  subDb.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB, render_info BLOB, step_payload BLOB);
+    CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER);
+    CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+  `);
+  subDb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, ?)').run(subId, subId, 0);
+  subDb.prepare('INSERT INTO trajectory_metadata_blob VALUES (?, ?)').run('main', parentMetadata(mainId, mainId));
+  subDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(Buffer.from(seconds(1, nowSec - 10)));
+  subDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (1, 2, 3, ?)').run(Buffer.from([...seconds(1, nowSec - 8), ...seconds(7, nowSec - 5)]));
+  subDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (2, 98, 2, ?)').run(Buffer.from(seconds(1, nowSec - 4)));
 
+  const engine = new ConversationMetricsEngine({ conversationsDir: subDir });
+  const subMetrics = await engine.getConversationMetrics({ conversationId: subId, isStreaming: false });
+  assert.equal(subMetrics.isStreaming, false, '尾部透明步 98 不得遮蔽前面 stepType=2 的终结状态');
+});
+
+test('OPT-05 & OPT-06：跨 4 并发波次子代理两阶段防抖 + 同子库模型回退且严禁借用父模型', async (t) => {
+  const { create, engine } = databaseFixture(t);
+  const zeroUsage = usage({
+    rawInputTokens: 0,
+    cachedReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    candidateTokens: 0,
+  });
+  const mainId = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
+  const childIds = [
+    'bbbbbbbb-1111-4111-8111-000000000001',
+    'bbbbbbbb-1111-4111-8111-000000000002',
+    'bbbbbbbb-1111-4111-8111-000000000003',
+    'bbbbbbbb-1111-4111-8111-000000000004',
+    'bbbbbbbb-1111-4111-8111-000000000005',
+  ];
+  const mainDb = create(mainId);
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status) VALUES (0, 14, 3)').run();
+  invoke(mainDb, 1, childIds);
+  // 主库模型设为较贵的 claude-opus-5-5（1M input = $4）
+  const parentGen = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(zeroUsage)),
+      ...string(19, 'claude-opus-5-5'),
+    ]),
+    ...message(2, varint(0)),
+  ]);
+  mainDb.prepare('INSERT INTO gen_metadata VALUES (1, ?, ?)').run(parentGen, parentGen.length);
+
+  // 第 1 波（前 4 个）处于两步间短暂空档（status=3 且无 stepType=2）；第 5 个处于第 2 波且正在 status=2 运行
+  for (let i = 0; i < 4; i++) {
+    const cDb = create(childIds[i], { parentBlob: parentMetadata(mainId, mainId) });
+    cDb.prepare('INSERT INTO steps (idx, step_type, status) VALUES (0, 14, 3)').run();
+    if (i === 0) {
+      // Child 0：第 1 步记录了自己的 gemini-3.8-flash（无费用），第 2 步刚落盘 1M input 但尚未写 generation
+      const meta1 = Buffer.from([
+        ...message(9, usageBytes(zeroUsage)),
+        ...string(19, 'gemini-3.8-flash'),
+      ]);
+      // 将模型显式挂在 step_payload/generation 同子库回退场景：给 step 1 写入独立 gen_metadata
+      cDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (1, 15, 3, ?)').run(meta1);
+      const childOwnGen = Buffer.from([
+        ...message(1, [
+          ...message(4, usageBytes(zeroUsage)),
+          ...string(19, 'gemini-3.8-flash'),
+        ]),
+        ...message(2, varint(1)),
+      ]);
+      cDb.prepare('INSERT INTO gen_metadata VALUES (1, ?, ?)').run(childOwnGen, childOwnGen.length);
+      insertStep(cDb, {
+        idx: 2,
+        status: 3,
+        value: usage({
+          rawInputTokens: 1_000_000,
+          cachedReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          candidateTokens: 0,
+        }),
+      });
+    } else {
+      // Child 1..3：无任何模型元数据（验证绝不借用父会话 Opus 模型）
+      insertStep(cDb, {
+        idx: 1,
+        status: 3,
+        value: usage({
+          rawInputTokens: 100,
+          cachedReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 10,
+          reasoningTokens: 0,
+          candidateTokens: 0,
+        }),
+      });
+    }
+  }
+  // 第 5 个子库（第 2 波）实锤 RUNNING(2)
+  const c5 = create(childIds[4], { parentBlob: parentMetadata(mainId, mainId) });
+  c5.prepare('INSERT INTO steps (idx, step_type, status) VALUES (0, 14, 3)').run();
+  insertStep(c5, { idx: 1, status: 2, value: zeroUsage });
+
+  const metricsCrossWave = await engine.getConversationMetrics({
+    conversationId: mainId,
+    isStreaming: false,
+    isSubagentRunning: false,
+    runningSubagentCount: 0,
+  });
+  assert.equal(metricsCrossWave.runningSubagentCount, 5, '跨 4 并发波次时，第 2 波活跃兄弟必须能保活第 1 波处于步间空档的 4 个兄弟');
+  assert.equal(metricsCrossWave.tokens.hasUnpricedSteps, true, '无模型元数据的子库绝不可借用父会话模型，必须保留 hasUnpricedSteps=true');
+  // Child 0 按同子库 gemini-3.8-flash ($0.75/1M input) 计费，而不是按父会话 Opus ($4.00/1M) 虚增
+  assert.ok(
+    Math.abs(metricsCrossWave.tokens.estimatedCostUsd - 0.75) < 1e-6,
+    `Child 0 应按同子库 gemini-3.8-flash 估算为 $0.75，实际 $${metricsCrossWave.tokens.estimatedCostUsd}`
+  );
+});
+
+test('切换同模型 Extra 思考程度时折叠为同一基模型，不得将 Hydrogen Extra 误判为待切换独立模型', () => {
+  const hydrogenHighStep = step({
+    idx: 1,
+    rawInputTokens: 3_840,
+    cachedReadTokens: 323_000,
+    cacheWriteTokens: 0,
+    outputTokens: 313,
+    generation: {
+      responseModel: 'gemini-4-hydrogen-tiered-high',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 512000,
+    },
+  });
+
+  for (const inputModel of [
+    'Gemini 4 Hydrogen Extra',
+    '+ Gemini 4 Hydrogen Extra ⌄',
+    'Gemini 4 Hydrogen (Extra)',
+    'gemini-4-hydrogen-extra',
+    'gemini-4-hydrogen-tiered-extra',
+  ]) {
+    const metrics = buildConversationHudMetrics({
+      conversationId: 'conv-hydrogen-extra-fold',
+      steps: [hydrogenHighStep],
+      modelId: inputModel,
+    });
+    assert.equal(metrics.context.modelId, 'gemini-4-hydrogen', `${inputModel} 应折叠回 gemini-4-hydrogen`);
+    assert.equal(metrics.context.modelDisplayName, 'Gemini 4 Hydrogen (High)');
+    assert.equal(metrics.context.isMultiModel, undefined, `${inputModel} 切换思考档位不应触发多模型态`);
+    assert.equal(metrics.context.modelStages, undefined, `${inputModel} 不应产生待切换模型阶段`);
+  }
+
+  const newChatMetrics = buildConversationHudMetrics({
+    conversationId: 'conv-hydrogen-extra-empty',
+    steps: [],
+    modelId: 'Gemini 4 Hydrogen Extra',
+  });
+  assert.equal(newChatMetrics.context.modelId, 'gemini-4-hydrogen');
+  assert.equal(newChatMetrics.context.modelDisplayName, 'Gemini 4 Hydrogen');
+  assert.equal(newChatMetrics.context.capacityTokens, 200_000);
+  assert.equal(newChatMetrics.context.capacitySource, 'reference');
+});
+
+test('P0-1 回归：2.34.0 可配置 Orchestrator (plan_model=1532, execution_model=1528, DOM "Orchestrator Gemini 4 Neon High") 零 Argon 伪造并精准呈现规划/执行阶段', async (t) => {
+  t.after(() => clearObservedIdeModelsForTest());
+  clearObservedIdeModelsForTest();
+  registerObservedIdeModels([
+    { modelId: 'gemini-4-neon', displayName: 'Gemini 4 Neon (High)', modelOrAlias: 'MODEL_PLACEHOLDER_M532', modelEnum: 1532 },
+    { modelId: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen (XHigh)', modelOrAlias: 'MODEL_PLACEHOLDER_M528', modelEnum: 1528 },
+  ]);
+
+  // 1. 直接通过 buildConversationHudMetrics 复现 85315fe1（29 步 Neon，未调用 exit_plan_mode）
+  const neonPlannerStep = step({
+    idx: 1,
+    rawInputTokens: 2_226,
+    cachedReadTokens: 69_371,
+    cacheWriteTokens: 0,
+    outputTokens: 640,
+    generation: {
+      modelEnum: 1532,
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-neon',
+      modelDisplayName: 'Gemini 4 Neon (High)',
+      maxContextTokens: 512_000,
+    },
+  });
+  const m = buildConversationHudMetrics({
+    conversationId: 'conv-234-orch-neon',
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    executorMetadata: {
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      checkpointMaxTokenLimit: 512_000,
+    },
+    steps: [{ idx: 0, stepType: 14, status: 3 }, neonPlannerStep],
+  });
+  assert.equal(m.context.isOrchestrator, true);
+  assert.equal(m.context.isMultiModel, true);
+  assert.equal(m.context.modelId, 'gemini-4-neon');
+  assert.equal(m.context.modelShortLabel, 'Neon');
+  assert.equal(m.context.usedTokens, 71_597);
+  assert.equal(m.context.capacityTokens, 512_000);
+  assert.equal(m.context.isFallbackCapacity, false);
+  assert.equal(m.context.modelStages?.length, 2);
+  assert.equal(m.context.modelStages?.[0]?.slotKey, 'orchestrator:neon');
+  assert.equal(m.context.modelStages?.[0]?.role, 'planner');
+  assert.equal(m.context.modelStages?.[0]?.section, 'primary');
+  assert.equal(m.context.modelStages?.[0]?.isActive, true);
+  assert.equal(m.context.modelStages?.[0]?.hasUsageData, true);
+  assert.equal(m.context.modelStages?.[1]?.slotKey, 'orchestrator:hydrogen');
+  assert.equal(m.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(m.context.modelStages?.[1]?.shortLabel, 'Hydrogen');
+  assert.equal(m.context.modelStages?.[1]?.section, 'primary');
+  assert.equal(m.context.modelStages?.[1]?.hasUsageData, false);
+  assert.equal(m.context.modelStages?.some((s) => /argon/i.test(`${s.slotKey} ${s.shortLabel} ${s.modelDisplayName}`)), false);
+
+  // 2. 端到端 SQLite executor_metadata + gen_metadata f3.1/f3.60.1 解析验证（含空对话与活跃对话）
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-execmeta-'));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const convId = '85315fe1-0000-4000-8000-000000000001';
+  const db = new DatabaseSync(path.join(baseDir, `${convId}.db`));
+  t.after(() => { try { db.close(); } catch {} });
+  db.exec(`
+    CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB);
+    CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+  `);
+  // executor_metadata: f10(cascade_config) -> f1(planner_config: f1=1532, f60={f1=1528}), f2(checkpoint_config: f5=512000)
+  const execMetaBuf = Buffer.from(
+    message(10, [
+      ...message(1, [...scalar(1, 1532), ...message(60, scalar(1, 1528))]),
+      ...message(2, scalar(5, 512_000)),
+    ])
+  );
+  const parsedExec = parseExecutorMetadataBlob(execMetaBuf);
+  assert.equal(parsedExec.planModelEnum, 1532);
+  assert.equal(parsedExec.executionModelEnum, 1528);
+  assert.equal(parsedExec.checkpointMaxTokenLimit, 512_000);
+  db.prepare('INSERT INTO executor_metadata VALUES (0, ?)').run(execMetaBuf);
+
+  const engine = new ConversationMetricsEngine({ conversationsDir: baseDir });
+  // 空对话：仅凭 executor_metadata 即可准确识别规划 Neon + 执行 Hydrogen + 512K 上限
+  const emptyRes = await engine.getConversationMetrics({
+    conversationId: convId,
+    modelId: 'Orchestrator Gemini 4 Neon High',
+  });
+  assert.equal(emptyRes.context.isOrchestrator, true);
+  assert.equal(emptyRes.context.capacityTokens, 512_000);
+  assert.equal(emptyRes.context.isFallbackCapacity, false);
+  assert.equal(emptyRes.context.modelStages?.[0]?.shortLabel, 'Neon');
+  assert.equal(emptyRes.context.modelStages?.[1]?.shortLabel, 'Hydrogen');
+});
+
+test('P0-1 回归：非 Gemini Orchestrator ("Orchestrator Claude Opus 5.5 Medium") 与裸 "Orchestrator" 绝不伪造 gemini-4-opus / Argon / Carbon', () => {
+  const opusOrchCap = resolveModelCapacity('Orchestrator Claude Opus 5.5 Medium');
+  assert.equal(opusOrchCap.modelId, 'claude-opus-5-5');
+  assert.equal(opusOrchCap.isFallback, false);
+
+  const opusParenCap = resolveModelCapacity('Orchestrator (Claude Opus 5.5)');
+  assert.equal(opusParenCap.modelId, 'claude-opus-5-5');
+  assert.equal(opusParenCap.isFallback, false);
+
+  const emptyCap = resolveModelCapacity('');
+  assert.equal(emptyCap.isFallback, true);
+  assert.equal(emptyCap.capacityCompact, '~200K');
+
+  const opusMetrics = buildConversationHudMetrics({
+    conversationId: 'conv-orch-claude-opus',
+    modelId: 'Orchestrator Claude Opus 5.5 Medium',
+    steps: [],
+  });
+  assert.equal(opusMetrics.context.isOrchestrator, true);
+  assert.equal(opusMetrics.context.modelId, 'claude-opus-5-5');
+  assert.equal(opusMetrics.context.modelShortLabel, 'Opus');
+  assert.equal(opusMetrics.context.isFallbackCapacity, true, '无 DB/DOM 上限时必须保留估算 ~ 前缀');
+  assert.equal(opusMetrics.context.capacityTokensCompact, '~200K');
+  assert.equal(opusMetrics.context.modelStages?.some((s) => /argon|carbon|gemini-4-opus/i.test(`${s.slotKey} ${s.modelId} ${s.shortLabel}`)), false);
+
+  const bareOrch = buildConversationHudMetrics({
+    conversationId: 'conv-orch-bare',
+    modelId: 'Orchestrator',
+    steps: [],
+  });
+  assert.equal(bareOrch.context.isOrchestrator, true);
+  assert.equal(bareOrch.context.modelStages?.[0]?.slotKey, 'orchestrator:planner_pending');
+  assert.equal(bareOrch.context.modelStages?.[0]?.shortLabel, '');
+  assert.equal(bareOrch.context.modelStages?.some((s) => /argon|carbon/i.test(`${s.slotKey} ${s.shortLabel}`)), false);
+});
+
+test('P0-2 回归：0-token field 9 占位不导致上下文归零、同模型吸收同步 latestStep/latestPrompt 且容量优先级正确', () => {
+  // 1. parseStepMetadataBlob 遇到全 0 token 的 field 9 占位必须保持 hasUsage = false
+  const zeroField9Meta = Buffer.from(
+    message(9, [
+      ...scalar(1, 1532),
+      ...scalar(2, 0),
+      ...scalar(3, 0),
+      ...scalar(4, 0),
+      ...scalar(5, 0),
+    ])
+  );
+  const parsedZero = parseStepMetadataBlob(2, 15, 2, zeroField9Meta);
+  assert.equal(parsedZero.hasUsage, false);
+
+  // 2. 在 180K 有效步后追加全 0 占位步，usedTokens 保持 180K 绝不跌落至 0%
+  const validStep = step({
+    idx: 1,
+    rawInputTokens: 10_000,
+    cachedReadTokens: 170_000,
+    cacheWriteTokens: 0,
+    outputTokens: 500,
+    generation: { responseModel: 'gemini-4-neon', modelDisplayName: 'Gemini 4 Neon (High)', maxContextTokens: 512_000 },
+  });
+  const noZeroDrop = buildConversationHudMetrics({
+    conversationId: 'conv-no-zero-drop',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      validStep,
+      { idx: 2, stepType: 15, status: 2, hasUsage: true, rawInputTokens: 0, cachedReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 },
+    ],
+  });
+  assert.equal(noZeroDrop.context.usedTokens, 180_000);
+  assert.equal(noZeroDrop.context.capacityTokens, 512_000);
+
+  // 3. 同模型吸收（b051bb7d 场景）：Orchestrator Hydrogen(415K) 后切到独立 Hydrogen(39.5K)，顶栏与展开卡当前行必须一致
+  const orchHydrogenOld = step({
+    idx: 2,
+    rawInputTokens: 15_000,
+    cachedReadTokens: 400_000,
+    cacheWriteTokens: 0,
+    outputTokens: 800,
+    generation: {
+      modelEnum: 1669,
+      responseModel: 'gemini-flash-worker-agy',
+      modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)',
+      maxContextTokens: 512_000,
+    },
+  });
+  const standaloneHydrogenNew = step({
+    idx: 5,
+    rawInputTokens: 4_500,
+    cachedReadTokens: 35_000,
+    cacheWriteTokens: 0,
+    outputTokens: 300,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 512_000,
+    },
+  });
+  const absorbed = buildConversationHudMetrics({
+    conversationId: 'conv-absorb-sync',
+    modelId: 'Orchestrator (Carbon)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      step({
+        idx: 1,
+        rawInputTokens: 5_000,
+        cachedReadTokens: 200_000,
+        cacheWriteTokens: 0,
+        outputTokens: 400,
+        generation: { modelEnum: 1667, responseModel: 'gemini-pro-orchestrator', modelDisplayName: 'Orchestrator (Carbon)', maxContextTokens: 512_000 },
+      }),
+      orchHydrogenOld,
+      { idx: 4, stepType: 14, status: 3 },
+      standaloneHydrogenNew,
+    ],
+  });
+  const activeAbsorbedStage = absorbed.context.modelStages?.find((s) => s.isActive);
+  assert.equal(absorbed.context.usedTokens, 39_500);
+  assert.equal(activeAbsorbedStage?.usedTokens, 39_500, '同模型吸收后展开卡当前行必须与顶栏一致，不得滞留在 415K');
+  assert.equal(activeAbsorbedStage?.peakContextTokens, 415_000, '历史峰值 415K 仍需守恒保留');
+
+  // 4. 容量优先级：stepGenMeta.maxContextTokens > executorMetadata.checkpointMaxTokenLimit > step.modelMaxTokens > inputExplicitCapacity
+  const capPriority1 = buildConversationHudMetrics({
+    conversationId: 'conv-cap-priority-1',
+    modelCapacity: 256_000,
+    executorMetadata: { checkpointMaxTokenLimit: 512_000 },
+    steps: [
+      step({
+        idx: 1,
+        modelMaxTokens: 1_048_576,
+        generation: { responseModel: 'claude-opus-5-5', maxContextTokens: 840_000 },
+      }),
+    ],
+  });
+  assert.equal(capPriority1.context.capacityTokens, 840_000);
+
+  const capPriority2 = buildConversationHudMetrics({
+    conversationId: 'conv-cap-priority-2',
+    modelCapacity: 256_000,
+    executorMetadata: { checkpointMaxTokenLimit: 512_000 },
+    steps: [step({ idx: 1, modelMaxTokens: 1_048_576, generation: { responseModel: 'gemini-4-neon' } })],
+  });
+  assert.equal(capPriority2.context.capacityTokens, 512_000);
+
+  // 5. in+cr+cw === 0 且 estimatedTokensUsed > 0 时安全回退至 estimatedTokensUsed，且 breakdown 严格守恒
+  const estFallback = buildConversationHudMetrics({
+    conversationId: 'conv-est-fallback',
+    steps: [
+      step({
+        idx: 1,
+        rawInputTokens: 0,
+        cachedReadTokens: 0,
+        cacheWriteTokens: 0,
+        outputTokens: 100,
+        generation: { responseModel: 'gemini-4-neon', estimatedTokensUsed: 64_000, maxContextTokens: 512_000 },
+      }),
+    ],
+  });
+  assert.equal(estFallback.context.usedTokens, 64_000);
+  assert.equal(estFallback.context.breakdown.cachedContextTokens, 0);
+  assert.equal(estFallback.context.breakdown.uncachedContextTokens, 64_000);
+  assert.equal(estFallback.context.breakdown.toolTokens, 64_000);
+  assert.equal(
+    estFallback.context.breakdown.cachedContextTokens + estFallback.context.breakdown.uncachedContextTokens,
+    estFallback.context.usedTokens,
+    'estimatedTokensUsed 回退路径必须保持 breakdown 守恒'
+  );
+  assert.equal(estFallback.context.breakdown.uncachedContextRatio, 12.5);
+});
+
+test('P0-1 审计复验回归：2.34.0 可配置 Orchestrator 执行步宿主将 f3.1 改写为 executionModelEnum (1528===1528) 时准确归类为 executor，零重复 slotKey 与零双 isActive', (t) => {
+  t.after(() => clearObservedIdeModelsForTest());
+  clearObservedIdeModelsForTest();
+  registerObservedIdeModels([
+    { modelId: 'gemini-4-neon', displayName: 'Gemini 4 Neon (High)', modelOrAlias: 'MODEL_PLACEHOLDER_M532', modelEnum: 1532 },
+    { modelId: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen (XHigh)', modelOrAlias: 'MODEL_PLACEHOLDER_M528', modelEnum: 1528 },
+  ]);
+
+  const plannerStep = step({
+    idx: 1,
+    rawInputTokens: 4_000,
+    cachedReadTokens: 86_000,
+    cacheWriteTokens: 0,
+    outputTokens: 500,
+    generation: {
+      modelEnum: 1532,
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-neon',
+      modelDisplayName: 'Gemini 4 Neon (High)',
+      maxContextTokens: 512_000,
+    },
+  });
+  // 真实 2.34.0 宿主执行步特征：f3.1=1528（被改写为执行模型）、f3.60.1=1528、modelEnum=1528，且无 worker/Orchestrator 字样
+  const execStep = step({
+    idx: 3,
+    rawInputTokens: 5_000,
+    cachedReadTokens: 45_000,
+    cacheWriteTokens: 0,
+    outputTokens: 400,
+    generation: {
+      modelEnum: 1528,
+      planModelEnum: 1528,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+      maxContextTokens: 512_000,
+    },
+  });
+
+  // 场景 A：同轮先规划后执行（带 executorMetadata）
+  const res = buildConversationHudMetrics({
+    conversationId: 'conv-234-exec-same-enum',
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    executorMetadata: {
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      checkpointMaxTokenLimit: 512_000,
+    },
+    steps: [{ idx: 0, stepType: 14, status: 3 }, plannerStep, execStep],
+  });
+  assert.equal(res.context.isOrchestrator, true);
+  assert.equal(res.context.modelStages?.length, 2, '不得多出第 3 行重复 pending 阶段');
+  assert.equal(res.context.modelStages?.filter((s) => s.isActive).length, 1, '绝不可出现双 isActive: true');
+  assert.equal(new Set(res.context.modelStages?.map((s) => s.slotKey)).size, 2, 'slotKey 必须全局唯一');
+  assert.equal(res.context.modelStages?.[0]?.slotKey, 'orchestrator:neon');
+  assert.equal(res.context.modelStages?.[0]?.role, 'planner');
+  assert.equal(res.context.modelStages?.[0]?.isActive, false);
+  assert.equal(res.context.modelStages?.[1]?.slotKey, 'orchestrator:hydrogen');
+  assert.equal(res.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(res.context.modelStages?.[1]?.isActive, true);
+  assert.equal(res.context.modelStages?.[1]?.usedTokens, 50_000);
+
+  // 场景 B：无 executorMetadata 且无同轮前步，仅靠 DOM "Orchestrator Gemini 4 Neon High" + 执行步 f3.1=f3.60.1=1528
+  const resDomOnly = buildConversationHudMetrics({
+    conversationId: 'conv-234-exec-dom-only',
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    steps: [{ idx: 0, stepType: 14, status: 3 }, execStep],
+  });
+  assert.equal(resDomOnly.context.modelStages?.length, 2);
+  assert.equal(resDomOnly.context.modelStages?.filter((s) => s.isActive).length, 1);
+  assert.equal(resDomOnly.context.modelStages?.[0]?.role, 'planner');
+  assert.equal(resDomOnly.context.modelStages?.[0]?.shortLabel, 'Neon');
+  assert.equal(resDomOnly.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(resDomOnly.context.modelStages?.[1]?.shortLabel, 'Hydrogen');
+  assert.equal(resDomOnly.context.modelStages?.[1]?.isActive, true);
+});
+
+test('P1-1 回归：>4MB 超大 gen_metadata 投影成功不静默丢弃，且 >64KB 历史行不阻塞 genPrefixCutoffIdx 增量推进', async (t) => {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-large-gen-'));
+  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const dbPath = path.join(baseDir, 'large.db');
+  const db = new DatabaseSync(dbPath);
+  t.after(() => { try { db.close(); } catch {} });
+  db.exec(`
+    CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB);
+    CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+  `);
+
+  // 构造 >5MB 的 gen_metadata（模拟 2.34.0 长对话巨型 prompt payload，包含真实 field 1.9.10.4 max_context_tokens=512000）
+  const buildLargeGenBlob = (stepIdx, payloadBytes, maxCtx) => {
+    const padding = Buffer.alloc(payloadBytes, 0x61); // field 99 skipped payload inside ChatModelMetadata
+    const chatModel = Buffer.concat([
+      Buffer.from(scalar(3, 1532)),
+      Buffer.from(string(19, 'gemini-4-neon')),
+      Buffer.from(string(21, 'Gemini 4 Neon (High)')),
+      Buffer.from(message(9, message(10, [...scalar(1, 95_000), ...scalar(4, maxCtx)]))),
+      Buffer.from(varint(99 * 8 + 2)),
+      Buffer.from(varint(padding.length)),
+      padding,
+    ]);
+    return Buffer.concat([
+      Buffer.from(varint(1 * 8 + 2)),
+      Buffer.from(varint(chatModel.length)),
+      chatModel,
+      Buffer.from(message(2, varint(stepIdx))),
+      Buffer.from(message(3, [...scalar(1, 1532), ...message(60, scalar(1, 1528))])),
+    ]);
+  };
+
+  const blob0 = buildLargeGenBlob(1, 120_000, 512_000); // >64KB 历史行
+  const blob1 = buildLargeGenBlob(3, 5 * 1024 * 1024, 512_000); // >5MB 超大尾行
+  db.prepare('INSERT INTO gen_metadata VALUES (0, ?, ?)').run(blob0, blob0.length);
+  db.prepare('INSERT INTO gen_metadata VALUES (1, ?, ?)').run(blob1, blob1.length);
+
+  // 首次全量扫描：>5MB 行必须成功投影且 genPrefixCutoffIdx 越过 >64KB 的 idx=0 推进至 1
+  const scan1 = await runHudDbScanInWorker({ dbPath, inlineBlobLimitBytes: 65_536 });
+  assert.equal(scan1.genBlobs.length, 2, '超 4MB gen_metadata 行不得静默丢弃');
+  assert.equal(scan1.genPrefixCutoffIdx, 1, '>64KB 历史行不得卡死 genPrefixCutoffIdx');
+  const parsedLarge = parseLatestGenMetadataBlob(scan1.genBlobs[1].data);
+  assert.equal(parsedLarge.responseModel, 'gemini-4-neon');
+  assert.equal(parsedLarge.maxContextTokens, 512_000);
+  assert.equal(parsedLarge.planModelEnum, 1532);
+  assert.equal(parsedLarge.executionModelEnum, 1528);
+
+  // 二次扫描（无变化）：必须命中 unchanged 且无需重传
+  const scan2 = await runHudDbScanInWorker({
+    dbPath,
+    inlineBlobLimitBytes: 65_536,
+    prevGenDigest: scan1.genDigest,
+    prevGenPrefixCutoffIdx: scan1.genPrefixCutoffIdx,
+    prevGenPrefixDigest: scan1.genPrefixDigest,
+  });
+  assert.equal(scan2.genMode, 'unchanged');
+  assert.equal(scan2.genBlobs.length, 0);
+
+  // 追加 idx=2 后扫描：走 append 模式且前缀截断点继续越过 5MB 的 idx=1 推进至 2
+  const blob2 = buildLargeGenBlob(5, 80_000, 512_000);
+  db.prepare('INSERT INTO gen_metadata VALUES (2, ?, ?)').run(blob2, blob2.length);
+  const scan3 = await runHudDbScanInWorker({
+    dbPath,
+    inlineBlobLimitBytes: 65_536,
+    prevGenDigest: scan2.genDigest,
+    prevGenPrefixCutoffIdx: scan2.genPrefixCutoffIdx,
+    prevGenPrefixDigest: scan2.genPrefixDigest,
+  });
+  assert.equal(scan3.genMode, 'append');
+  assert.equal(scan3.genPrefixCutoffIdx, 2, '前缀截断点应越过 5MB 历史行推进至 2');
+});
+
+test('2.34.0 主对话 trajectory_metadata_blob field 6 引用自身 UUID 时不得误判为 isSubagentTrajectory', async (t) => {
+  const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'gb-self-root-ref-'));
+  const convDir = path.join(baseDir, 'antigravity', 'conversations');
+  await fs.promises.mkdir(convDir, { recursive: true });
+  t.after(async () => {
+    await fs.promises.rm(baseDir, { recursive: true, force: true });
+  });
+
+  const mainId = '91111111-1111-4111-8111-111111111111';
+  const childId = '92222222-2222-4222-8222-222222222222';
+  const dbPath = path.join(convDir, `${mainId}.db`);
+  const mainDb = new DatabaseSync(dbPath);
+  const childDb = new DatabaseSync(path.join(convDir, `${childId}.db`));
+  t.after(() => {
+    try { mainDb.close(); } catch {}
+    try { childDb.close(); } catch {}
+  });
+
+  const createSchema = (db) => {
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB, render_info BLOB, step_payload BLOB);
+      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER);
+      CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+    `);
+  };
+  createSchema(mainDb);
+  createSchema(childDb);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  // Antigravity 2.34.0 主对话会在 trajectory_metadata_blob.field 6 写入自身 root_cascade_id（无 field 5）
+  mainDb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 0)').run(mainId, mainId);
+  mainDb.prepare('INSERT INTO trajectory_metadata_blob VALUES (?, ?)').run('main', Buffer.from(string(6, mainId)));
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(
+    Buffer.from(seconds(1, nowSec - 20))
+  );
+  // 模拟一个未闭合工具步（step_type=132, status=1），验证非子轨迹在 isStreaming=false 时不会把小圆点保活点亮
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (1, 132, 1, ?)').run(
+    Buffer.from([...seconds(1, nowSec - 10), ...message(4, string(2, 'run_command'))])
+  );
+
+  // 真实子智能体：field 5 指向父对话 mainId，field 6 指向根对话 mainId
+  childDb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 0)').run(childId, childId);
+  childDb.prepare('INSERT INTO trajectory_metadata_blob VALUES (?, ?)').run(
+    'main',
+    Buffer.from([...string(5, mainId), ...string(6, mainId)])
+  );
+  childDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 15, 3, ?)').run(
+    Buffer.from([...seconds(1, nowSec - 15), ...message(9, usageBytes(usage({ rawInputTokens: 1000, outputTokens: 100 })))])
+  );
+
+  const engine = new ConversationMetricsEngine({ geminiDir: baseDir });
+  const mainMetrics = await engine.getConversationMetrics({
+    conversationId: mainId,
+    isStreaming: false,
+  });
+  assert.equal(Boolean(mainMetrics.session.isSubagentTrajectory), false, '主对话自身 root 引用不得误判为子智能体轨迹');
+  assert.equal(mainMetrics.activityPhase, 'idle', '主对话非流式时残留工具步不得使 activityPhase 虚亮');
+
+  const childMetrics = await engine.getConversationMetrics({
+    conversationId: childId,
+    isStreaming: false,
+  });
+  assert.equal(childMetrics.session.isSubagentTrajectory, true, '带外部父/根引用的子智能体仍必须判定为 true');
+});
+
+test('step_type 132 同时满足 metadata > 64KB 且 render_info > 64KB 时仍通过 Protobuf 投影保留末尾 AgentRef 子智能体关联', async (t) => {
+  const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'gb-hud-renderinfo-proj-'));
+  const convDir = path.join(baseDir, 'antigravity', 'conversations');
+  await fs.promises.mkdir(convDir, { recursive: true });
+  t.after(async () => {
+    await fs.promises.rm(baseDir, { recursive: true, force: true });
+  });
+
+  const mainId = 'a1111111-1111-4111-8111-111111111111';
+  const childId = 'b2222222-2222-4222-8222-222222222222';
+  const createSchema = (db) => {
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB, render_info BLOB, step_payload BLOB);
+      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER);
+      CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+    `);
+  };
+
+  const mainDb = new DatabaseSync(path.join(convDir, `${mainId}.db`));
+  const childDb = new DatabaseSync(path.join(convDir, `${childId}.db`));
+  t.after(() => {
+    try { mainDb.close(); } catch {}
+    try { childDb.close(); } catch {}
+  });
+  createSchema(mainDb);
+  createSchema(childDb);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  // 构造 > 64KB metadata（前置大字段 20）与 > 64KB render_info（前置大字段 99 + 末尾 field 2.field 1 嵌套 AgentRef.trajectory_id = childId）
+  const bigMeta = Buffer.from([
+    ...seconds(1, nowSec - 20),
+    ...seconds(7, nowSec - 15),
+    ...message(4, string(2, 'run_command')),
+    ...string(20, 'M'.repeat(70_000)),
+  ]);
+  const bigRenderInfo = Buffer.from([
+    ...string(99, 'R'.repeat(70_000)),
+    ...message(10, message(4, string(1, childId))),
+  ]);
+  assert.ok(bigMeta.length > 65_536 && bigRenderInfo.length > 65_536);
+
+  mainDb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 0)').run(mainId, mainId);
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(
+    Buffer.from(seconds(1, nowSec - 25))
+  );
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata, render_info) VALUES (1, 132, 3, ?, ?)').run(
+    bigMeta,
+    bigRenderInfo
+  );
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (2, 15, 3, ?)').run(
+    Buffer.from([...seconds(1, nowSec - 10), ...seconds(6, nowSec - 9), ...seconds(7, nowSec - 5), ...message(9, usageBytes(usage({ outputTokens: 100 })))])
+  );
+
+  // 子库写入父关联元数据后关闭句柄，同时直接验证 worker 对 step_type=132 超 64KB render_info 的 Protobuf 投影结果
+  childDb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 0)').run(childId, childId);
+  childDb.prepare('INSERT INTO trajectory_metadata_blob VALUES (?, ?)').run('main', Buffer.from(string(5, mainId)));
+  childDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 15, 3, ?)').run(
+    Buffer.from([...seconds(1, nowSec - 18), ...seconds(6, nowSec - 17), ...seconds(7, nowSec - 14), ...message(9, usageBytes(usage({ outputTokens: 350 })))])
+  );
+  mainDb.close();
+  childDb.close();
+
+  const workerScan = await runHudDbScanInWorker({
+    dbPath: path.join(convDir, `${mainId}.db`),
+    inlineBlobLimitBytes: 65_536,
+  });
+  const step132 = workerScan.appendedSteps.find((s) => Number(s.idx) === 1);
+  assert.ok(step132?.render_info && step132.render_info.byteLength > 0 && step132.render_info.byteLength < 1024, 'step_type=132 超 64KB render_info 必须走投影裁剪大字段 99');
+  const parsedStep132 = parseStepMetadataBlob(1, 132, 3, step132.metadata, step132.data, [step132.render_info]);
+  assert.deepEqual(parsedStep132.childConversationIds, [childId], '投影后的 render_info 必须完整保留末尾 AgentRef UUID');
+
+  const engine = new ConversationMetricsEngine({ geminiDir: baseDir });
+  const result = await engine.getConversationMetrics({
+    conversationId: mainId,
+    isStreaming: false,
+  });
+  assert.equal(result.session.subagentCount, 1, 'step_type=132 双大字段超 64KB 必须通过投影保留 AgentRef');
+  assert.equal(result.tokens.outputTokens, 450, '主库 100 + 子库 350 = 450');
+});
 

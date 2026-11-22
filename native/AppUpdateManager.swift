@@ -80,7 +80,7 @@ final class AppUpdateManager {
                 return Self.normalizeVersion(ver)
             }
         }
-        return "1.1.2"
+        return "1.1.3"
     }
 
     var currentBuildDisplay: String {
@@ -105,7 +105,7 @@ final class AppUpdateManager {
                 break
             }
         }
-        return buildStr.isEmpty ? "10101" : buildStr
+        return buildStr.isEmpty ? "10103" : buildStr
     }
 
     static func normalizeVersion(_ raw: String) -> String {
@@ -533,7 +533,7 @@ final class AppUpdateManager {
         downloadTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let reportProgress: @Sendable (Int) -> Void = { [weak self] pct in
-                DispatchQueue.main.async { [weak self] in
+                Task { @MainActor [weak self] in
                     guard let self, self.downloadInFlight else { return }
                     if case .downloading = self.state {
                         self.downloadProgressPercent = pct

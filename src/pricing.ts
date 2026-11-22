@@ -1,9 +1,14 @@
-import { normalizeModelId, stripModelProviderPrefix } from './model-identity.js';
+import {
+  normalizeModelId,
+  stripModelProviderPrefix,
+  TIERED_OR_THINKING_EFFORT_SUFFIX_RE,
+} from './model-identity.js';
 import {
   MODEL_PRICES,
   getEffectiveModelPriceAlias,
-  FEED_MODEL_KEYS,
+  getEffectiveFeedModelKeys,
   CATALOG_PRICING_VERSION,
+  CATALOG_PRICING_UPDATED_AT,
   getEffectiveActiveModelKeys,
   getEffectiveModelDisplayName,
 } from './model-catalog.js';
@@ -69,10 +74,12 @@ export type ApiPricingEntry = ApiPricing | ApiPricingInterval[];
 export const DEFAULT_PRICING_FEED_URLS = [
   'https://raw.githubusercontent.com/Enzoo404/gravitybox/main/assets/pricing-feed.json',
   'https://cdn.jsdelivr.net/gh/Enzoo404/gravitybox@main/assets/pricing-feed.json',
+  'https://api.github.com/repos/Enzoo404/gravitybox/contents/assets/pricing-feed.json?ref=main',
 ];
 
 export const PRICING_METADATA = {
   version: CATALOG_PRICING_VERSION || '2026-11-13',
+  updatedAt: CATALOG_PRICING_UPDATED_AT || '',
   sourceUrl: 'https://cloud.google.com/vertex-ai/pricing',
   effectiveDate: '2026-11-01',
   currency: 'USD',
@@ -207,7 +214,7 @@ export function priceStatus(price: ApiPricing | ApiPricingInterval[], now = Date
 
 const SORTED_DEFAULT_PRICE_KEYS = Object.keys(DEFAULT_API_PRICES).sort((a, b) => b.length - a.length);
 const PRICING_TABLE_SORTED_KEYS_CACHE = new WeakMap<object, readonly string[]>();
-const SUFFIX_VARIANT_RE = /^(?:xhigh|extra-high|extra-low|high|medium|low|thinking|latest|preview|trial|\d{8}|\d{4}-\d{2}-\d{2}|\d{3})(?:-thinking)?(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}|\d{2}-\d{2}))?$/;
+const SUFFIX_VARIANT_RE = /^(?:tiered(?:-(?:extra-high|extra-low|xhigh|extra|high|medium|low|minimal|max|thinking|latest|preview|trial))?|(?:extra-high|extra-low|xhigh|extra|high|medium|low|minimal|max|thinking|latest|preview|trial|\d{8}|\d{4}-\d{2}-\d{2}|\d{3}))(?:-thinking)?(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}|\d{2}-\d{2}))?$/;
 
 function getSortedPricingTableKeys(pricingTable: Record<string, ApiPricingEntry>): readonly string[] {
   if (pricingTable === DEFAULT_API_PRICES) return SORTED_DEFAULT_PRICE_KEYS;
@@ -414,7 +421,7 @@ function buildKnownPricedKeys(
   extraPricingKeys?: Iterable<string>
 ): Set<string> {
   const known = new Set<string>();
-  for (const k of FEED_MODEL_KEYS) {
+  for (const k of getEffectiveFeedModelKeys()) {
     const norm = normalizeModelId(k);
     if (norm) known.add(norm);
   }
@@ -461,6 +468,18 @@ function isPricedCatalogFlashLiteModel(
   return knownPricedKeys.has(normId) || (Boolean(normKey) && knownPricedKeys.has(normKey));
 }
 
+function isTieredVariantModelId(rawId: string): boolean {
+  const id = stripModelProviderPrefix(String(rawId ?? '')).trim();
+  if (!id) return false;
+  if (
+    /^(?:chat_|tab_)/i.test(id) ||
+    /(?:^|[-_])(?:image|flash[-_]lite|safety[-_]le|control|exp[-_][a-z0-9]+|trial)(?:$|[-_])/i.test(id)
+  ) {
+    return false;
+  }
+  return /(?:^|[-_])tiered(?:$|[-_])/i.test(id);
+}
+
 export function isInternalNonChatModelId(rawId: string): boolean {
   const id = stripModelProviderPrefix(String(rawId ?? '')).trim();
   if (!id) return false;
@@ -485,7 +504,8 @@ export function canonicalActivePricingKeys(
     const normBase = normalizeModelId(baseId);
     const matched = matchPricingKeys(baseId, extraPricingKeys);
     const isPricedFlashLite = isPricedCatalogFlashLiteModel(baseId, matched, knownPricedKeys);
-    if (!baseId || (!effectiveActive.has(normBase) && !isPricedFlashLite && isInternalNonChatModelId(baseId))) continue;
+    const isActiveTieredVariant = isTieredVariantModelId(baseId) && effectiveActive.has(matched);
+    if (!baseId || (!effectiveActive.has(normBase) && !isActiveTieredVariant && !isPricedFlashLite && isInternalNonChatModelId(baseId))) continue;
     if (matched) keys.add(matched);
   }
   if (keys.size === 0) {
@@ -504,6 +524,7 @@ export type ModelAvailabilityKind =
 export interface ModelCatalogEntryMeta {
   availability: ModelAvailabilityKind;
   displayName: string;
+  hostOrder?: number;
   availableInTiers?: string[];
   activeTier?: string;
 }
@@ -526,6 +547,19 @@ export interface PricingCatalogModelInput {
   disabled?: boolean | null;
   stale?: boolean | null;
   quota_source?: string | null;
+  is_internal?: boolean | null;
+  isInternal?: boolean | null;
+  deprecated?: boolean | null;
+  non_chat_specialized?: boolean | null;
+  nonChatSpecialized?: boolean | null;
+  in_model_selector?: boolean | null;
+  inModelSelector?: boolean | null;
+  model_provider?: string | null;
+  modelProvider?: string | null;
+  max_tokens?: number | null;
+  maxTokens?: number | null;
+  max_output_tokens?: number | null;
+  maxOutputTokens?: number | null;
 }
 
 export interface PricingCatalogSourceInput {
@@ -572,7 +606,7 @@ export function normalizeCatalogTierLabel(rawTier: unknown): string {
   if (/enterprise/i.test(text)) return 'ENTERPRISE';
   if (/\b(?:team|teams|business|workspace)\b/i.test(text)) return 'TEAM';
   if (/\bplus\b/i.test(text)) return 'PLUS';
-  if (/pro/i.test(text)) return 'PRO';
+  if (/\bpro\b/i.test(text)) return 'PRO';
   if (/\b(?:free|starter|trial)\b/i.test(text)) return 'FREE';
   return '';
 }
@@ -609,30 +643,36 @@ interface ExtractedCatalogCandidate {
 }
 
 const UNPRICED_THINKING_SUFFIX_LABELS: Record<string, string> = {
+  minimal: 'Minimal',
+  'extra-low': 'Extra Low',
   low: 'Low',
   medium: 'Medium',
   high: 'High',
   xhigh: 'XHigh',
+  extra: 'Extra',
   'extra-high': 'Extra High',
-  'extra-low': 'Extra Low',
+  max: 'Max',
   thinking: 'Thinking',
 };
 
 const UNPRICED_VARIANT_ORDER: Record<string, number> = {
+  Minimal: -1,
   Low: 0,
   Medium: 1,
   High: 2,
   XHigh: 3,
-  'Extra High': 4,
-  'Extra Low': 5,
-  Thinking: 6,
-  Orchestrator: 7,
+  Extra: 4,
+  'Extra High': 5,
+  'Extra Low': 6,
+  Max: 7,
+  Thinking: 8,
+  Orchestrator: 9,
 };
 
 function stripDisplayTierSuffix(displayName: string): string {
   const cleaned = displayName
-    .replace(/\s*[（(]\s*(?:extra[\s-]*high|extra[\s-]*low|xhigh|high|medium|low|thinking)\s*[）)]\s*$/i, '')
-    .replace(/\s+(?:extra[\s-]*high|extra[\s-]*low|xhigh|high|medium|low|thinking)\s*$/i, '')
+    .replace(/\s*[（(]\s*(?:extra[\s-]*high|extra[\s-]*low|xhigh|extra|high|medium|low|minimal|max|thinking)\s*[）)]\s*$/i, '')
+    .replace(/\s+(?:extra[\s-]*high|extra[\s-]*low|xhigh|extra|high|medium|low|minimal|max|thinking)\s*$/i, '')
     .trim();
   return cleaned || displayName;
 }
@@ -645,7 +685,9 @@ function foldUnpricedLiveCandidate(
 ): { canonicalKey: string; displayName: string; variantLabel?: string; isOrchestratorVariant?: boolean } {
   const orchestratorTarget = resolveDynamicOrchestratorModel(baseId, rawDisplayName, siblingNormIds);
   if (orchestratorTarget) {
-    const isOrchLabel = /^Orchestrator\s*\(/i.test(rawDisplayName);
+    const isOrchLabel =
+      /^(?:Orchestrator\s*[(\uFF08]|Orchestrator\s+)/i.test(rawDisplayName) ||
+      /[(\uFF08]\s*Orchestrator\s*[)\uFF09]$/i.test(rawDisplayName);
     return {
       canonicalKey: orchestratorTarget,
       displayName: isOrchLabel ? '' : stripDisplayTierSuffix(rawDisplayName),
@@ -654,7 +696,9 @@ function foldUnpricedLiveCandidate(
     };
   }
   if (/^(?:gemini|claude|gpt|o[1-9])/.test(canonicalKey)) {
-    const suffixMatch = canonicalKey.match(/^(.+)-(extra-high|extra-low|xhigh|high|medium|low|thinking)$/i);
+    const suffixMatch = canonicalKey.match(
+      /^(.+?)(?:-tiered)?-(extra-high|extra-low|xhigh|extra|high|medium|low|minimal|max|thinking)$/i
+    );
     if (suffixMatch) {
       const baseKey = suffixMatch[1]!;
       const rawSuffix = suffixMatch[2]!.toLowerCase();
@@ -662,6 +706,13 @@ function foldUnpricedLiveCandidate(
         canonicalKey: baseKey,
         displayName: stripDisplayTierSuffix(rawDisplayName),
         variantLabel: UNPRICED_THINKING_SUFFIX_LABELS[rawSuffix] ?? rawSuffix,
+      };
+    }
+    const bareTieredMatch = canonicalKey.match(/^(.+)-tiered$/i);
+    if (bareTieredMatch) {
+      return {
+        canonicalKey: bareTieredMatch[1]!,
+        displayName: stripDisplayTierSuffix(rawDisplayName),
       };
     }
   }
@@ -711,16 +762,26 @@ function extractCatalogModels(
   for (const m of rawModels) {
     if (!m || typeof m !== 'object') continue;
     if (m.stale === true || m.quota_source === 'carried') continue;
+    if (m.is_internal === true || m.isInternal === true || m.deprecated === true || m.non_chat_specialized === true || m.nonChatSpecialized === true) {
+      continue;
+    }
     const rawId = String(m.model_id ?? m.id ?? m.name ?? m.model_or_alias ?? m.modelOrAlias ?? '').trim();
     if (!rawId) continue;
     const cleaned = normalizeModelId(rawId.replace(/(?:^|[-_])disabled$/i, '').trim())
-      .replace(/-(?:extra-high|extra-low|xhigh|high|medium|low|thinking)$/i, '');
+      .replace(TIERED_OR_THINKING_EFFORT_SUFFIX_RE, '');
     if (cleaned) siblingNormIds.add(cleaned);
   }
   const parsed: ExtractedCatalogCandidate[] = [];
   for (const m of rawModels) {
     if (!m || typeof m !== 'object') continue;
     if (m.stale === true || m.quota_source === 'carried') continue;
+    const isUpstreamInternal = m.is_internal === true || m.isInternal === true;
+    const isUpstreamDeprecated = m.deprecated === true;
+    const isUpstreamNonChat = m.non_chat_specialized === true || m.nonChatSpecialized === true;
+    if (isUpstreamInternal || isUpstreamDeprecated || isUpstreamNonChat) continue;
+    const rawInSelector = m.in_model_selector ?? m.inModelSelector;
+    const explicitlyExcludedFromSelector = rawInSelector === false;
+    const explicitlyInSelector = rawInSelector === true;
     const rawId = String(m.model_id ?? m.id ?? m.name ?? m.model_or_alias ?? m.modelOrAlias ?? '').trim();
     if (!rawId) continue;
     const hasDisabledSuffix = /(?:^|[-_])disabled$/i.test(rawId);
@@ -736,9 +797,18 @@ function extractCatalogModels(
       : null;
     const initialKey = foundPricing?.key || matchPricingKeys(baseId, extraKeys) || normBase;
     if (!initialKey || FORBIDDEN_CATALOG_KEYS.has(initialKey)) continue;
+    if (explicitlyExcludedFromSelector && !resolvedPricing && !effectiveActiveSet.has(initialKey)) {
+      continue;
+    }
     const isPricedFlashLite = isPricedCatalogFlashLiteModel(baseId, initialKey, knownPricedKeys);
+    const isActiveTieredVariant = isTieredVariantModelId(baseId) && (
+      effectiveActiveSet.has(initialKey) ||
+      Boolean(resolvedPricing) ||
+      explicitlyInSelector
+    );
     if (
       !effectiveActiveSet.has(normBase) &&
+      !isActiveTieredVariant &&
       !isPricedFlashLite &&
       isInternalNonChatModelId(baseId) &&
       !isUserVisiblePreviewChatModel(sourceKind, baseId, normBase, rawDisplayName, feedModelSet)
@@ -804,7 +874,8 @@ export function resolvePricingCatalogSnapshot(
   const timestampSeconds = input.timestampSeconds ?? Math.floor(effectiveNowMs / 1000);
   const locale = input.locale ?? getActiveLocale();
 
-  const publicCandidateKeys = new Set<string>(FEED_MODEL_KEYS);
+  const effectiveFeedKeys = getEffectiveFeedModelKeys();
+  const publicCandidateKeys = new Set<string>(effectiveFeedKeys);
   if (input.publicPricingKeys) {
     for (const rawKey of input.publicPricingKeys) {
       const k = String(rawKey).trim();
@@ -821,7 +892,7 @@ export function resolvePricingCatalogSnapshot(
     .map((k) => String(k).trim())
     .filter((k) => Boolean(k) && !FORBIDDEN_CATALOG_KEYS.has(k));
   const effectiveActiveSet = new Set<string>(effectiveActiveList);
-  const feedModelSet = new Set<string>(FEED_MODEL_KEYS);
+  const feedModelSet = new Set<string>(effectiveFeedKeys);
   const knownPricedKeys = buildKnownPricedKeys(rawPricingTable);
 
   let primaryKind: CatalogSourceKind | null = null;
@@ -886,7 +957,7 @@ export function resolvePricingCatalogSnapshot(
     }
   }
 
-  const primaryPricedMap = new Map<string, { pricing: ApiPricing; enabled: boolean; displayName: string }>();
+  const primaryPricedMap = new Map<string, { pricing: ApiPricing; enabled: boolean; displayName: string; hostOrder?: number }>();
   const unpricedMap = new Map<string, {
     key: string;
     displayName: string;
@@ -911,15 +982,22 @@ export function resolvePricingCatalogSnapshot(
     });
   };
 
+  const isHostMenuOrdered = primaryKind === 'live' || primaryKind === 'snapshot' || primaryKind === 'account_live';
   if (primaryKind) {
-    const allowUnpricedLive = primaryKind === 'live' || primaryKind === 'snapshot' || primaryKind === 'account_live';
-    for (const c of primaryCandidates) {
+    const allowUnpricedLive = isHostMenuOrdered;
+    for (let idx = 0; idx < primaryCandidates.length; idx += 1) {
+      const c = primaryCandidates[idx]!;
       if (c.resolvedPricing) {
         const existing = primaryPricedMap.get(c.canonicalKey);
         primaryPricedMap.set(c.canonicalKey, {
           pricing: existing?.pricing ?? c.resolvedPricing,
           enabled: (existing?.enabled ?? false) || !c.disabled,
           displayName: resolveCatalogDisplayName(c.canonicalKey, c.displayName, existing?.displayName),
+          ...(existing?.hostOrder !== undefined
+            ? { hostOrder: existing.hostOrder }
+            : isHostMenuOrdered
+              ? { hostOrder: idx }
+              : {}),
         });
         unpricedMap.delete(c.canonicalKey);
       } else if (
@@ -1011,6 +1089,7 @@ export function resolvePricingCatalogSnapshot(
     modelCatalogState[key] = {
       availability: info.enabled ? 'available' : 'tier_locked',
       displayName: info.displayName,
+      ...(info.hostOrder !== undefined ? { hostOrder: info.hostOrder } : {}),
       ...(primaryTier ? { activeTier: primaryTier } : {}),
     };
   }
@@ -1130,6 +1209,7 @@ function translateProvenanceConditionsToEn(text: string): string {
     .replace(/基础 ([A-Za-z0-9 ._-]+) 文本参考价；内部 -n 标识按同系列 Flash 基准估算/g, 'Base $1 text reference rate; internal -n variant estimated from Flash series benchmark')
     .replace(/基础 ([A-Za-z0-9 ._-]+) 标准全量定价/g, 'Base $1 standard list pricing')
     .replace(/Google Cloud 标准文本参考价；(\d{4}-\d{2}-\d{2})为本地核价起点，不代表官方调价日期/g, 'Google Cloud standard text reference rate; $1 marks local audit baseline rather than an official price-change date')
+    .replace(/Google Cloud 标准文本参考价（([A-Za-z0-9 ._-]+) 历史基准）/g, 'Google Cloud standard text reference rate ($1 historical benchmark)')
     .replace(/沿用历史基准；不代表所有区域、长上下文或缓存写入单价；需按来源逐项核对/g, 'Historical benchmark; excludes regional, long-context, or cache-write surcharges; verify against official source')
     .replace(/沿用历史基准；缓存读取 (\$[0-9.]+\/MTok)，缓存写入 (\$[0-9.]+\/MTok)/g, 'Historical benchmark; cache read $1, cache write $2')
     .replace(/文本基准；缓存读取 (\$[0-9.]+\/MTok)，缓存写入 (\$[0-9.]+\/MTok)；不含工具费用/g, 'Text benchmark; cache read $1, cache write $2; excludes tool charges')

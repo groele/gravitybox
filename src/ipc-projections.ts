@@ -60,6 +60,8 @@ export function projectQuotaContract(overview: {
 export interface ProjectAccountIpcOptions {
   overview?: QuotaOverview;
   nowMs?: number;
+  isActive?: boolean;
+  hasLocalOAuthClient?: boolean;
   includeOverviewFields?: boolean;
   formatResetTime?: (resetTime: number | null | undefined) => string;
   revisionWithReadiness?: boolean;
@@ -71,12 +73,17 @@ export function projectAccountForIpcNormalized(
   options?: ProjectAccountIpcOptions,
 ): Record<string, unknown> | null {
   if (!account) return null;
-  const projected = projectAccountForIpc(account) as Record<string, unknown> | null;
-  if (!projected) return projected;
   const overview = options?.overview ?? accountsManager.getAccountQuotaOverview(
     account,
     options?.nowMs !== undefined ? { nowMs: options.nowMs } : undefined,
   );
+  const projected = projectAccountForIpc(account, {
+    isActive: options?.isActive,
+    hasLocalOAuthClient: options?.hasLocalOAuthClient,
+    nowMs: options?.nowMs,
+    overview,
+  }) as Record<string, unknown> | null;
+  if (!projected) return projected;
   const normalizedTier = normalizeSubscriptionTier(
     options?.includeOverviewFields ? overview.subscriptionTier : projected.subscription_tier,
   );
@@ -89,7 +96,8 @@ export function projectAccountForIpcNormalized(
   if (options?.revisionWithReadiness) {
     const revBase = computeAccountRevision(account as Account | AccountSummary);
     const readinessState = (projected.credentialReadiness as { state?: string } | undefined)?.state ?? 'ready';
-    normalized.revision = `${revBase}:${readinessState}`;
+    const standbyMode = (projected.standbyRefreshStatus as { mode?: string } | undefined)?.mode ?? 'snapshot_cooling';
+    normalized.revision = `${revBase}:${readinessState}:${standbyMode}`;
   }
   if (projected.quota && typeof projected.quota === 'object') {
     const quotaObj = projected.quota as Record<string, unknown>;

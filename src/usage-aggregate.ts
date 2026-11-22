@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import type { TokenUsageSummary, TokenUsagePeriod, AvailableAccountUsageOption } from './usage.js';
 import { resolveDatabaseModelFullName } from './usage-types.js';
 import { getEffectiveModelAliasKeys } from './model-catalog.js';
-import { normalizeModelId } from './model-identity.js';
+import { normalizeModelId, THINKING_EFFORT_OR_LATEST_SUFFIX_RE } from './model-identity.js';
 import { DEFAULT_API_PRICES, resolveContextTierPricing, resolvePricingForTimestamp, matchPricingKeys, calculateEstimatedUsd, priceStatus, type ApiPricing, type ApiPricingEntry } from './pricing.js';
 import { bt } from './i18n.js';
 
@@ -280,7 +280,7 @@ export function aggregateLedger(db: DatabaseSync, options: AggregateOptions): To
 export function createModelQueryMatcher(rawQuery: string): (candidate: string) => boolean {
     const qLower = rawQuery.trim().toLowerCase();
     const qNorm = qLower ? normalizeModelId(rawQuery) : '';
-    const qCleanNorm = qNorm.replace(/(?:-(?:extra-high|extra-low|xhigh|high|medium|low|max|thinking|latest))+$/, '');
+    const qCleanNorm = qNorm.replace(THINKING_EFFORT_OR_LATEST_SUFFIX_RE, '');
     return (candidate: string): boolean => {
         if (!qLower) return true;
         const candLower = candidate.toLowerCase();
@@ -319,7 +319,7 @@ export function ledgerEventPage(db: DatabaseSync, options: {
     const rawQuery = options.query ?? '';
     const qLower = rawQuery.trim().toLowerCase();
     const qNorm = qLower ? normalizeModelId(rawQuery) : '';
-    const qCleanNorm = qNorm.replace(/(?:-(?:extra-high|extra-low|xhigh|high|medium|low|max|thinking|latest))+$/, '');
+    const qCleanNorm = qNorm.replace(THINKING_EFFORT_OR_LATEST_SUFFIX_RE, '');
     const modelMatchesQuery = createModelQueryMatcher(rawQuery);
     const aliasMatchSet = new Set<string>();
     if (qLower) {

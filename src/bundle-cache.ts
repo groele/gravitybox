@@ -2,7 +2,7 @@ import {stat} from 'node:fs/promises';
 import {join} from 'node:path';
 import {fetchBundleWithHash} from './bundle.js';
 import {bt} from './i18n.js';
-import {getAppResourcesDir} from './platform.js';
+import {IS_WINDOWS, getAppResourcesDir} from './platform.js';
 /** Memory-only identity-bound fingerprint cache; source bodies are never retained. */
 export class BundleCache {
   downloads=0;downloadedBytes=0;
@@ -11,9 +11,12 @@ export class BundleCache {
   async key(app:string,pid:number,version:string,origin:string){
     const rows=[];
     const resourcesDir = getAppResourcesDir(app);
-    for(const name of ['app.asar','app.asar.unpacked']){
+    for(const name of ['app.asar','app.asar.unpacked', IS_WINDOWS ? 'bin/language_server.exe' : 'bin/language_server']){
       try{const s=await stat(join(resourcesDir,name));rows.push([name,s.dev,s.ino,s.size,s.mtimeMs,s.ctimeMs]);}
-      catch(error){if(name==='app.asar'||(error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+      catch(error){
+        const code=(error as NodeJS.ErrnoException).code;
+        if(name==='app.asar'||(code!=='ENOENT'&&code!=='ENOTDIR'))throw error;
+      }
     }
     return JSON.stringify([app,pid,version,new URL(origin).origin,rows]);
   }

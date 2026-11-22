@@ -30,6 +30,7 @@ export function buildPricingFeed(catalog) {
   }
   const hasAliases = Boolean(catalog.aliases && typeof catalog.aliases === 'object' && Object.keys(catalog.aliases).length > 0);
   const hasModels = Object.keys(models).length > 0;
+  const hasFeedModels = Array.isArray(catalog.feedModels) && catalog.feedModels.length > 0;
   return {
     version: catalog.pricingVersion,
     schema: 1,
@@ -37,6 +38,7 @@ export function buildPricingFeed(catalog) {
     source: 'https://raw.githubusercontent.com/Enzoo404/gravitybox/main/assets/pricing-feed.json',
     ...(hasAliases ? { aliases: catalog.aliases } : {}),
     ...(hasActiveModels ? { activeModels: catalog.activeModels } : {}),
+    ...(hasFeedModels ? { feedModels: [...catalog.feedModels] } : {}),
     ...(hasModels ? { models } : {}),
     prices,
   };

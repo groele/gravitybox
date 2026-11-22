@@ -34,6 +34,7 @@ export class AntigravityHudManager {
     this.nextSlotSeq = 1;
     this.nextRevisionCounter = Number(globalThis.__GRAVITYBOX_HUD_REVISION__) || 0;
     this.mutationObserver = null;
+    this.themeObserver = null;
     this.domReadyAbort = null;
     this.visibilityHandler = null;
     this.reconcileTimer = null;
@@ -139,6 +140,8 @@ export class AntigravityHudManager {
         attributeFilter: [
           'data-cascade-id',
           'data-conversation-id',
+          'data-context-window',
+          'data-model-id',
           'data-state',
           'data-streaming',
           'data-testid',
@@ -150,14 +153,29 @@ export class AntigravityHudManager {
           'data-aux-pane-open',
           'data-split-transition',
           'aria-label',
-          'class',
-          'style',
           'hidden',
         ],
       });
+      // 仅对根节点 (document.body / document.documentElement, subtree: false) 监听主题 class/style，避免流式光标/动画引发全子树回调风暴
+      this.themeObserver = new MutationObserver(() => {
+        if (!this.active || !this.enabled || this.reconcileTimer !== null) return;
+        this.reconcileTimer = setTimeout(() => {
+          this.reconcileTimer = null;
+          this.checkRoute();
+          if (this.enabled && !this.routeExcluded) {
+            this.reconcileMounts();
+          }
+        }, 60);
+      });
+      try {
+        this.themeObserver.observe(document.body, {
+          attributes: true,
+          attributeFilter: ['class', 'data-theme', 'style', 'hidden'],
+        });
+      } catch {}
       if (document.documentElement && typeof document.documentElement.nodeType === 'number') {
         try {
-          this.mutationObserver.observe(document.documentElement, {
+          this.themeObserver.observe(document.documentElement, {
             attributes: true,
             attributeFilter: ['class', 'data-theme', 'style', 'hidden'],
           });
@@ -228,8 +246,8 @@ export class AntigravityHudManager {
     if (!this.active || !this.enabled || this.routeExcluded) return;
     this.reconcileMounts();
     for (const instance of this.instances.values()) {
-      instance.lastMetricsSequence = 0;
-      instance.requestRefresh?.();
+      // 推进单调刷新代际 (sessionRevision)，避免清零 lastMetricsSequence 后被旧在途轮询包短暂覆盖最新视图
+      instance.requestRefresh?.({ bumpRevision: true });
     }
   }
 
@@ -334,6 +352,7 @@ export class AntigravityHudManager {
       const effectiveViewCount = isSubpane ? Math.max(2, views.length) : Math.max(1, mainPaneCount);
       const convId = this.resolveConversationId(view, rawCascadeId, effectiveViewCount, isSubpane);
       const modelId = this.resolveActiveModel(view, effectiveViewCount);
+      const modelCapacity = this.resolveActiveModelCapacity(view, effectiveViewCount);
       const sharedButtons = typeof view.querySelectorAll === 'function' ? view.querySelectorAll('button, [role="button"]') : null;
       const subagentState = this.resolveSubagentState(view, { isSubpane, buttons: sharedButtons });
       const activityPhase = this.resolveActivityPhase(view, subagentState, { isSubpane, buttons: sharedButtons });
@@ -353,9 +372,9 @@ export class AntigravityHudManager {
       }
       if (instance.getCurrentConvId() !== convId) {
         instance.switchConversation(convId, modelId, isStreaming, subagentState.isSubagentRunning,
-          subagentState.runningSubagentCount, domSubagentIds, activityPhase);
+          subagentState.runningSubagentCount, domSubagentIds, activityPhase, modelCapacity);
       } else instance.notifyModelOrStreamingChange(modelId, isStreaming, subagentState.isSubagentRunning,
-        subagentState.runningSubagentCount, domSubagentIds, activityPhase);
+        subagentState.runningSubagentCount, domSubagentIds, activityPhase, modelCapacity);
     }
   }
 
@@ -491,11 +510,56 @@ export class AntigravityHudManager {
     return totalViews > 1 ? null : 'default';
   }
 
+  parseContextWindowTokens(raw) {
+    if (typeof raw === 'number') {
+      const rounded = Math.round(raw);
+      return Number.isSafeInteger(rounded) && rounded >= 4096 && rounded <= 10_000_000 ? rounded : undefined;
+    }
+    if (typeof raw !== 'string') return undefined;
+    const cleaned = raw.trim().replace(/,/g, '');
+    if (!cleaned) return undefined;
+    const match = cleaned.match(/^(\d+(?:\.\d+)?)\s*([kKmM])?(?:\s*(?:tok|tokens))?$/);
+    if (!match) return undefined;
+    const num = Number(match[1]);
+    if (!Number.isFinite(num) || num <= 0) return undefined;
+    const unit = (match[2] || '').toLowerCase();
+    const mult = unit === 'm' ? 1_000_000 : unit === 'k' ? 1_000 : 1;
+    const tokens = Math.round(num * mult);
+    return Number.isSafeInteger(tokens) && tokens >= 4096 && tokens <= 10_000_000 ? tokens : undefined;
+  }
+
+  findModelSelectorTrigger(view, totalViews = 1) {
+    if (!view || typeof view.querySelector !== 'function') return null;
+    const localTrigger =
+      view.querySelector('[data-testid="model-selector-trigger"]') ||
+      view.querySelector('.model-selector') ||
+      view.querySelector(
+        'button[data-context-window], button[data-model-id], button[aria-label*="Select model"], button[aria-label*="选择模型"]'
+      );
+    if (localTrigger) return localTrigger;
+    if (totalViews === 1 && typeof document !== 'undefined') {
+      return document.querySelector(
+        '[data-testid="model-selector-trigger"], .model-selector, button[data-context-window], button[aria-label*="Select model"], button[aria-label*="选择模型"]'
+      );
+    }
+    return null;
+  }
+
+  resolveActiveModelCapacity(view, totalViews = 1) {
+    const trigger = this.findModelSelectorTrigger(view, totalViews);
+    if (!trigger || typeof trigger.getAttribute !== 'function') return undefined;
+    const raw = trigger.getAttribute('data-context-window');
+    return this.parseContextWindowTokens(raw);
+  }
+
   resolveActiveModel(view, totalViews = 1) {
     if (!view || typeof view.querySelector !== 'function') return '';
     const localTrigger =
       view.querySelector('[data-testid="model-selector-trigger"]') ||
-      view.querySelector('.model-selector');
+      view.querySelector('.model-selector') ||
+      view.querySelector(
+        'button[data-context-window], button[data-model-id], button[aria-label*="Select model"], button[aria-label*="选择模型"]'
+      );
 
     const extractFromTrigger = (trigger) => {
       if (!trigger) return null;
@@ -504,7 +568,7 @@ export class AntigravityHudManager {
       if (dataModel && dataModel.trim()) return dataModel.trim();
 
       const aria = trigger.getAttribute?.('aria-label') || trigger.getAttribute?.('title') || '';
-      const ariaMatch = aria.match(/(?:current:|当前：)\s*(.+)$/i);
+      const ariaMatch = aria.match(/(?:current:|当前[：:])\s*(.+)$/i);
       if (ariaMatch && ariaMatch[1]) return ariaMatch[1].trim();
 
       const text = (trigger.textContent || '').replace(/\s+/g, ' ').trim();
@@ -530,6 +594,17 @@ export class AntigravityHudManager {
           ) {
             return;
           }
+          const attrCandidate = extractFromTrigger(
+            btn.hasAttribute?.('data-model-id') ||
+              btn.hasAttribute?.('data-context-window') ||
+              /(?:Select model|选择模型)/i.test(btn.getAttribute?.('aria-label') || '')
+              ? btn
+              : null
+          );
+          if (attrCandidate) {
+            matchedModel = attrCandidate;
+            return;
+          }
           const t = (btn.textContent || '').replace(/\s+/g, ' ').trim();
           if (/\b(?:Orchestrator|Gemini|Claude|GPT|o1|o3|o4)\b/i.test(t)) {
             matchedModel = t;
@@ -541,7 +616,7 @@ export class AntigravityHudManager {
 
     if (totalViews === 1 && typeof document !== 'undefined') {
       const globalTrigger = document.querySelector(
-        '[data-testid="model-selector-trigger"], .model-selector'
+        '[data-testid="model-selector-trigger"], .model-selector, button[data-context-window], button[aria-label*="Select model"], button[aria-label*="选择模型"]'
       );
       const globalModel = extractFromTrigger(globalTrigger);
       if (globalModel) return globalModel;
@@ -998,6 +1073,10 @@ export class AntigravityHudManager {
     if (this.mutationObserver) {
       this.mutationObserver.disconnect();
       this.mutationObserver = null;
+    }
+    if (this.themeObserver) {
+      this.themeObserver.disconnect();
+      this.themeObserver = null;
     }
     for (const instance of this.instances.values()) {
       instance.dispose();

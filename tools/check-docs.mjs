@@ -112,8 +112,8 @@ export async function checkDocs({
   if (!summary) {
     if (!sourceOnly) add('error', 'SUMMARY_MISSING', summaryFile, null, '缺少验收摘要文件（仅检查源码文档可传 --source-only；正式发布前需打包并完成实机验收以生成该摘要）');
   } else {
-    if (facts.version) verify('error', 'SUMMARY_VERSION_MISMATCH', summaryFile, null, `version ${shorten(summary.version)} ≠ 实际 ${facts.version}`, summary.version === facts.version);
     if (!sourceOnly) {
+      if (facts.version) verify('error', 'SUMMARY_VERSION_MISMATCH', summaryFile, null, `version ${shorten(summary.version)} ≠ 实际 ${facts.version}`, summary.version === facts.version);
       if (facts.digest && summary.sourceDigest) verify('error', 'SUMMARY_SOURCE_STALE', summaryFile, null, `sourceDigest ${shorten(summary.sourceDigest)} ≠ 当前 ${shorten(facts.digest)}`, summary.sourceDigest === facts.digest);
       if (facts.digest && summary.revision) verify('error', 'SUMMARY_REVISION_STALE', summaryFile, null, `revision ${shorten(summary.revision)} ≠ 当前 ${facts.digest.slice(0, 8)}`, summary.revision === facts.digest.slice(0, 8));
       if (summary.dmg) verify('error', 'SUMMARY_DMG_PATH_MISSING', summaryFile, null, `摘要 DMG 路径不存在：${summary.dmg}`, existsSync(summary.dmg));

@@ -8,10 +8,12 @@ import {
   GENERATION_PROJECTION,
   STEP_PROJECTION,
   USAGE_PROTO_LIMITS,
+  HUD_GEN_PROTO_LIMITS,
   HUD_STEP_METADATA_PROJECTION,
   HUD_STEP_METADATA_MINIMAL_PROJECTION,
   HUD_STEP_RENDER_INFO_PROJECTION,
   HUD_GEN_METADATA_PROJECTION,
+  HUD_EXECUTOR_METADATA_PROJECTION,
 } from './protobuf-projection.js';
 
 export interface HudWorkerScanRequest {
@@ -24,6 +26,7 @@ export interface HudWorkerScanRequest {
   };
   cachedTrajectoryId?: string;
   prevParentMetaDigest?: string;
+  prevExecutorMetaDigest?: string;
   prevStepPrefixCutoffIdx?: number;
   prevStepPrefixDigest?: string;
   prevGenDigest?: string;
@@ -52,6 +55,9 @@ export interface HudWorkerScanResult {
   parentMetaReadError: boolean;
   parentMetaUnchanged: boolean;
   parentMetaDigest: string;
+  executorMetaUnchanged?: boolean;
+  executorMetaDigest?: string;
+  executorMetaBlob?: Uint8Array | null;
   trajectoryId?: string;
   metaBlobProjectedSlices: Uint8Array[];
   maxIdx: number;
@@ -91,9 +97,44 @@ function hashRawStepRow(hash: Hash, r: any): void {
   hash.update('\n');
 }
 
-function hashRawGenRow(hash: Hash, idx: number, dataLen: number, blob: Uint8Array | null | undefined): void {
+const MAX_PROJECTED_GEN_CACHE_ENTRIES = 128;
+const projectedGenBlobCache = new Map<string, Uint8Array | null>();
+
+function getCachedProjectedGenBlob(cacheKey: string): Uint8Array | null | undefined {
+  if (!projectedGenBlobCache.has(cacheKey)) return undefined;
+  const val = projectedGenBlobCache.get(cacheKey)!;
+  projectedGenBlobCache.delete(cacheKey);
+  projectedGenBlobCache.set(cacheKey, val);
+  return val;
+}
+
+function setCachedProjectedGenBlob(cacheKey: string, value: Uint8Array | null): void {
+  if (projectedGenBlobCache.has(cacheKey)) {
+    projectedGenBlobCache.delete(cacheKey);
+  }
+  projectedGenBlobCache.set(cacheKey, value);
+  while (projectedGenBlobCache.size > MAX_PROJECTED_GEN_CACHE_ENTRIES) {
+    const oldest = projectedGenBlobCache.keys().next().value;
+    if (oldest === undefined) break;
+    projectedGenBlobCache.delete(oldest);
+  }
+}
+
+function hashRawGenRowMeta(
+  hash: Hash,
+  idx: number,
+  dataLen: number,
+  inlineData: Uint8Array | null | undefined,
+  dataHead?: Uint8Array | null,
+  dataTail?: Uint8Array | null
+): void {
   hash.update(`${idx}:${dataLen}:`);
-  if (blob && blob.byteLength > 0) hash.update(blob);
+  if (inlineData && inlineData.byteLength > 0) {
+    hash.update(inlineData);
+  } else {
+    if (dataHead && dataHead.byteLength > 0) hash.update(dataHead);
+    if (dataTail && dataTail.byteLength > 0) hash.update(dataTail);
+  }
   hash.update('\n');
 }
 
@@ -142,11 +183,12 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
     const metaBlobProjectedSlices: Uint8Array[] = [];
 
     const tables = db
-      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('trajectory_meta', 'trajectory_metadata_blob', 'gen_metadata')")
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('trajectory_meta', 'trajectory_metadata_blob', 'gen_metadata', 'executor_metadata')")
       .all() as Array<{ name?: string }>;
     const tableSet = new Set(tables.map(t => String(t.name ?? '')));
     hasTrajectoryMeta = tableSet.has('trajectory_meta');
     const hasGenTable = tableSet.has('gen_metadata');
+    const hasExecutorMetaTable = tableSet.has('executor_metadata');
     if (hasTrajectoryMeta && !trajectoryId) {
       try {
         const tm = db
@@ -216,7 +258,7 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
       }
       if (hasRenderInfoColumn) {
         extraCols.push(
-          `CASE WHEN step_type IN (85, 127, 132) AND length(render_info) <= ${inlineLimit} THEN render_info WHEN step_type NOT IN (14, 15, 23, 101) AND length(metadata) > ${inlineLimit} THEN substr(render_info, 1, 16384) ELSE NULL END as render_info, CASE WHEN step_type IN (85, 127, 132) THEN COALESCE(length(render_info), 0) ELSE 0 END as render_info_len, CASE WHEN step_type IN (85, 127, 132) AND length(render_info) > ${inlineLimit} THEN substr(render_info, 1, 512) ELSE NULL END as render_info_head, CASE WHEN step_type IN (85, 127, 132) AND length(render_info) > ${inlineLimit} THEN substr(render_info, max(1, length(render_info) - 511), 512) ELSE NULL END as render_info_tail`
+          `CASE WHEN step_type IN (85, 127, 132) AND length(render_info) <= ${inlineLimit} THEN render_info WHEN step_type NOT IN (14, 15, 23, 85, 101, 127, 132) AND length(metadata) > ${inlineLimit} THEN substr(render_info, 1, 16384) ELSE NULL END as render_info, CASE WHEN step_type IN (85, 127, 132) THEN COALESCE(length(render_info), 0) ELSE 0 END as render_info_len, CASE WHEN step_type IN (85, 127, 132) AND length(render_info) > ${inlineLimit} THEN substr(render_info, 1, 512) ELSE NULL END as render_info_head, CASE WHEN step_type IN (85, 127, 132) AND length(render_info) > ${inlineLimit} THEN substr(render_info, max(1, length(render_info) - 511), 512) ELSE NULL END as render_info_tail`
         );
       }
       if (hasStepPayloadColumn) {
@@ -374,6 +416,56 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
       rows.length = 0;
     }
 
+    let executorMetaUnchanged = false;
+    let executorMetaDigest = '';
+    let executorMetaBlob: Uint8Array | null = null;
+    if (hasExecutorMetaTable) {
+      try {
+        const execRow = db
+          .prepare(
+            `SELECT idx, length(data) AS dataLen, CASE WHEN length(data) <= ${inlineLimit} THEN data ELSE NULL END AS inlineData, CASE WHEN length(data) > ${inlineLimit} THEN substr(data, 1, 512) ELSE NULL END AS dataHead, CASE WHEN length(data) > ${inlineLimit} THEN substr(data, max(1, length(data) - 511), 512) ELSE NULL END AS dataTail FROM executor_metadata WHERE data IS NOT NULL ORDER BY idx DESC LIMIT 1`
+          )
+          .get() as
+          | {
+              idx: number;
+              dataLen: number;
+              inlineData: Uint8Array | null;
+              dataHead: Uint8Array | null;
+              dataTail: Uint8Array | null;
+            }
+          | undefined;
+        if (execRow && Number(execRow.dataLen ?? 0) > 0) {
+          const execIdx = Number(execRow.idx);
+          const execLen = Number(execRow.dataLen ?? 0);
+          const execHasher = createHash('sha256');
+          hashRawGenRowMeta(execHasher, execIdx, execLen, execRow.inlineData, execRow.dataHead, execRow.dataTail);
+          executorMetaDigest = execHasher.digest('hex');
+          if (req.prevExecutorMetaDigest && executorMetaDigest === req.prevExecutorMetaDigest) {
+            executorMetaUnchanged = true;
+          } else {
+            const inlineBuf = execRow.inlineData && execLen <= inlineLimit ? execRow.inlineData : null;
+            let execChunkStmt: ReturnType<DatabaseSync['prepare']> | undefined;
+            const projected = projectProtobuf(
+              execLen,
+              (offset, length) => {
+                if (inlineBuf) return inlineBuf.subarray(offset, offset + length);
+                execChunkStmt ??= db.prepare('SELECT substr(data, ?, ?) AS chunk FROM executor_metadata WHERE idx = ?');
+                return (
+                  (execChunkStmt.get(offset + 1, length, execIdx) as { chunk?: Uint8Array } | undefined)?.chunk ??
+                  new Uint8Array(0)
+                );
+              },
+              HUD_EXECUTOR_METADATA_PROJECTION,
+              HUD_GEN_PROTO_LIMITS
+            );
+            executorMetaBlob = detachBuf(projected.data);
+          }
+        }
+      } catch {
+        // 兼容无 executor_metadata 表或损坏行，就地降级
+      }
+    }
+
     let genMode: 'full' | 'append' | 'unchanged' = 'full';
     let lastGenIdx = -1;
     let genDigest = '';
@@ -383,27 +475,42 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
 
     if (hasGenTable) {
       let chunkStmt: ReturnType<DatabaseSync['prepare']> | undefined;
-      const resolveRawGenBlob = (idx: number, dataLen: number, inlineData: Uint8Array | null | undefined): Uint8Array | null => {
+      const resolveRawGenBlob = (
+        idx: number,
+        dataLen: number,
+        inlineData: Uint8Array | null | undefined,
+        dataHead?: Uint8Array | null,
+        dataTail?: Uint8Array | null
+      ): Uint8Array | null => {
         if (dataLen <= 0) return null;
         if (dataLen <= inlineLimit) {
           return inlineData && inlineData.byteLength > 0 ? inlineData : null;
         }
+        const keyHasher = createHash('sha256');
+        keyHasher.update(`${req.dbPath}|${idx}|${dataLen}|`);
+        if (dataHead && dataHead.byteLength > 0) keyHasher.update(dataHead);
+        if (dataTail && dataTail.byteLength > 0) keyHasher.update(dataTail);
+        const cacheKey = keyHasher.digest('hex');
+        const cached = getCachedProjectedGenBlob(cacheKey);
+        if (cached !== undefined) return cached;
         try {
           chunkStmt ??= db.prepare('SELECT substr(data, ?, ?) AS chunk FROM gen_metadata WHERE idx = ?');
           const projected = projectProtobuf(
             dataLen,
             (offset, length) => (chunkStmt!.get(offset + 1, length, idx) as { chunk?: Uint8Array } | undefined)?.chunk ?? new Uint8Array(0),
             HUD_GEN_METADATA_PROJECTION,
-            { skipOversizedLeafFields: true }
+            HUD_GEN_PROTO_LIMITS
           );
-          return projected.data;
+          const resultBuf = Uint8Array.from(projected.data);
+          setCachedProjectedGenBlob(cacheKey, resultBuf);
+          return resultBuf;
         } catch {
           // 单行生成元数据投影异常就地降级，避免阻断整库读取
           return null;
         }
       };
 
-      const genColsSql = `idx, length(data) AS dataLen, CASE WHEN length(data) <= ${inlineLimit} THEN data ELSE NULL END AS inlineData`;
+      const genColsSql = `idx, length(data) AS dataLen, CASE WHEN length(data) <= ${inlineLimit} THEN data ELSE NULL END AS inlineData, CASE WHEN length(data) > ${inlineLimit} THEN substr(data, 1, 512) ELSE NULL END AS dataHead, CASE WHEN length(data) > ${inlineLimit} THEN substr(data, max(1, length(data) - 511), 512) ELSE NULL END AS dataTail`;
       let usedIncrementalGen = false;
 
       if (
@@ -414,22 +521,16 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
         const genPrefixHasher = createHash('sha256');
         let prefixGenCount = 0;
         let prefixMaxGenIdx = -1;
-        let prefixAllInline = true;
         for (const r of db
           .prepare(`SELECT ${genColsSql} FROM gen_metadata WHERE data IS NOT NULL AND idx < ? ORDER BY idx ASC`)
           .iterate(req.prevGenPrefixCutoffIdx) as Iterable<any>) {
           const idx = Number(r.idx);
           const dataLen = Number(r.dataLen ?? 0);
-          if (dataLen > inlineLimit) {
-            prefixAllInline = false;
-            break;
-          }
-          hashRawGenRow(genPrefixHasher, idx, dataLen, r.inlineData);
+          hashRawGenRowMeta(genPrefixHasher, idx, dataLen, r.inlineData, r.dataHead, r.dataTail);
           prefixGenCount++;
           prefixMaxGenIdx = idx;
         }
         if (
-          prefixAllInline &&
           prefixGenCount > 0 &&
           genPrefixHasher.copy().digest('hex') === req.prevGenPrefixDigest
         ) {
@@ -439,27 +540,21 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
             .all(req.prevGenPrefixCutoffIdx) as any[];
           lastGenIdx = tailGenRows.length > 0 ? Number(tailGenRows[tailGenRows.length - 1]!.idx) : prefixMaxGenIdx;
           const fullGenHasher = genPrefixHasher.copy();
-          const resolvedTail: Array<{ idx: number; dataLen: number; rawBlob: Uint8Array | null }> = [];
-          for (let i = 0; i < tailGenRows.length; i++) {
-            const r = tailGenRows[i];
-            tailGenRows[i] = null;
+          for (const r of tailGenRows) {
             if (!r) continue;
-            const idx = Number(r.idx);
-            const dataLen = Number(r.dataLen ?? 0);
-            const rawBlob = resolveRawGenBlob(idx, dataLen, r.inlineData);
-            hashRawGenRow(fullGenHasher, idx, dataLen, rawBlob);
-            resolvedTail.push({ idx, dataLen, rawBlob });
+            hashRawGenRowMeta(fullGenHasher, Number(r.idx), Number(r.dataLen ?? 0), r.inlineData, r.dataHead, r.dataTail);
           }
-          tailGenRows.length = 0;
           genDigest = fullGenHasher.digest('hex');
           let advanceGen = 0;
-          while (advanceGen < resolvedTail.length - 1 && resolvedTail[advanceGen]!.dataLen <= inlineLimit) {
-            const item = resolvedTail[advanceGen]!;
-            hashRawGenRow(genPrefixHasher, item.idx, item.dataLen, item.rawBlob);
+          while (advanceGen < tailGenRows.length - 1) {
+            const r = tailGenRows[advanceGen];
+            if (r) {
+              hashRawGenRowMeta(genPrefixHasher, Number(r.idx), Number(r.dataLen ?? 0), r.inlineData, r.dataHead, r.dataTail);
+            }
             advanceGen++;
           }
           if (advanceGen > 0) {
-            genPrefixCutoffIdx = resolvedTail[advanceGen]!.idx;
+            genPrefixCutoffIdx = Number(tailGenRows[advanceGen]!.idx);
             genPrefixDigest = genPrefixHasher.digest('hex');
           } else {
             genPrefixCutoffIdx = req.prevGenPrefixCutoffIdx;
@@ -469,13 +564,18 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
             genMode = 'unchanged';
           } else {
             genMode = 'append';
-            for (const item of resolvedTail) {
-              const detached = detachBuf(item.rawBlob);
-              item.rawBlob = null;
-              if (detached) genBlobs.push({ idx: item.idx, data: detached });
+            for (let i = 0; i < tailGenRows.length; i++) {
+              const r = tailGenRows[i];
+              tailGenRows[i] = null;
+              if (!r) continue;
+              const idx = Number(r.idx);
+              const dataLen = Number(r.dataLen ?? 0);
+              const rawBlob = resolveRawGenBlob(idx, dataLen, r.inlineData, r.dataHead, r.dataTail);
+              const detached = detachBuf(rawBlob);
+              if (detached) genBlobs.push({ idx, data: detached });
             }
           }
-          resolvedTail.length = 0;
+          tailGenRows.length = 0;
         }
       }
 
@@ -486,40 +586,39 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
         lastGenIdx = allGenRows.length > 0 ? Number(allGenRows[allGenRows.length - 1]!.idx) : -1;
         const fullGenHasher = createHash('sha256');
         const prefixGenHasher = createHash('sha256');
-        const resolvedAll: Array<{ idx: number; dataLen: number; rawBlob: Uint8Array | null }> = [];
-        for (let i = 0; i < allGenRows.length; i++) {
-          const r = allGenRows[i];
-          allGenRows[i] = null;
+        for (const r of allGenRows) {
           if (!r) continue;
-          const idx = Number(r.idx);
-          const dataLen = Number(r.dataLen ?? 0);
-          const rawBlob = resolveRawGenBlob(idx, dataLen, r.inlineData);
-          hashRawGenRow(fullGenHasher, idx, dataLen, rawBlob);
-          resolvedAll.push({ idx, dataLen, rawBlob });
+          hashRawGenRowMeta(fullGenHasher, Number(r.idx), Number(r.dataLen ?? 0), r.inlineData, r.dataHead, r.dataTail);
         }
-        allGenRows.length = 0;
         genDigest = fullGenHasher.digest('hex');
         let prefixEnd = 0;
-        while (prefixEnd < resolvedAll.length - 1 && resolvedAll[prefixEnd]!.dataLen <= inlineLimit) {
-          const item = resolvedAll[prefixEnd]!;
-          hashRawGenRow(prefixGenHasher, item.idx, item.dataLen, item.rawBlob);
+        while (prefixEnd < allGenRows.length - 1) {
+          const r = allGenRows[prefixEnd];
+          if (r) {
+            hashRawGenRowMeta(prefixGenHasher, Number(r.idx), Number(r.dataLen ?? 0), r.inlineData, r.dataHead, r.dataTail);
+          }
           prefixEnd++;
         }
         if (prefixEnd > 0) {
-          genPrefixCutoffIdx = resolvedAll[prefixEnd]!.idx;
+          genPrefixCutoffIdx = Number(allGenRows[prefixEnd]!.idx);
           genPrefixDigest = prefixGenHasher.digest('hex');
         }
         if (req.prevGenDigest !== undefined && genDigest === req.prevGenDigest) {
           genMode = 'unchanged';
         } else {
           genMode = 'full';
-          for (const item of resolvedAll) {
-            const detached = detachBuf(item.rawBlob);
-            item.rawBlob = null;
-            if (detached) genBlobs.push({ idx: item.idx, data: detached });
+          for (let i = 0; i < allGenRows.length; i++) {
+            const r = allGenRows[i];
+            allGenRows[i] = null;
+            if (!r) continue;
+            const idx = Number(r.idx);
+            const dataLen = Number(r.dataLen ?? 0);
+            const rawBlob = resolveRawGenBlob(idx, dataLen, r.inlineData, r.dataHead, r.dataTail);
+            const detached = detachBuf(rawBlob);
+            if (detached) genBlobs.push({ idx, data: detached });
           }
         }
-        resolvedAll.length = 0;
+        allGenRows.length = 0;
       }
     }
 
@@ -533,6 +632,9 @@ function executeHudScan(req: HudWorkerScanRequest): { result: HudWorkerScanResul
         parentMetaReadError,
         parentMetaUnchanged,
         parentMetaDigest,
+        executorMetaUnchanged,
+        executorMetaDigest,
+        executorMetaBlob,
         trajectoryId,
         metaBlobProjectedSlices,
         maxIdx,
@@ -763,7 +865,8 @@ function hasValidStartedAtField4(startBuf: Uint8Array): boolean {
         if ((tsTag & 0x07) === 0 && (tsTag >>> 3) === 1) {
           try {
             const sec = Number(decodeVarint64(tsBuf, cTs));
-            if (Number.isFinite(sec) && sec >= 946_684_800) return true;
+            const maxValidSec = Math.floor(Date.now() / 1000) + 86400;
+            if (Number.isFinite(sec) && sec >= 946_684_800 && sec <= maxValidSec) return true;
           } catch {
             break;
           }

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import * as hudExports from "../dist/hud.js";
+import { clearObservedIdeModelsForTest, registerObservedIdeModels } from "../dist/model-catalog.js";
 import { AntigravityHudManager } from "../runtime/hud-manager.js";
 const { computeTps, parseProtobufTimestamp, parseStepMetadataBlob, parseLatestGenMetadataBlob, ConversationMetricsEngine, buildConversationHudMetrics, resolveModelCapacity } = hudExports;
 
@@ -942,7 +943,7 @@ test('Case G: Orchestrator (Carbon / Hydrogen) 双阶段分模型独立水位与
   assert.equal(switchedPending.context.modelStages?.[2]?.section, 'primary');
 });
 
-test('Case H: 独立 Hydrogen 切入 Orchestrator 仅显示通用待介入执行阶段与历史模型分组，执行器介入后去重', () => {
+test('Case H: 独立 Hydrogen 切入未知执行器的 Orchestrator 仅显示通用待介入执行阶段与统一主列表，执行器介入后去重', () => {
   const standaloneHydrogenStep = {
     idx: 1,
     stepType: 15,
@@ -997,7 +998,7 @@ test('Case H: 独立 Hydrogen 切入 Orchestrator 仅显示通用待介入执行
     },
   };
 
-  // 1. 仅选中 Orchestrator (Carbon)，尚未跑 Carbon 与执行器：Carbon(primary) + pending(primary) + 历史 Hydrogen(history)
+  // 1. 仅选中 Orchestrator (Carbon)，尚未跑 Carbon 与执行器：Carbon(primary) + pending(primary) + 历史 Hydrogen(primary)
   const pendingCarbon = buildConversationHudMetrics({
     conversationId: 'conv-standalone-to-orch',
     sessionRevision: 1,
@@ -1012,10 +1013,10 @@ test('Case H: 独立 Hydrogen 切入 Orchestrator 仅显示通用待介入执行
   assert.equal(pendingCarbon.context.modelStages?.[1]?.shortLabel, '');
   assert.equal(pendingCarbon.context.modelStages?.[1]?.section, 'primary');
   assert.equal(pendingCarbon.context.modelStages?.[2]?.slotKey, 'model:gemini-4-hydrogen');
-  assert.equal(pendingCarbon.context.modelStages?.[2]?.section, 'history');
+  assert.equal(pendingCarbon.context.modelStages?.[2]?.section, 'primary');
   assert.equal(pendingCarbon.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
 
-  // 2. Carbon 规划阶段完成、执行器仍未运行：保留历史 Hydrogen 在 history 分组，总计仅 1 个 Hydrogen
+  // 2. Carbon 规划阶段完成、执行器仍未运行：统一在 primary 列表中保留历史 Hydrogen，总计仅 1 个 Hydrogen
   const beforeExecutor = buildConversationHudMetrics({
     conversationId: 'conv-standalone-to-orch',
     sessionRevision: 2,
@@ -1037,10 +1038,10 @@ test('Case H: 独立 Hydrogen 切入 Orchestrator 仅显示通用待介入执行
   assert.equal(beforeExecutor.context.modelStages?.[1]?.section, 'primary');
   assert.equal(beforeExecutor.context.modelStages?.[1]?.capacityTokens, 512000);
   assert.equal(beforeExecutor.context.modelStages?.[2]?.slotKey, 'model:gemini-4-hydrogen');
-  assert.equal(beforeExecutor.context.modelStages?.[2]?.section, 'history');
+  assert.equal(beforeExecutor.context.modelStages?.[2]?.section, 'primary');
   assert.equal(beforeExecutor.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
 
-  // 3. Hydrogen 执行器运行后：历史独立 Hydrogen 被去重剔除，仅保留 Carbon + Orchestrator Hydrogen 2 个主阶段
+  // 3. Hydrogen 执行器运行后：历史独立 Hydrogen 被去重吸收，仅保留 Carbon + Orchestrator Hydrogen 2 个主阶段
   const afterExecutor = buildConversationHudMetrics({
     conversationId: 'conv-standalone-to-orch',
     sessionRevision: 3,
@@ -1064,7 +1065,7 @@ test('Case H: 独立 Hydrogen 切入 Orchestrator 仅显示通用待介入执行
   assert.equal(afterExecutor.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
 });
 
-test('Case I: Orchestrator 后新轮切回独立 Gemini 4 Hydrogen (High) 按轮次隔离角色并去重', () => {
+test('Case I: Orchestrator 后新轮切回独立 Gemini 4 Hydrogen (High) 保持非 Orchestrator 上下文上限并保留曾用 executor 角色去重', () => {
   const carbonStep = {
     idx: 1,
     stepType: 15,
@@ -1139,16 +1140,17 @@ test('Case I: Orchestrator 后新轮切回独立 Gemini 4 Hydrogen (High) 按轮
   assert.equal(res.context.capacityTokens, 200000);
   assert.equal(res.context.modelStages?.length, 2);
   assert.equal(res.context.modelStages?.[0]?.slotKey, 'orchestrator:carbon');
+  assert.equal(res.context.modelStages?.[0]?.role, 'planner');
   assert.equal(res.context.modelStages?.[0]?.section, 'primary');
   assert.equal(res.context.modelStages?.[0]?.isActive, false);
-  assert.equal(res.context.modelStages?.[1]?.slotKey, 'model:gemini-4-hydrogen');
-  assert.equal(res.context.modelStages?.[1]?.role, 'model');
+  assert.equal(res.context.modelStages?.[1]?.slotKey, 'orchestrator:hydrogen');
+  assert.equal(res.context.modelStages?.[1]?.role, 'executor');
   assert.equal(res.context.modelStages?.[1]?.section, 'primary');
   assert.equal(res.context.modelStages?.[1]?.isActive, true);
   assert.equal(res.context.modelStages?.[1]?.usedTokens, 80000);
   assert.equal(res.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
 
-  // 同理，若第 2 轮步骤仅通过 step.modelName / modelId 传入（无 generation），仍必须归类为独立 model 而非 executor
+  // 同理，若第 2 轮步骤仅通过 step.modelName / modelId 传入（无 generation），仍必须保留独立模型 200K 上限且保留 executor 角色标记
   const resFallbackModel = buildConversationHudMetrics({
     conversationId: 'conv-orch-to-standalone-hydrogen-fallback',
     sessionRevision: 2,
@@ -1162,10 +1164,262 @@ test('Case I: Orchestrator 后新轮切回独立 Gemini 4 Hydrogen (High) 按轮
     ],
   });
   assert.equal(Boolean(resFallbackModel.context.isOrchestrator), false);
+  assert.equal(resFallbackModel.context.capacityTokens, 200000);
   assert.equal(resFallbackModel.context.modelStages?.length, 2);
-  assert.equal(resFallbackModel.context.modelStages?.[1]?.slotKey, 'model:gemini-4-hydrogen');
-  assert.equal(resFallbackModel.context.modelStages?.[1]?.role, 'model');
+  assert.equal(resFallbackModel.context.modelStages?.[1]?.slotKey, 'orchestrator:hydrogen');
+  assert.equal(resFallbackModel.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(resFallbackModel.context.modelStages?.[1]?.isActive, true);
   assert.equal(resFallbackModel.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
+});
+
+test('Case J: 独立 Hydrogen (167K/512K) 切入 Neon+Hydrogen Orchestrator 规划阶段立即吸收不重复、执行后阶段数与角色稳定', (t) => {
+  t.after(() => clearObservedIdeModelsForTest());
+  clearObservedIdeModelsForTest();
+  registerObservedIdeModels([
+    { modelId: 'gemini-4-neon', displayName: 'Gemini 4 Neon (High)', modelOrAlias: 'MODEL_PLACEHOLDER_M532', modelEnum: 1532 },
+    { modelId: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen (XHigh)', modelOrAlias: 'MODEL_PLACEHOLDER_M528', modelEnum: 1528 },
+  ]);
+
+  const standaloneHydrogenStep = {
+    idx: 1,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 50,
+    endTimeSeconds: 60,
+    rawInputTokens: 17000,
+    cachedReadTokens: 150000,
+    cacheWriteTokens: 0,
+    outputTokens: 600,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 512000,
+    },
+  };
+  const neonPlannerStep = {
+    idx: 3,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 100,
+    endTimeSeconds: 112,
+    rawInputTokens: 8000,
+    cachedReadTokens: 92000,
+    cacheWriteTokens: 0,
+    outputTokens: 900,
+    generation: {
+      modelEnum: 1532,
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-neon',
+      modelDisplayName: 'Gemini 4 Neon (High)',
+      maxContextTokens: 512000,
+    },
+  };
+  const hydrogenExecStep = {
+    idx: 4,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 115,
+    endTimeSeconds: 122,
+    rawInputTokens: 12000,
+    cachedReadTokens: 168000,
+    cacheWriteTokens: 0,
+    outputTokens: 700,
+    generation: {
+      modelEnum: 1528,
+      planModelEnum: 1528,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+      maxContextTokens: 512000,
+    },
+  };
+
+  // 0. 刚切换至 Orchestrator (Neon 规划 + Hydrogen 待介入执行器)、Neon 尚未发言前：直接吸收历史 Hydrogen 至 executor 槽位，不出现待介入重复行
+  const beforeNeonPlan = buildConversationHudMetrics({
+    conversationId: 'conv-orch-hydrogen-absorb-preplan',
+    sessionRevision: 0,
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    executorMetadata: {
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      checkpointMaxTokenLimit: 512000,
+    },
+    steps: [{ idx: 0, stepType: 14, status: 3 }, standaloneHydrogenStep],
+  });
+  assert.equal(beforeNeonPlan.context.isOrchestrator, true);
+  assert.equal(beforeNeonPlan.context.modelStages?.length, 2);
+  assert.equal(beforeNeonPlan.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
+  assert.equal(beforeNeonPlan.context.modelStages?.[0]?.slotKey, 'orchestrator:neon');
+  assert.equal(beforeNeonPlan.context.modelStages?.[0]?.role, 'planner');
+  assert.equal(beforeNeonPlan.context.modelStages?.[0]?.hasUsageData, false);
+  assert.equal(beforeNeonPlan.context.modelStages?.[0]?.capacityTokens, 512000);
+  assert.equal(beforeNeonPlan.context.modelStages?.[0]?.isActive, false);
+  assert.equal(beforeNeonPlan.context.modelStages?.[1]?.slotKey, 'orchestrator:hydrogen');
+  assert.equal(beforeNeonPlan.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(beforeNeonPlan.context.modelStages?.[1]?.hasUsageData, true);
+  assert.equal(beforeNeonPlan.context.modelStages?.[1]?.usedTokens, 167000);
+  assert.equal(beforeNeonPlan.context.modelStages?.[1]?.isActive, true);
+
+  // 1. 先运行独立 Hydrogen (167K / 512K)，再进入 Orchestrator (Neon 规划 + Hydrogen 待介入执行器)
+  const planningPhase = buildConversationHudMetrics({
+    conversationId: 'conv-orch-hydrogen-absorb-planning',
+    sessionRevision: 1,
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    executorMetadata: {
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      checkpointMaxTokenLimit: 512000,
+    },
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      standaloneHydrogenStep,
+      { idx: 2, stepType: 14, status: 3 },
+      neonPlannerStep,
+    ],
+  });
+  assert.equal(planningPhase.context.isOrchestrator, true);
+  assert.equal(planningPhase.context.modelStages?.length, 2, '规划阶段不得同时出现 pending executor 与历史 Hydrogen');
+  assert.equal(planningPhase.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
+  assert.equal(planningPhase.context.modelStages?.[0]?.slotKey, 'orchestrator:neon');
+  assert.equal(planningPhase.context.modelStages?.[0]?.role, 'planner');
+  assert.equal(planningPhase.context.modelStages?.[0]?.section, 'primary');
+  assert.equal(planningPhase.context.modelStages?.[0]?.isActive, true);
+  assert.equal(planningPhase.context.modelStages?.[1]?.slotKey, 'orchestrator:hydrogen');
+  assert.equal(planningPhase.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(planningPhase.context.modelStages?.[1]?.section, 'primary');
+  assert.equal(planningPhase.context.modelStages?.[1]?.hasUsageData, true);
+  assert.equal(planningPhase.context.modelStages?.[1]?.usedTokens, 167000);
+  assert.equal(planningPhase.context.modelStages?.[1]?.capacityTokens, 512000);
+  assert.equal(planningPhase.context.modelStages?.[1]?.isActive, false);
+
+  // 2. Hydrogen 执行器实际运行一步后：阶段总数保持 2、角色保持 executor、无跳变或突然消失
+  const execPhase = buildConversationHudMetrics({
+    conversationId: 'conv-orch-hydrogen-absorb-planning',
+    sessionRevision: 2,
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    executorMetadata: {
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      checkpointMaxTokenLimit: 512000,
+    },
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      standaloneHydrogenStep,
+      { idx: 2, stepType: 14, status: 3 },
+      neonPlannerStep,
+      hydrogenExecStep,
+    ],
+  });
+  assert.equal(execPhase.context.isOrchestrator, true);
+  assert.equal(execPhase.context.modelStages?.length, 2);
+  assert.equal(execPhase.context.modelStages?.filter((s) => s.modelId === 'gemini-4-hydrogen').length, 1);
+  assert.equal(execPhase.context.modelStages?.[0]?.role, 'planner');
+  assert.equal(execPhase.context.modelStages?.[0]?.isActive, false);
+  assert.equal(execPhase.context.modelStages?.[1]?.slotKey, 'orchestrator:hydrogen');
+  assert.equal(execPhase.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(execPhase.context.modelStages?.[1]?.section, 'primary');
+  assert.equal(execPhase.context.modelStages?.[1]?.isActive, true);
+  assert.equal(execPhase.context.modelStages?.[1]?.usedTokens, 180000);
+  assert.equal(execPhase.context.modelStages?.[1]?.peakContextTokens, 180000);
+});
+
+test('Case K: Orchestrator (Neon + Hydrogen) 后切至第 3 个模型 Claude，Neon/Hydrogen 仍保留 planner/executor 角色', (t) => {
+  t.after(() => clearObservedIdeModelsForTest());
+  clearObservedIdeModelsForTest();
+  registerObservedIdeModels([
+    { modelId: 'gemini-4-neon', displayName: 'Gemini 4 Neon (High)', modelOrAlias: 'MODEL_PLACEHOLDER_M532', modelEnum: 1532 },
+    { modelId: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen (XHigh)', modelOrAlias: 'MODEL_PLACEHOLDER_M528', modelEnum: 1528 },
+  ]);
+
+  const neonPlannerStep = {
+    idx: 1,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 100,
+    endTimeSeconds: 110,
+    rawInputTokens: 5000,
+    cachedReadTokens: 85000,
+    cacheWriteTokens: 0,
+    outputTokens: 600,
+    generation: {
+      modelEnum: 1532,
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-neon',
+      modelDisplayName: 'Gemini 4 Neon (High)',
+      maxContextTokens: 512000,
+    },
+  };
+  const hydrogenExecStep = {
+    idx: 2,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 112,
+    endTimeSeconds: 120,
+    rawInputTokens: 10000,
+    cachedReadTokens: 120000,
+    cacheWriteTokens: 0,
+    outputTokens: 700,
+    generation: {
+      modelEnum: 1528,
+      planModelEnum: 1528,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+      maxContextTokens: 512000,
+    },
+  };
+  const claudeStep = {
+    idx: 4,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 200,
+    endTimeSeconds: 210,
+    rawInputTokens: 15000,
+    cachedReadTokens: 45000,
+    cacheWriteTokens: 0,
+    outputTokens: 500,
+    generation: {
+      responseModel: 'claude-opus-4-6-thinking',
+      modelDisplayName: 'Claude Opus 4.6 (Thinking)',
+      maxContextTokens: 200000,
+    },
+  };
+
+  const switchedToClaude = buildConversationHudMetrics({
+    conversationId: 'conv-orch-then-claude',
+    sessionRevision: 1,
+    modelId: 'Claude Opus 4.6 (Thinking)',
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      neonPlannerStep,
+      hydrogenExecStep,
+      { idx: 3, stepType: 14, status: 3 },
+      claudeStep,
+    ],
+  });
+  assert.equal(Boolean(switchedToClaude.context.isOrchestrator), false);
+  assert.equal(switchedToClaude.context.isMultiModel, true);
+  assert.equal(switchedToClaude.context.modelStages?.length, 3);
+  assert.equal(switchedToClaude.context.modelStages?.[0]?.modelId, 'gemini-4-neon');
+  assert.equal(switchedToClaude.context.modelStages?.[0]?.role, 'planner');
+  assert.equal(switchedToClaude.context.modelStages?.[0]?.section, 'primary');
+  assert.equal(switchedToClaude.context.modelStages?.[0]?.isActive, false);
+  assert.equal(switchedToClaude.context.modelStages?.[1]?.modelId, 'gemini-4-hydrogen');
+  assert.equal(switchedToClaude.context.modelStages?.[1]?.role, 'executor');
+  assert.equal(switchedToClaude.context.modelStages?.[1]?.section, 'primary');
+  assert.equal(switchedToClaude.context.modelStages?.[1]?.isActive, false);
+  assert.equal(switchedToClaude.context.modelStages?.[2]?.modelId, 'claude-opus-4-6');
+  assert.equal(switchedToClaude.context.modelStages?.[2]?.role, 'model');
+  assert.equal(switchedToClaude.context.modelStages?.[2]?.section, 'primary');
+  assert.equal(switchedToClaude.context.modelStages?.[2]?.isActive, true);
 });
 });
 

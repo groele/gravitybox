@@ -383,6 +383,11 @@ function renderAccountsPage(root) {
           const isActive = acc.id === activeId;
           const isCollapsed = state.collapsedAccounts.has(acc.id);
           const readiness = acc.credentialReadiness || {};
+          const standby = acc.standbyRefreshStatus || {};
+          const standbyMode = standby.mode || '';
+          const standbyPill = !isActive && (standbyMode === 'snapshot_cooldown_elapsed' || standbyMode === 'snapshot_cooling')
+            ? `<span class="pill ${standbyMode === 'snapshot_cooldown_elapsed' ? 'pill-blue' : ''}">${escapeHtml(standbyMode === 'snapshot_cooldown_elapsed' ? '预计已重置 · 切换时同步' : '待机保鲜 · 切换时同步')}</span>`
+            : (readiness.state && readiness.state !== 'ready' ? `<span class="pill pill-amber">${escapeHtml(readiness.message || readiness.state)}</span>` : '');
           const updatedStr = acc.quotaLastUpdated ? t('common.updated_at', { time: formatTimestampShort(acc.quotaLastUpdated) }, `更新于 ${formatTimestampShort(acc.quotaLastUpdated)}`) : '';
           return `
             <div class="card account-card ${isActive ? 'active' : ''}" data-acc-id="${escapeHtml(acc.id)}">
@@ -392,7 +397,7 @@ function renderAccountsPage(root) {
                     <span style="font-size:15px;font-weight:700">${escapeHtml(acc.name || acc.email)}</span>
                     ${tierBadgeHtml(acc.subscription_tier)}
                     ${isActive ? `<span class="pill pill-blue">${escapeHtml(t('menu_panel.quota.current_account', null, '当前账号'))}</span>` : ''}
-                    ${readiness.state && readiness.state !== 'ready' ? `<span class="pill pill-amber">${escapeHtml(readiness.message || readiness.state)}</span>` : ''}
+                    ${standbyPill}
                   </div>
                   <div class="muted small truncate" style="margin-top:2px">${escapeHtml(acc.email)}</div>
                 </div>
@@ -644,6 +649,15 @@ function openAddAccountModal() {
           <input type="password" id="m-refresh-token" placeholder="1//..." style="width:100%;margin:8px 0" />
           <button class="btn btn-sm" id="m-token-add">验证并导入</button>
         </div>
+        <div class="card" style="padding:12px;margin-top:0">
+          <div style="font-weight:600">4. JSON 批量导入 / 备份导出</div>
+          <div class="muted small" style="margin:4px 0 8px">支持单个 JSON 文件或目录路径导入（按邮箱去重），或导出全部账号备份。</div>
+          <input type="text" id="m-json-path" placeholder="输入 JSON 文件或目录完整路径…" style="width:100%;margin-bottom:8px" />
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-sm" id="m-json-import">导入 JSON</button>
+            <button class="btn btn-sm" id="m-json-export">导出备份到该路径</button>
+          </div>
+        </div>
       </div>
     `,
     footerHtml: `<button class="btn" id="m-close">关闭</button>`,
@@ -653,6 +667,28 @@ function openAddAccountModal() {
     const res = await window.gravitybox.rpc('account_save_current');
     if (res?.ok) { toast(res.account?.email || 'OK'); closeModal(); await loadAccounts(); }
     else toast(res?.error || 'Failed', true);
+  });
+  body.querySelector('#m-json-import')?.addEventListener('click', async () => {
+    const pathVal = body.querySelector('#m-json-path')?.value?.trim();
+    if (!pathVal) return toast('请输入 JSON 文件或目录路径', true);
+    const res = await window.gravitybox.rpc('account_import_json', { paths: [pathVal] });
+    if (res?.ok) {
+      toast(`导入完成：新增 ${res.imported ?? 0}，更新 ${res.updated ?? 0}，跳过 ${res.skipped ?? 0}`);
+      closeModal();
+      await loadAccounts();
+    } else {
+      toast(res?.error || '导入失败', true);
+    }
+  });
+  body.querySelector('#m-json-export')?.addEventListener('click', async () => {
+    const pathVal = body.querySelector('#m-json-path')?.value?.trim();
+    if (!pathVal) return toast('请输入导出目标 JSON 文件路径（如 D:\\accounts-backup.json）', true);
+    const res = await window.gravitybox.rpc('account_export_backup', { path: pathVal, confirmed: true });
+    if (res?.ok) {
+      toast(`已导出 ${res.count ?? 0} 个账号至 ${res.path}`);
+    } else {
+      toast(res?.error || '导出失败', true);
+    }
   });
   body.querySelector('#m-oauth-begin').addEventListener('click', async () => {
     const res = await window.gravitybox.rpc('account_oauth_begin');

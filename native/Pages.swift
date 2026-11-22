@@ -65,8 +65,8 @@ final class DashboardPage: NSObject {
 
     // Hero 账号与 5 桶配额
     let debugPortTitleLabel = text(L10n.t("status.debug_port_missing", fallback: "未开启调试端口"), size: 12.5, weight: .semibold, color: .labelColor)
-    let debugPortBodyLabel = text(L10n.t("debug_port_missing.banner_body", fallback: "检测到 Antigravity 已运行但未开启调试端口，汉化与对话状态栏暂不可连接。请先保存工作后再安全重启。"), size: 11.5, color: Design.secondary, wrap: true)
-    let safeRelaunchButton = button(L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启 Antigravity 以连接"), target: nil, action: #selector(safeRelaunchAntigravityPressed))
+    let debugPortBodyLabel = text(L10n.t("debug_port_missing.banner_body", fallback: "Antigravity 未带调试端口运行，请先保存工作后安全重启以连接。"), size: 11.5, color: Design.secondary, wrap: true)
+    let safeRelaunchButton = button(L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启以连接"), target: nil, action: #selector(safeRelaunchAntigravityPressed))
     let debugPortBannerBox: NSBox
     let activeAccountLabel = text(L10n.t("overview.loading_account"), size: 16, weight: .semibold)
     // B02: status/freshness warnings and the mailbox are two separate lines so a warning can
@@ -118,25 +118,47 @@ final class DashboardPage: NSObject {
         refreshQuotaButton = QuotaRefreshButton(target: nil, action: #selector(refreshActiveQuota))
         refreshQuotaButton.controlSize = .small
 
-        let debugIcon = symbol("exclamationmark.triangle.fill", size: 16, color: accessibleWarningColor())
+        let warnTint = accessibleWarningColor()
+        let debugIconBox = tintedIconBox(
+            size: 28,
+            cornerRadius: 7,
+            tint: warnTint,
+            darkFillAlpha: 0.18,
+            lightFillAlpha: 0.11,
+            darkBorderAlpha: 0.30,
+            lightBorderAlpha: 0.16
+        )
+        let debugIcon = symbol("exclamationmark.triangle.fill", size: 13.5, color: warnTint)
+        debugIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        debugIconBox.addSubview(debugIcon)
+        NSLayoutConstraint.activate([
+            debugIcon.centerXAnchor.constraint(equalTo: debugIconBox.centerXAnchor),
+            debugIcon.centerYAnchor.constraint(equalTo: debugIconBox.centerYAnchor)
+        ])
+        debugPortTitleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         debugPortTitleLabel.lineBreakMode = .byTruncatingTail
-        debugPortBodyLabel.maximumNumberOfLines = 0
+        debugPortBodyLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        debugPortBodyLabel.maximumNumberOfLines = 1
+        debugPortBodyLabel.lineBreakMode = .byTruncatingTail
         debugPortBodyLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let debugCopyCol = vertical([debugPortTitleLabel, debugPortBodyLabel], spacing: 2)
         debugCopyCol.alignment = .leading
         debugCopyCol.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         safeRelaunchButton.controlSize = .small
-        safeRelaunchButton.bezelColor = .controlAccentColor
+        safeRelaunchButton.font = .systemFont(ofSize: 11.5, weight: .medium)
+        safeRelaunchButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+        safeRelaunchButton.imagePosition = .imageLeading
         safeRelaunchButton.setContentHuggingPriority(.required, for: .horizontal)
         safeRelaunchButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         safeRelaunchButton.toolTip = nil
-        let debugRow = horizontal([debugIcon, debugCopyCol, flexibleSpace(), safeRelaunchButton], spacing: 10)
+        let debugRow = horizontal([debugIconBox, debugCopyCol, flexibleSpace(), safeRelaunchButton], spacing: 10)
         debugRow.alignment = .centerY
-        let debugBanner = group([debugRow], inset: 12)
-        debugBanner.cornerRadius = 10
+        debugRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 32).isActive = true
+        let debugBanner = group([debugRow], inset: 14)
+        debugBanner.cornerRadius = Design.Radius.card
         debugBanner.borderWidth = 1
-        debugBanner.borderColor = Design.dynamicAlpha(accessibleWarningColor(), 0.35)
-        debugBanner.fillColor = Design.dynamicAlpha(accessibleWarningColor(), 0.08, 0.12)
+        debugBanner.borderColor = Design.dynamicAlpha(warnTint, 0.25, 0.34)
+        debugBanner.fillColor = Design.dynamicAlpha(warnTint, 0.06, 0.11)
         debugBanner.isHidden = true
         debugPortBannerBox = debugBanner
 
@@ -555,7 +577,7 @@ final class DashboardPage: NSObject {
             ?? (report["byModel"] as? [[String: Any]])
             ?? (report["models"] as? [[String: Any]])
             ?? []
-        let models = rawModels.filter {
+        let models = ModelUsageFold.foldThinkingVariants(rawModels).filter {
             let t = intVal($0, "totalTokens", fallback: intVal($0, "total_tokens"))
             let r = intVal($0, "requestCount", fallback: intVal($0, "request_count"))
             return t > 0 || r > 0
@@ -744,8 +766,8 @@ final class DashboardPage: NSObject {
         let showBanner = app.statusValue.mode == "debug-port-missing"
         let visibilityChanged = debugPortBannerBox.isHidden != !showBanner
         debugPortTitleLabel.stringValue = L10n.t("status.debug_port_missing", fallback: "未开启调试端口")
-        debugPortBodyLabel.stringValue = L10n.t("debug_port_missing.banner_body", fallback: "检测到 Antigravity 已运行但未开启调试端口，汉化与对话状态栏暂不可连接。请先保存工作后再安全重启。")
-        let btnTitle = L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启 Antigravity 以连接")
+        debugPortBodyLabel.stringValue = L10n.t("debug_port_missing.banner_body", fallback: "Antigravity 未带调试端口运行，请先保存工作后安全重启以连接。")
+        let btnTitle = L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启以连接")
         safeRelaunchButton.title = btnTitle
         safeRelaunchButton.setAccessibilityLabel(btnTitle)
         safeRelaunchButton.toolTip = nil
@@ -967,6 +989,7 @@ final class DashboardPage: NSObject {
     }
 
     static func syncCoreGroupBars(_ groups: [QuotaPresentation.QuotaGroup], into stack: NSStackView, compact: Bool = true, minBarHeight: CGFloat? = nil) {
+        let now = Date()
         var rows: [[QuotaBarSpec]] = []
         var pendingSingle: QuotaBarSpec? = nil
         for group in groups {
@@ -974,10 +997,10 @@ final class DashboardPage: NSObject {
                 QuotaBarSpec(
                     title: group.barTitle(for: win),
                     percentage: win.percentage,
-                    resetText: win.percentage == nil ? "" : win.resetText,
+                    resetText: win.percentage == nil ? "" : win.effectiveResetText(at: now),
                     icon: group.iconName(for: win),
                     placeholder: win.placeholder(availability: group.availability),
-                    stale: win.stale
+                    stale: win.effectiveStale(at: now)
                 )
             }
             guard !specs.isEmpty else { continue }
@@ -1008,6 +1031,7 @@ final class DashboardPage: NSObject {
     }
 
     static func syncStandaloneGroupBars(_ groups: [QuotaPresentation.QuotaGroup], into stack: NSStackView, compact: Bool = true, minBarHeight: CGFloat? = nil) {
+        let now = Date()
         var specs: [QuotaBarSpec] = []
         for group in groups {
             if group.windows.isEmpty {
@@ -1025,10 +1049,10 @@ final class DashboardPage: NSObject {
                     specs.append(QuotaBarSpec(
                         title: group.barTitle(for: win),
                         percentage: win.percentage,
-                        resetText: win.percentage == nil ? "" : win.resetText,
+                        resetText: win.percentage == nil ? "" : win.effectiveResetText(at: now),
                         icon: group.iconName(for: win),
                         placeholder: win.placeholder(availability: group.availability),
-                        stale: win.stale
+                        stale: win.effectiveStale(at: now)
                     ))
                 }
             }

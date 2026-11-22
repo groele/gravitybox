@@ -56,24 +56,49 @@ test('S3 凭据安全: 切换历史归档自动脱敏，且最多保留最近 3 
       isRunning: async () => false,
     });
 
-    // 连续执行 4 次账号切换，每次切换都会把上一份 journal 归档入 account-switch-backups
+    // 连续执行 4 次账号切换，每次切换都会把上一份 journal 归档入 account-switch-backups（保留微小间隔确保时间戳不同）
     await service.switchAccount(acc1.id);
+    await new Promise(r => setTimeout(r, 5));
     await service.switchAccount(acc2.id);
+    await new Promise(r => setTimeout(r, 5));
     await service.switchAccount(acc3.id);
+    await new Promise(r => setTimeout(r, 5));
     await service.switchAccount(acc4.id);
 
     const backupsDir = join(env.stateDir, 'account-switch-backups');
     const backups = (await readdir(backupsDir)).filter(f => f.endsWith('.json'));
 
-    // 1. 验证数量上限裁剪：不能无限膨胀，最多保留最近 3 份
-    assert.ok(backups.length <= 3, `备份文件数量为 ${backups.length}，不得超过 3 份`);
+    // 1. 验证数量上限裁剪：不能无限膨胀，按时间戳最多保留最近 3 份
+    assert.equal(backups.length, 3, `最多保留 3 份历史切号归档，实际为 ${backups.length}`);
 
-    // 2. 验证凭据脱敏：备份历史文件内绝不能包含未脱敏的明文 refresh token
+    // 2. 验证文件名携带时间戳前缀
+    for (const b of backups) {
+      assert.match(b, /^\d+_[0-9a-f]{8}\.json$/, '归档文件命名必须为时间戳_uuid格式');
+    }
+
+    // 3. 验证凭据深度不可逆脱敏：不仅 keychainBefore/After，before 和 after 的数据库行也不得残留明文或可还原 Base64 凭据
+    let sawRedactedBeforeToken = false;
     for (const b of backups) {
       const content = await readFile(join(backupsDir, b), 'utf8');
+      const data = JSON.parse(content);
+
+      // 绝不得包含原始明文 access_token / refresh_token
+      assert.ok(!content.includes('token-access-'), '历史备份中绝不得包含明文 access_token');
       assert.ok(!content.includes('1//token-refresh-acc'), '历史备份中绝不得包含真实 refresh token');
+      assert.ok(!content.includes('token-refresh-'), '历史备份中绝不得包含明文 refresh_token');
       assert.ok(content.includes('[REDACTED]'), '历史钥匙串凭据必须被明确脱敏为 [REDACTED]');
+
+      // 验证 before/after 中的 TOKEN 键被彻底脱敏，绝不保留可还原的 Base64 编码
+      if (data.before && data.before['antigravityUnifiedStateSync.oauthToken']) {
+        sawRedactedBeforeToken = true;
+        assert.equal(data.before['antigravityUnifiedStateSync.oauthToken'], '[REDACTED_OAUTH_TOKEN]', 'before 中的 oauthToken 必须脱敏为 [REDACTED_OAUTH_TOKEN]');
+      }
+      assert.equal(data.after?.['antigravityUnifiedStateSync.oauthToken'], '[REDACTED_OAUTH_TOKEN]', 'after 中的 oauthToken 必须脱敏为 [REDACTED_OAUTH_TOKEN]');
+
+      assert.equal(data.keychainBefore, data.keychainBefore ? '[REDACTED]' : null);
+      assert.equal(data.keychainAfter, '[REDACTED]');
     }
+    assert.ok(sawRedactedBeforeToken, '历史归档中应至少包含一条带 before.oauthToken 的脱敏快照');
   } finally {
     await rm(env.root, { recursive: true, force: true });
   }
@@ -297,4 +322,194 @@ test('P0-09: switchAccount 提交前失败回滚时日志脱敏，且 reconcileR
     await rm(env.root, { recursive: true, force: true });
   }
 });
+
+test('v1.1.3 Issue #19 & 合规切号: 同源 agy CLI 凭据非侵入同步、无 .env 过期 access_token 切号放行、CLI 刷新后 7 天回滚兼容与双源对称还原', async () => {
+  const env = await setupSandbox();
+  const geminiDir = join(env.root, '.gemini');
+  const agyCliTokenPath = join(geminiDir, 'antigravity-cli', 'antigravity-oauth-token');
+  const jetskiTokenPath = join(geminiDir, 'jetski-standalone-oauth-token');
+  const geminiCliOauthPath = join(geminiDir, 'oauth_creds.json');
+  const geminiCliAccountsPath = join(geminiDir, 'google_accounts.json');
+
+  try {
+    // 创建账号 A（当前账号）与账号 B（access_token 已过期，且未配置 .env，但有合法 refresh_token）
+    const accA = await env.manager.upsertAccount({
+      email: 'cli-a@example.test',
+      name: 'CLI User A',
+      refreshToken: '1//refresh-cli-a',
+      accessToken: 'ya29.access-cli-a',
+      expiryTimestamp: 1700000100,
+      projectId: 'proj-cli-a',
+    });
+    const accB = await env.manager.upsertAccount({
+      email: 'cli-b@example.test',
+      name: 'CLI User B',
+      refreshToken: '1//refresh-cli-b',
+      accessToken: 'pending_refresh',
+      expiryTimestamp: 1600000000, // 早已过期
+      projectId: 'proj-cli-b',
+    });
+
+    const service = new AccountSwitchService(env.manager, {
+      stateDir: env.stateDir,
+      profile: env.profile,
+      geminiDir,
+      keychain: env.keychain,
+      isRunning: async () => false,
+    });
+
+    // 1. 非侵入原则验证：当 ~/.gemini 下文件不存在时，切号绝不主动创建 CLI 凭据文件
+    await service.switchAccount(accA.id);
+    await assert.rejects(readFile(agyCliTokenPath, 'utf8'), { code: 'ENOENT' });
+    await assert.rejects(readFile(jetskiTokenPath, 'utf8'), { code: 'ENOENT' });
+
+    // 2. 预置已存在的同源 CLI 凭据文件与不应触碰的 gemini-cli 文件
+    await mkdir(join(geminiDir, 'antigravity-cli'), { recursive: true });
+    await writeFile(agyCliTokenPath, '{"initial":"agy"}', { mode: 0o600 });
+    await writeFile(jetskiTokenPath, '{"initial":"jetski"}', { mode: 0o600 });
+    await writeFile(geminiCliOauthPath, '{"gemini_cli":"untouched"}', { mode: 0o600 });
+    await writeFile(geminiCliAccountsPath, '{"accounts":["untouched"]}', { mode: 0o600 });
+
+    // 先切回 A 使钥匙串和 CLI 文件同步为 A，然后再切到 access_token 已过期的 B
+    await service.switchAccount(accA.id);
+    const cliAAfterFirst = JSON.parse(await readFile(agyCliTokenPath, 'utf8'));
+    assert.equal(cliAAfterFirst.token.email, 'cli-a@example.test');
+    assert.equal(cliAAfterFirst.id_token_email, 'cli-a@example.test');
+    assert.equal(cliAAfterFirst.token.refresh_token, '1//refresh-cli-a');
+
+    // 3. 验证无 .env 且 access_token 已过期的账号 B 切号不拦截，且同步写入两个同源 CLI 文件
+    const switchBRes = await service.switchAccount(accB.id);
+    assert.equal(switchBRes.switchedTo, 'cli-b@example.test');
+
+    for (const cliPath of [agyCliTokenPath, jetskiTokenPath]) {
+      const raw = await readFile(cliPath, 'utf8');
+      assert.equal(raw.startsWith('go-keyring-base64:'), false, 'CLI 文件必须是纯 UTF-8 JSON，不得带 go-keyring-base64 前缀');
+      const parsed = JSON.parse(raw);
+      assert.equal(parsed.token.email, 'cli-b@example.test');
+      assert.equal(parsed.id_token_email, 'cli-b@example.test');
+      assert.equal(parsed.token.refresh_token, '1//refresh-cli-b');
+      assert.equal(parsed.token.project_id, 'proj-cli-b');
+      assert.equal(parsed.token.expiry_timestamp, 1600000000);
+      assert.equal(typeof parsed.token.expiry, 'string');
+    }
+
+    // 验证 @google/gemini-cli 的文件完全未被触碰
+    assert.equal(await readFile(geminiCliOauthPath, 'utf8'), '{"gemini_cli":"untouched"}');
+    assert.equal(await readFile(geminiCliAccountsPath, 'utf8'), '{"accounts":["untouched"]}');
+
+    // 4. 模拟用户在终端运行 agy 导致 CLI 凭据文件被外部自动刷新改写
+    await writeFile(agyCliTokenPath, JSON.stringify({
+      token: {
+        access_token: 'ya29.refreshed-by-agy-cli',
+        refresh_token: '1//refresh-cli-b',
+        email: 'cli-b@example.test',
+        expiry_timestamp: Math.floor(Date.now() / 1000) + 3600,
+      },
+      id_token_email: 'cli-b@example.test',
+    }), { mode: 0o600 });
+
+    // 验证 CLI 文件不在 journal.files 中，因此外部修改绝不阻断桌面端 7 天回滚，且回滚后 CLI 文件对称还原回账号 A
+    const rbRes = await service.rollback();
+    assert.ok(rbRes.message.includes('已恢复'));
+
+    for (const cliPath of [agyCliTokenPath, jetskiTokenPath]) {
+      const restored = JSON.parse(await readFile(cliPath, 'utf8'));
+      assert.equal(restored.token.email, 'cli-a@example.test', `回滚后 ${cliPath} 必须对称还原为切号前账号 A`);
+      assert.equal(restored.token.refresh_token, '1//refresh-cli-a');
+    }
+
+    // 5. 验证历史归档对任意非 accounts.json 文件（含无后缀路径）严格脱敏
+    await service.switchAccount(accB.id);
+    const backupsDir = join(env.stateDir, 'account-switch-backups');
+    const backups = (await readdir(backupsDir)).filter(f => f.endsWith('.json'));
+    for (const b of backups) {
+      const content = await readFile(join(backupsDir, b), 'utf8');
+      assert.ok(!content.includes('1//refresh-cli-'), '归档快照严禁残留明文 refresh_token');
+    }
+
+    // 6. 崩溃中断恢复路径（reconcileRollback committed=true）也必须对称回滚已存在的 agy CLI 凭据文件
+    // 读取当前真实 ItemTable 行构造合法的 interrupted rollback 状态（从 B 回滚到 A 时在 DB COMMIT 之后中断）
+    const dbPath = join(env.profile, 'User', 'globalStorage', 'state.vscdb');
+    const { DatabaseSync } = await import('node:sqlite');
+    const dbConn = new DatabaseSync(dbPath);
+    const currentDbRows = {};
+    try {
+      const rows = dbConn.prepare(
+        "SELECT key, value FROM ItemTable WHERE key IN ('antigravityUnifiedStateSync.oauthToken','antigravityUnifiedStateSync.userStatus','jetskiStateSync.agentManagerInitState','antigravityUnifiedStateSync.enterprisePreferences','antigravityOnboarding')"
+      ).all();
+      for (const row of rows) currentDbRows[row.key] = row.value;
+    } finally {
+      dbConn.close();
+    }
+    const beforeDbRows = { ...currentDbRows, 'antigravityUnifiedStateSync.oauthToken': 'old-raw-a' };
+    const indexPath = join(env.stateDir, 'accounts.json');
+    const indexNow = await readFile(indexPath, 'utf8');
+    const indexPrevObj = JSON.parse(indexNow);
+    indexPrevObj.current_account_id = accA.id;
+    const indexPrev = JSON.stringify(indexPrevObj);
+    const keychainB = await env.keychain.readPassword('gemini', 'antigravity');
+    // 构造一个带 Account A OAuth 的 go-keyring-base64 payload 放在 originalJournal.keychainBefore
+    const keychainA = 'go-keyring-base64:' + Buffer.from(JSON.stringify({
+      token: {
+        access_token: 'ya29.restored-a',
+        refresh_token: '1//refresh-cli-a',
+        token_type: 'Bearer',
+        expiry_timestamp: 1900000000,
+        email: 'cli-a@example.test',
+      },
+      id_token_email: 'cli-a@example.test',
+    })).toString('base64');
+
+    const journalPath = join(env.stateDir, 'account-switch-journal-stable.json');
+    const rollbackPath = `${journalPath}.rollback.json`;
+    const originalJournal = {
+      version: 1,
+      status: 'rolling-back',
+      at: new Date().toISOString(),
+      fromId: accA.id,
+      toId: accB.id,
+      before: beforeDbRows,
+      after: currentDbRows,
+      files: [{ path: indexPath, before: indexPrev, after: indexNow }],
+      keychainBefore: keychainA,
+      keychainAfter: keychainB ?? '',
+    };
+    // 模拟 DB/文件/Keychain 已提交为 A，但进程在删除 rollback.json 及同步 CLI 前崩溃
+    await writeFile(indexPath, indexPrev);
+    await env.keychain.writePassword('gemini', 'antigravity', keychainA);
+    const dbWriteConn = new DatabaseSync(dbPath);
+    try {
+      dbWriteConn.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run(
+        'antigravityUnifiedStateSync.oauthToken',
+        'old-raw-a'
+      );
+    } finally {
+      dbWriteConn.close();
+    }
+    await writeFile(journalPath, JSON.stringify(originalJournal));
+    await writeFile(rollbackPath, JSON.stringify({
+      version: 1,
+      phase: 'committed',
+      databasePath: dbPath,
+      hadDatabase: true,
+      rowsBefore: currentDbRows,
+      rowsAfter: beforeDbRows,
+      files: [{ path: indexPath, before: indexNow, after: indexPrev }],
+      keychainBefore: keychainB ?? '',
+      keychainAfter: keychainA,
+      originalJournal,
+    }));
+
+    const interruptedRes = await service.rollback();
+    assert.ok(interruptedRes.message.includes('中断') || interruptedRes.message.includes('恢复'));
+    for (const cliPath of [agyCliTokenPath, jetskiTokenPath]) {
+      const restored = JSON.parse(await readFile(cliPath, 'utf8'));
+      assert.equal(restored.token.email, 'cli-a@example.test', `中断恢复后 ${cliPath} 也必须对称还原为账号 A`);
+      assert.equal(restored.token.refresh_token, '1//refresh-cli-a');
+    }
+  } finally {
+    await rm(env.root, { recursive: true, force: true });
+  }
+});
+
 

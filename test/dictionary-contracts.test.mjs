@@ -345,6 +345,31 @@ test('P1-37/P1-39：dict/base.json 无首尾空格，HUD 与 engine.js 术语和
   const baseDict = JSON.parse(baseRaw);
   const zhPack = JSON.parse(zhPackRaw);
 
+  assert.equal(baseDict['Enter'], 'Enter');
+  assert.equal(baseDict['Cmd+Enter'], 'Cmd+Enter');
+  assert.equal(baseDict['Command+Enter'], 'Command+Enter');
+  assert.equal(baseDict['Low'], 'Low');
+  assert.equal(baseDict['Medium'], 'Medium');
+  assert.equal(baseDict['High'], 'High');
+  assert.equal(baseDict['Extra'], 'Extra');
+  assert.equal(baseDict['Extra High'], 'Extra High');
+  assert.equal(baseDict['Max'], 'Max');
+  assert.equal(baseDict['Orchestrator Settings'], 'Orchestrator 设置');
+  assert.equal(baseDict['Orchestrator Model'], 'Orchestrator 模型');
+  assert.equal(baseDict['Executor Model'], 'Executor 模型');
+  assert.equal(baseDict['Input Box'], '对话输入框');
+  assert.equal(baseDict['Choose which key sends a message in the chat composer.'], '选择在对话输入框中发送消息的按键。');
+  const { classifyCoverage } = await import('../dist/coverage.js');
+  assert.equal(classifyCoverage('Enter', 'Enter'), 'preserved');
+  assert.equal(classifyCoverage('Cmd+Enter', 'Cmd+Enter'), 'preserved');
+  assert.equal(classifyCoverage('Command+Enter', 'Command+Enter'), 'preserved');
+  assert.equal(classifyCoverage('Low', 'Low'), 'preserved');
+  assert.equal(classifyCoverage('Medium', 'Medium'), 'preserved');
+  assert.equal(classifyCoverage('High', 'High'), 'preserved');
+  assert.equal(classifyCoverage('Extra', 'Extra'), 'preserved');
+  assert.equal(classifyCoverage('Extra High', 'Extra High'), 'preserved');
+  assert.equal(classifyCoverage('Max', 'Max'), 'preserved');
+
   const untrimmed = [];
   for (const [k, v] of Object.entries(baseDict)) {
     if (k !== k.trim() || (typeof v === 'string' && v !== v.trim())) {
@@ -366,6 +391,8 @@ test('P1-37/P1-39：dict/base.json 无首尾空格，HUD 与 engine.js 术语和
   assert.match(engineSrc, /function syncElementLocFlag/);
   assert.match(engineSrc, /⚠️ Failed to render LaTeX: \{reason\}/);
   assert.match(engineSrc, /Working directory: \{path\}/);
+  assert.match(engineSrc, /function isElapsedDurationNode/);
+  assert.match(engineSrc, /key:\s*"\{count\}\{timeUnit\}",\s*pattern:\s*\/\^\(\\d\+\)\(m\|h\|d\|w\|mo\|y\)\$\//);
 });
 
 test('P2-3：loadDictionaryLayers 支持声明式 template-rules.json 热编译且拦截非锚定或嵌套量词风险正则', async () => {

@@ -1,11 +1,14 @@
 import Cocoa
 
 extension Assistant {
+    private static let uiBootstrapCacheSchemaVersion = 2
+
     func loadUIBootstrapSnapshot() {
         #if !NATIVE_UI_TEST
         let url = state.appendingPathComponent("ui-bootstrap-cache-v1.json")
         guard let data = try? Data(contentsOf: url),
-              let raw = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+              let raw = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              (raw["schema"] as? Int) == Self.uiBootstrapCacheSchemaVersion else { return }
         if let dash = raw["dashboardSummary"] as? [String: Any] {
             cachedDashboardBootstrapSummary = dash
             if let usg = dash["usage"] as? [String: Any], let periodsMap = usg["periods"] as? [String: Any] {
@@ -49,7 +52,7 @@ extension Assistant {
         let targetURL = state.appendingPathComponent("ui-bootstrap-cache-v1.json")
         let work = DispatchWorkItem { [weak self] in
             guard self != nil else { return }
-            var doc: [String: Any] = ["schema": 1, "savedAt": Date().timeIntervalSince1970]
+            var doc: [String: Any] = ["schema": Self.uiBootstrapCacheSchemaVersion, "savedAt": Date().timeIntervalSince1970]
             if let dashSnap, JSONSerialization.isValidJSONObject(dashSnap) {
                 doc["dashboardSummary"] = dashSnap
             }
@@ -192,6 +195,7 @@ extension Assistant {
             return
         }
         singleAccountRefreshErrors[id] = nil
+        singleAccountRefreshNotices[id] = nil
         refreshingAccountIds.insert(id)
         updateQuotaRefreshControls()
         menuPanelController?.syncFromAssistant()
@@ -201,8 +205,16 @@ extension Assistant {
             switch response {
             case .failure(let error):
                 self.singleAccountRefreshErrors[id] = error.localizedDescription
+                self.singleAccountRefreshNotices[id] = nil
             case .success(let value):
                 self.singleAccountRefreshErrors[id] = nil
+                if value["standbyDeferred"] as? Bool == true {
+                    let notice = (value["notice"] as? String ?? value["message"] as? String)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.singleAccountRefreshNotices[id] = (notice?.isEmpty == false) ? notice : nil
+                } else {
+                    self.singleAccountRefreshNotices[id] = nil
+                }
                 if let globalErr = self.quotaRefreshError, !InterfaceText.isMultiAccountSummary(globalErr) {
                     self.quotaRefreshError = nil
                 }
@@ -242,6 +254,7 @@ extension Assistant {
         scheduleUIBootstrapSave()
     }
 
+    /// @testonly 保留供 test/native-ui.swift 验证菜单切号状态机，生产环境已统一由 MenuPanelController 承载。
     func buildAccountSwitchMenu() -> NSMenu {
         let switchSubmenu = NSMenu(title: L10n.t("assistant_account.switch_submenu"))
         switchSubmenu.showsStateColumn = true
@@ -301,13 +314,14 @@ extension Assistant {
         if contentVisible && currentPage == 2 {
             usagePage?.fetch()
         }
-        if menuTracking || menuPopover?.isShown == true {
+        if menuTracking || isMenuPanelShown {
             let periodKey = menuPanelController.map { MenuPanelController.periods[$0.selectedPeriod] } ?? "today"
             fetchUsageSummary(period: periodKey, force: true, allowCached: false)
             menuPanelController?.syncFromAssistant()
         }
     }
 
+    /// @testonly 保留供 test/native-ui.swift 验证菜单切号状态机，生产环境已统一由 MenuPanelController 承载。
     @objc func switchAccountFromMenu(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         switchAccountByIdFromMenu(id)
@@ -350,6 +364,8 @@ extension Assistant {
                         if shouldQuitAndRelaunch { self.relaunchAntigravityAfterSwitch() }
                         self.showMessage(L10n.t("assistant_account.switch_failed", ["error": error.localizedDescription]), error: true)
                     case .success(let value):
+                        self.singleAccountRefreshNotices[id] = nil
+                        self.singleAccountRefreshErrors[id] = nil
                         self.showMessage(value["message"] as? String ?? L10n.t("assistant_account.switched_to", ["email": email]))
                         if shouldQuitAndRelaunch { self.relaunchAntigravityAfterSwitch() }
                         self.invalidateUsageReportCache()
@@ -365,6 +381,8 @@ extension Assistant {
                     self.bridge.send(["command": "account_switch", "id": id, "target": "all", "autoRefreshToken": true]) { [weak self] response in
                         guard let self else { return }; self.accountSwitchInFlight = false
                         if case .success(let value) = response {
+                            self.singleAccountRefreshNotices[id] = nil
+                            self.singleAccountRefreshErrors[id] = nil
                             self.showMessage(value["message"] as? String ?? L10n.t("assistant_account.switched_to", ["email": email]))
                             if shouldQuitAndRelaunch { self.relaunchAntigravityAfterSwitch() }
                             self.invalidateUsageReportCache()
@@ -436,7 +454,17 @@ extension Assistant {
     }
     func finishQuotaRefresh(error: String?) {
         quotaRefreshing = false; quotaRefreshStartedAt = nil; pendingAccountTaskId = nil; quotaRefreshError = error; quotaRefreshPollTimer?.invalidate(); quotaRefreshPollTimer = nil
-        if error == nil { singleAccountRefreshErrors.removeAll() }
+        let now = Date()
+        lastAutoQuotaRefreshTriggerAt = now
+        pendingAutoQuotaRefresh = false
+        if let minutes = configuration?.value.quotaRefreshMinutes, [5, 10, 15, 30, 60].contains(minutes) {
+            nextScheduledQuotaRefreshAt = now.addingTimeInterval(TimeInterval(minutes * 60))
+        }
+        if error == nil {
+            singleAccountRefreshErrors.removeAll()
+            singleAccountRefreshNotices.removeAll()
+        }
+        configureQuotaRefreshTimer(preserveSchedule: true)
         updateQuotaRefreshControls(); fetchAccountList(notifyPage: true); overview?.update(force: true); menuPanelController?.syncFromAssistant(); refresh()
     }
     func updateQuotaRefreshControls() {
@@ -455,7 +483,7 @@ extension Assistant {
         }
         apply(pageHost)
         updateStatusItemState()
-        if menuTracking || menuPopover?.isShown == true {
+        if menuTracking || isMenuPanelShown {
             menuPanelController?.syncFromAssistant()
         }
     }
@@ -530,8 +558,43 @@ extension Assistant {
                 self.updateQuotaRefreshControls()
                 self.menuPanelController?.syncFromAssistant()
                 if shouldNotifyPage { self.accountsPage?.fetch(val) }
+                self.refreshRecommendedAccountIfNeeded()
+                self.checkAndTriggerOverdueQuotaRefreshIfNeeded()
             }
             for waiter in waiters { waiter(res) }
+        }
+    }
+
+    func refreshRecommendedAccountIfNeeded(force: Bool = false) {
+        if cachedAccounts.count <= 1 {
+            if cachedRecommendedAccountId != nil {
+                cachedRecommendedAccountId = nil
+                accountsPage?.recommendedAccountId = nil
+                menuPanelController?.syncFromAssistant(updateSize: true)
+            }
+            return
+        }
+        guard reachable,
+              !(contentVisible && currentPage == 1),
+              (menuTracking || isMenuPanelShown),
+              !recommendationPreviewInFlight else { return }
+        let fingerprint = "\(lastFetchedAccountsRevision)|\(activeAccountId)|\(cachedAccounts.count)"
+        guard force || fingerprint != lastRecommendedAccountsFingerprint else { return }
+        recommendationPreviewInFlight = true
+        bridge.send(["command": "auto_switch_best", "preview": true]) { [weak self] res in
+            guard let self else { return }
+            self.recommendationPreviewInFlight = false
+            guard case .success(let value) = res else { return }
+            self.lastRecommendedAccountsFingerprint = fingerprint
+            let candidate = value["account"] as? [String: Any]
+            let candidateId = candidate?["id"] as? String
+            let shouldSwitch = value["shouldSwitch"] as? Bool ?? false
+            let nextId = (shouldSwitch && candidateId != nil && candidateId != self.activeAccountId) ? candidateId : nil
+            if self.cachedRecommendedAccountId != nextId {
+                self.cachedRecommendedAccountId = nextId
+                self.accountsPage?.recommendedAccountId = nextId
+                self.menuPanelController?.syncFromAssistant(updateSize: true)
+            }
         }
     }
     func failPendingQuotaRefresh(_ message: String, cancelBackendTask: Bool = false) {

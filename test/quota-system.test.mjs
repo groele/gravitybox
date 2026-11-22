@@ -191,7 +191,7 @@ test('只有目录的生产端点成功而配额来自备用端点时，必须�
   assert.equal(manager.getAccountQuotaOverview(refreshed).geminiWeeklyRemaining,40);
 });
 
-test('Gemini 4 Carbon 与未来新模型自动检测：无模型证据时保持未知，Ultra 与动态新模型自动同步', () => {
+test('Gemini 4 Carbon 与无 groups[] 降级兼容：无模型证据时保持未知，有效独立模型自动同步且排除编排器与僵尸模型', () => {
   const proArgonDisabled = normalizeLiveModels([{modelId:'gemini-4-argon-disabled', disabled:true}], stamp);
   const windows = familyWindowsFromGroups([], now);
   const argonState = buildArgonStatus(proArgonDisabled, [], windows, now);
@@ -203,36 +203,46 @@ test('Gemini 4 Carbon 与未来新模型自动检测：无模型证据时保持�
   const ultraModels = normalizeCloudModels({models:{
     'gemini-4-argon':{quotaInfo:{remainingFraction:.75}},
     'gemini-4-carbon':{quotaInfo:{remainingFraction:.9, resetTime:future}},
-    'gemini-4-neon':{quotaInfo:{remainingFraction:.64, resetTime:future}},
+    'gemini-4-neon':{quotaBucketName:'Gemini 4 Neon', quotaInfo:{remainingFraction:.64, resetTime:future}},
+    'nova-1-pro':{displayName:'Nova 1 Pro', quotaInfo:{remainingFraction:.55, resetTime:future}},
+    'gemini-pro-orchestrator-neon':{displayName:'Orchestrator (Neon)', quotaInfo:{remainingFraction:1, resetTime:future}},
   }}, stamp);
+  const carriedGhost = {
+    ...normalizeCloudModels({models:{'vanished-ghost':{displayName:'Vanished Ghost', quotaInfo:{remainingFraction:.4, resetTime:future}}}}, stamp - 1000)[0],
+    quota_source: 'carried',
+    stale: true,
+    own_stale: true,
+  };
   const ultraWindows = familyWindowsFromGroups([], now);
-  const applied = applyFamilyWindows(ultraModels, ultraWindows);
+  const applied = applyFamilyWindows([...ultraModels, carriedGhost], ultraWindows);
   const ultraArgon = buildArgonStatus(applied, [], ultraWindows, now);
   const ultraCarbon = buildCarbonStatus(applied, [], ultraWindows, now, ultraArgon, 'ULTRA');
   assert.equal(ultraCarbon.availability, 'available');
   assert.equal(ultraCarbon.remaining, .9);
   const standalones = buildStandaloneModels(applied, [], ultraWindows, now, ultraArgon, ultraCarbon);
-  assert.deepEqual(standalones.map(item => item.key), ['argon', 'carbon', 'gemini-4-neon']);
+  assert.deepEqual(standalones.map(item => item.key), ['argon', 'carbon', 'gemini-4-neon', 'nova-1-pro']);
   assert.equal(standalones[2].remaining, .64);
+  assert.equal(standalones[2].resetTime, future);
+  assert.equal(standalones[3].remaining, .55);
 });
 
-test('Gemini 4 Hydrogen 归入基础 Gemini 共享池，不单独列为独立配额行；共享池新模型及多档位变体不裂变重复行', () => {
+test('Gemini 4 Hydrogen / Helium 归入基础 Gemini 共享池，不单独列为独立配额行；显式独立桶多档位变体不裂变重复行', () => {
   const models = normalizeCloudModels({
     models: {
       'gemini-4-hydrogen-low': { displayName: 'Gemini 4 Hydrogen (Low)', quotaInfo: { remainingFraction: 0.22, resetTime: future } },
       'gemini-4-hydrogen-medium': { displayName: 'Gemini 4 Hydrogen (Medium)', quotaInfo: { remainingFraction: 0.22, resetTime: future } },
       'gemini-4-hydrogen-high': { displayName: 'Gemini 4 Hydrogen (High)', quotaInfo: { remainingFraction: 0.22, resetTime: future } },
       'gemini-4-hydrogen-xhigh': { displayName: 'Gemini 4 Hydrogen (XHigh)', quotaInfo: { remainingFraction: 0.22, resetTime: future } },
-      'gemini-4-helium-high': { displayName: 'Gemini 4 Helium (High)', quotaInfo: { remainingFraction: 0.22, resetTime: future } },
-      'gemini-4-xenon-low': { displayName: 'Gemini 4 Xenon (Low)', quotaInfo: { remainingFraction: 0.85, resetTime: future } },
-      'gemini-4-xenon-high': { displayName: 'Gemini 4 Xenon (High)', quotaInfo: { remainingFraction: 0.85, resetTime: future } },
+      'gemini-4-helium-high': { displayName: 'Gemini 4 Helium (High)', quotaInfo: { remainingFraction: 0.85, resetTime: future } },
+      'gemini-4-xenon-low': { displayName: 'Gemini 4 Xenon (Low)', quotaBucketName: 'Gemini 4 Xenon', quotaInfo: { remainingFraction: 0.85, resetTime: future } },
+      'gemini-4-xenon-high': { displayName: 'Gemini 4 Xenon (High)', quotaBucketName: 'Gemini 4 Xenon', quotaInfo: { remainingFraction: 0.85, resetTime: future } },
     },
   }, stamp);
-  for (const m of models.filter(m => m.model_id.includes('hydrogen'))) {
+  for (const m of models.filter(m => m.model_id.includes('hydrogen') || m.model_id.includes('helium'))) {
     assert.equal(m.family, 'gemini');
   }
 
-  // 旧持久化文件中被误标为 other 的 hydrogen 也必须在读取时自愈归入 gemini
+  // 旧持久化文件中被误标为 other 的 hydrogen / neon 也必须在读取时自愈归入 gemini
   const repaired = normalizedModelFromStored({
     name: 'gemini-4-hydrogen-xhigh',
     display_name: 'Gemini 4 Hydrogen (XHigh)',
@@ -256,9 +266,10 @@ test('Gemini 4 Hydrogen 归入基础 Gemini 共享池，不单独列为独立配
   const windows = familyWindowsFromGroups(groups, now);
   const applied = applyFamilyWindows(models, windows);
   const standalones = buildStandaloneModels(applied, groups, windows, now);
-  // hydrogen 归属 gemini；helium 因与 gemini 共享配额窗口也不单独列出；xenon 多档位收敛为一条
+  // hydrogen/helium 归属 gemini 不凭百分比猜独立池；带显式非核心 quotaBucketName 的 xenon 多档位收敛为一条
   assert.deepEqual(standalones.map(item => item.key), ['gemini-4-xenon']);
   assert.equal(standalones[0].displayName, 'Gemini 4 Xenon');
+  assert.equal(standalones[0].resetTime, future);
 });
 
 async function withQuotaAccountFixture(fn) {

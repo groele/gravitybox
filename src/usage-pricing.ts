@@ -1,4 +1,5 @@
-import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { access, readFile } from 'node:fs/promises';
 import { atomicJson, readOptionalJson } from './files.js';
 import { APP_VERSION } from './version.js';
 import {
@@ -29,6 +30,9 @@ export interface PricingSyncMutableState {
   lastSyncError: string | null;
   lastSyncedSourceUrl: string;
   lastSyncedVersion: string;
+  lastSyncedUpdatedAt?: string;
+  lastSyncedEtag?: string;
+  lastSyncedSha256?: string;
 }
 
 export function compareDatedFeedVersion(left: string, right: string): number | null {
@@ -43,10 +47,34 @@ export function compareDatedFeedVersion(left: string, right: string): number | n
   return leftRev - rightRev;
 }
 
+export function compareFeedFreshness(
+  incoming: { version?: string | null; updatedAt?: string | null },
+  baseline: { version?: string | null; updatedAt?: string | null }
+): number | null {
+  const verDiff = compareDatedFeedVersion(String(incoming.version ?? ''), String(baseline.version ?? ''));
+  if (verDiff === null) return null;
+  if (verDiff !== 0) return verDiff;
+  const inUpdated = typeof incoming.updatedAt === 'string' ? incoming.updatedAt.trim() : '';
+  const baseUpdated = typeof baseline.updatedAt === 'string' ? baseline.updatedAt.trim() : '';
+  if (inUpdated && baseUpdated) {
+    const inMs = Date.parse(inUpdated);
+    const baseMs = Date.parse(baseUpdated);
+    if (Number.isFinite(inMs) && Number.isFinite(baseMs) && inMs !== baseMs) {
+      return inMs > baseMs ? 1 : -1;
+    }
+  }
+  return 0;
+}
+
 export async function loadRawPricingTable(
   remotePricingCachePath: string,
   pricingCachePath: string
-): Promise<{ merged: Record<string, ApiPricingEntry>; warnings: string[]; publicKeys: Set<string> }> {
+): Promise<{
+  merged: Record<string, ApiPricingEntry>;
+  billingPrices: Record<string, ApiPricingEntry>;
+  warnings: string[];
+  publicKeys: Set<string>;
+}> {
   const warnings: string[] = [];
   const merged: Record<string, ApiPricingEntry> = Object.assign(Object.create(null), DEFAULT_API_PRICES);
   const publicKeys = new Set<string>(FEED_MODEL_KEYS);
@@ -58,13 +86,38 @@ export async function loadRawPricingTable(
     const parsedRemote = JSON.parse(rawRemote);
     const remotePrices = parsedRemote && typeof parsedRemote === 'object' && parsedRemote.prices ? parsedRemote.prices : parsedRemote;
     const remoteVer = typeof parsedRemote?.feedVersion === 'string' ? parsedRemote.feedVersion.trim() : '';
-    const cmpToBuiltin = compareDatedFeedVersion(remoteVer, PRICING_METADATA.version);
+    const remoteUpdatedAt = typeof parsedRemote?.feedUpdatedAt === 'string'
+      ? parsedRemote.feedUpdatedAt.trim()
+      : (typeof parsedRemote?.updatedAt === 'string' ? parsedRemote.updatedAt.trim() : '');
+    const cmpToBuiltin = compareFeedFreshness(
+      { version: remoteVer, updatedAt: remoteUpdatedAt },
+      { version: PRICING_METADATA.version, updatedAt: PRICING_METADATA.updatedAt }
+    );
     const isOlderDatedFeed = cmpToBuiltin !== null && cmpToBuiltin < 0;
-    resetAndRegisterRemoteModelMetadata(parsedRemote, { onlyNewEntries: isOlderDatedFeed });
-    if (remotePrices && typeof remotePrices === 'object' && !Array.isArray(remotePrices)) {
+    resetAndRegisterRemoteModelMetadata(parsedRemote, {
+      onlyNewEntries: isOlderDatedFeed,
+      authoritativeSnapshot: !isOlderDatedFeed,
+    });
+    const remoteMeta = sanitizeRemoteModelMetadata(parsedRemote);
+    const remotePriceObj = remotePrices && typeof remotePrices === 'object' && !Array.isArray(remotePrices)
+      ? remotePrices as Record<string, unknown>
+      : null;
+    if (!isOlderDatedFeed && Array.isArray(remoteMeta.feedModels) && remoteMeta.feedModels.length > 0) {
+      const remoteFeedSet = new Set(remoteMeta.feedModels);
+      for (const builtinPublicKey of FEED_MODEL_KEYS) {
+        if (!remoteFeedSet.has(builtinPublicKey) && (!remotePriceObj || !Object.hasOwn(remotePriceObj, builtinPublicKey))) {
+          delete merged[builtinPublicKey];
+        }
+      }
+      publicKeys.clear();
+      for (const k of remoteMeta.feedModels) {
+        if (!isInternalNonChatModelId(k)) publicKeys.add(k);
+      }
+    }
+    if (remotePriceObj) {
       const filteredRemote = isOlderDatedFeed
-        ? Object.fromEntries(Object.entries(remotePrices).filter(([k]) => !Object.hasOwn(merged, k)))
-        : remotePrices;
+        ? Object.fromEntries(Object.entries(remotePriceObj).filter(([k]) => !Object.hasOwn(merged, k)))
+        : remotePriceObj;
       const remoteAccepted = new Set<string>();
       mergePricingEntries(merged, filteredRemote, bt('pricing.warn.remote_entry_prefix'), warnings, remoteAccepted);
       for (const k of remoteAccepted) {
@@ -94,7 +147,13 @@ export async function loadRawPricingTable(
     }
   }
 
-  return { merged, warnings, publicKeys };
+  const billingPrices: Record<string, ApiPricingEntry> = Object.assign(
+    Object.create(null),
+    DEFAULT_API_PRICES,
+    merged
+  );
+
+  return { merged, billingPrices, warnings, publicKeys };
 }
 
 export function resolvePricingTableFromRaw(
@@ -117,7 +176,14 @@ export async function loadPricingSyncState(
   state: PricingSyncMutableState
 ): Promise<void> {
   if (!state.lastRemoteSyncAt) {
-    const data = await readOptionalJson<{ syncedAt?: string; sourceUrl?: string; feedVersion?: string }>(
+    const data = await readOptionalJson<{
+      syncedAt?: string;
+      sourceUrl?: string;
+      feedVersion?: string;
+      feedUpdatedAt?: string;
+      updatedAt?: string;
+      sha256?: string;
+    }>(
       remotePricingCachePath,
       'remote-pricing-cache.json'
     );
@@ -126,9 +192,20 @@ export async function loadPricingSyncState(
       state.lastSyncSuccess = true;
       state.lastSyncedSourceUrl = data.sourceUrl ?? '';
       state.lastSyncedVersion = data.feedVersion ?? '';
+      state.lastSyncedUpdatedAt = data.feedUpdatedAt ?? data.updatedAt ?? '';
+      state.lastSyncedSha256 = typeof data.sha256 === 'string' ? data.sha256 : '';
     }
   }
-  const checkData = await readOptionalJson<{ lastCheckAt?: number; lastCheckSuccess?: boolean; lastSyncError?: string | null }>(
+  const checkData = await readOptionalJson<{
+    lastCheckAt?: number;
+    lastCheckSuccess?: boolean;
+    lastSyncError?: string | null;
+    lastSyncedVersion?: string;
+    lastSyncedUpdatedAt?: string;
+    lastSyncedSourceUrl?: string;
+    lastSyncedEtag?: string;
+    lastSyncedSha256?: string;
+  }>(
     pricingSyncStatePath,
     'pricing-sync-state.json'
   );
@@ -141,6 +218,21 @@ export async function loadPricingSyncState(
     }
     if (typeof checkData.lastSyncError === 'string' || checkData.lastSyncError === null) {
       state.lastSyncError = checkData.lastSyncError;
+    }
+    if (!state.lastSyncedVersion && typeof checkData.lastSyncedVersion === 'string') {
+      state.lastSyncedVersion = checkData.lastSyncedVersion;
+    }
+    if (!state.lastSyncedUpdatedAt && typeof checkData.lastSyncedUpdatedAt === 'string') {
+      state.lastSyncedUpdatedAt = checkData.lastSyncedUpdatedAt;
+    }
+    if (!state.lastSyncedSourceUrl && typeof checkData.lastSyncedSourceUrl === 'string') {
+      state.lastSyncedSourceUrl = checkData.lastSyncedSourceUrl;
+    }
+    if (typeof checkData.lastSyncedEtag === 'string') {
+      state.lastSyncedEtag = checkData.lastSyncedEtag;
+    }
+    if (!state.lastSyncedSha256 && typeof checkData.lastSyncedSha256 === 'string') {
+      state.lastSyncedSha256 = checkData.lastSyncedSha256;
     }
   }
   if (!state.nextAutoSyncAt) {
@@ -188,17 +280,43 @@ export function assertAllowedPricingFeedUrl(rawUrl: unknown): string {
   throw new Error(bt('pricing.err.https_trusted_only'));
 }
 
-async function fetchBoundedPricingFeed(initialUrl: string, signal: AbortSignal): Promise<Uint8Array> {
+interface FetchedFeedResult {
+  notModified: boolean;
+  bytes?: Uint8Array;
+  etag: string | null;
+}
+
+async function fetchBoundedPricingFeed(
+  initialUrl: string,
+  signal: AbortSignal,
+  options?: { etag?: string | null; force?: boolean }
+): Promise<FetchedFeedResult> {
   let currentUrl = assertAllowedPricingFeedUrl(initialUrl);
   const initialIsHttps = new URL(currentUrl).protocol === 'https:';
   let res: Response | null = null;
   for (let hop = 0; hop <= MAX_PRICING_FEED_REDIRECTS; hop += 1) {
+    const parsedCurrent = new URL(currentUrl);
+    const headers: Record<string, string> = {
+      'User-Agent': `GravityBox/${APP_VERSION}`,
+    };
+    if (parsedCurrent.hostname === 'api.github.com') {
+      headers['Accept'] = 'application/vnd.github.raw+json';
+      headers['X-GitHub-Api-Version'] = '2022-11-28';
+    } else {
+      headers['Accept'] = 'application/json';
+    }
+    if (options?.etag) {
+      headers['If-None-Match'] = options.etag;
+    }
+    if (options?.force) {
+      headers['Cache-Control'] = 'no-cache';
+    }
     res = await fetch(currentUrl, {
       signal,
       redirect: 'manual',
-      headers: { 'User-Agent': `GravityBox/${APP_VERSION}` },
+      headers,
     });
-    if (res.status >= 300 && res.status < 400) {
+    if (res.status >= 300 && res.status < 400 && res.status !== 304) {
       const loc = res.headers?.get?.('location');
       if (!loc) throw new Error(`HTTP ${res.status}`);
       const nextUrl = assertAllowedPricingFeedUrl(new URL(loc, currentUrl).href);
@@ -212,7 +330,7 @@ async function fetchBoundedPricingFeed(initialUrl: string, signal: AbortSignal):
     break;
   }
   if (!res) throw new Error(bt('pricing.err.url_invalid'));
-  if (res.status >= 300 && res.status < 400) {
+  if (res.status >= 300 && res.status < 400 && res.status !== 304) {
     throw new Error(bt('pricing.err.too_many_redirects'));
   }
   if (res.url) {
@@ -220,6 +338,10 @@ async function fetchBoundedPricingFeed(initialUrl: string, signal: AbortSignal):
     if (initialIsHttps && new URL(verifiedFinal).protocol !== 'https:') {
       throw new Error(bt('pricing.err.https_trusted_only'));
     }
+  }
+  const responseEtag = res.headers?.get?.('etag') ?? null;
+  if (res.status === 304) {
+    return { notModified: true, etag: responseEtag ?? options?.etag ?? null };
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const contentLen = Number(res.headers.get('content-length') ?? 0);
@@ -251,13 +373,50 @@ async function fetchBoundedPricingFeed(initialUrl: string, signal: AbortSignal):
       merged.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    return merged;
+    return { notModified: false, bytes: merged, etag: responseEtag };
   }
   const rawBuf = await res.arrayBuffer();
   if (rawBuf.byteLength > MAX_PRICING_FEED_BYTES) {
     throw new Error(bt('pricing.err.response_too_large'));
   }
-  return new Uint8Array(rawBuf);
+  return { notModified: false, bytes: new Uint8Array(rawBuf), etag: responseEtag };
+}
+
+function parseFetchedFeedBytes(rawBytes: Uint8Array): { data: any; sha256: string } {
+  let effectiveBytes = rawBytes;
+  let data = JSON.parse(new TextDecoder('utf-8').decode(effectiveBytes));
+  if (
+    data &&
+    typeof data === 'object' &&
+    !Array.isArray(data) &&
+    !data.prices &&
+    typeof data.content === 'string' &&
+    data.encoding === 'base64'
+  ) {
+    effectiveBytes = new Uint8Array(Buffer.from(data.content, 'base64'));
+    if (effectiveBytes.byteLength > MAX_PRICING_FEED_BYTES) {
+      throw new Error(bt('pricing.err.response_too_large'));
+    }
+    data = JSON.parse(new TextDecoder('utf-8').decode(effectiveBytes));
+  }
+  const sha256 = createHash('sha256').update(effectiveBytes).digest('hex');
+  return { data, sha256 };
+}
+
+function persistPricingSyncStatus(
+  pricingSyncStatePath: string,
+  state: PricingSyncMutableState
+): Promise<void> {
+  return atomicJson(pricingSyncStatePath, {
+    lastCheckAt: state.lastCheckAt,
+    lastCheckSuccess: state.lastCheckSuccess,
+    lastSyncError: state.lastSyncError,
+    lastSyncedVersion: state.lastSyncedVersion,
+    lastSyncedUpdatedAt: state.lastSyncedUpdatedAt ?? '',
+    lastSyncedSourceUrl: state.lastSyncedSourceUrl,
+    lastSyncedEtag: state.lastSyncedEtag ?? '',
+    lastSyncedSha256: state.lastSyncedSha256 ?? '',
+  }).catch(() => {});
 }
 
 export async function executeRemotePricingSync(options: {
@@ -266,36 +425,101 @@ export async function executeRemotePricingSync(options: {
   pricingSyncStatePath: string;
   state: PricingSyncMutableState;
   now: number;
-}): Promise<{ synced: boolean; error?: string; count?: number; sourceUrl?: string; version?: string }> {
-  const { candidateUrls, remotePricingCachePath, pricingSyncStatePath, state, now } = options;
+  force?: boolean;
+}): Promise<{ synced: boolean; unchanged?: boolean; error?: string; count?: number; sourceUrl?: string; version?: string; updatedAt?: string }> {
+  const { candidateUrls, remotePricingCachePath, pricingSyncStatePath, state, now, force } = options;
+  const cacheExists = await access(remotePricingCachePath).then(() => true, () => false);
   let lastError: any = null;
   for (const targetUrl of candidateUrls) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6000);
     try {
-      const rawBytes = await fetchBoundedPricingFeed(targetUrl, controller.signal);
-      const data = JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
+      const canUseEtag = Boolean(
+        cacheExists &&
+        state.lastSyncedEtag &&
+        (!state.lastSyncedSourceUrl || targetUrl === state.lastSyncedSourceUrl)
+      );
+      const fetched = await fetchBoundedPricingFeed(targetUrl, controller.signal, {
+        etag: canUseEtag ? state.lastSyncedEtag : null,
+        force,
+      });
+      if (fetched.notModified) {
+        state.lastRemoteSyncAt = now;
+        state.lastCheckAt = now;
+        state.nextAutoSyncAt = now + 86_400_000;
+        state.lastSyncSuccess = true;
+        state.lastCheckSuccess = true;
+        state.lastSyncError = null;
+        state.lastSyncedSourceUrl = targetUrl;
+        if (fetched.etag) state.lastSyncedEtag = fetched.etag;
+        await persistPricingSyncStatus(pricingSyncStatePath, state);
+        return {
+          synced: true,
+          unchanged: true,
+          sourceUrl: targetUrl,
+          version: state.lastSyncedVersion || PRICING_METADATA.version,
+          updatedAt: state.lastSyncedUpdatedAt || PRICING_METADATA.updatedAt,
+        };
+      }
+      const { data, sha256 } = parseFetchedFeedBytes(fetched.bytes!);
       const prices = data && typeof data === 'object' && data.prices ? data.prices : data;
       const validated = validateRawPrices(prices);
       const remoteMeta = sanitizeRemoteModelMetadata(data);
-      const feedVersion = (data && typeof data === 'object' && typeof data.version === 'string') ? data.version : 'unknown';
-      const cmpToSynced = compareDatedFeedVersion(feedVersion, state.lastSyncedVersion);
+      const feedVersion = (data && typeof data === 'object' && typeof data.version === 'string') ? data.version.trim() : 'unknown';
+      const feedUpdatedAt = (data && typeof data === 'object' && typeof data.updatedAt === 'string') ? data.updatedAt.trim() : '';
+      const cmpToSynced = compareFeedFreshness(
+        { version: feedVersion, updatedAt: feedUpdatedAt },
+        { version: state.lastSyncedVersion, updatedAt: state.lastSyncedUpdatedAt }
+      );
       if (cmpToSynced !== null && cmpToSynced < 0) {
         throw new Error(bt('pricing.err.feed_version_older', { feedVersion, syncedVersion: state.lastSyncedVersion }));
       }
-      const cmpToBuiltin = compareDatedFeedVersion(feedVersion, PRICING_METADATA.version);
+      const cmpToBuiltin = compareFeedFreshness(
+        { version: feedVersion, updatedAt: feedUpdatedAt },
+        { version: PRICING_METADATA.version, updatedAt: PRICING_METADATA.updatedAt }
+      );
       const isOlderDatedFeed = cmpToBuiltin !== null && cmpToBuiltin < 0;
+      if (cacheExists && state.lastSyncedSha256 && sha256 === state.lastSyncedSha256 && (cmpToSynced === null || cmpToSynced === 0)) {
+        resetAndRegisterRemoteModelMetadata(remoteMeta, {
+          onlyNewEntries: isOlderDatedFeed,
+          authoritativeSnapshot: !isOlderDatedFeed,
+        });
+        state.lastRemoteSyncAt = now;
+        state.lastCheckAt = now;
+        state.nextAutoSyncAt = now + 86_400_000;
+        state.lastSyncSuccess = true;
+        state.lastCheckSuccess = true;
+        state.lastSyncError = null;
+        state.lastSyncedSourceUrl = targetUrl;
+        if (fetched.etag) state.lastSyncedEtag = fetched.etag;
+        await persistPricingSyncStatus(pricingSyncStatePath, state);
+        return {
+          synced: true,
+          unchanged: true,
+          count: Object.keys(validated).length,
+          sourceUrl: targetUrl,
+          version: feedVersion,
+          updatedAt: feedUpdatedAt,
+        };
+      }
+
       const persistedPrices = isOlderDatedFeed
         ? Object.fromEntries(Object.entries(validated).filter(([k]) => !Object.hasOwn(DEFAULT_API_PRICES, k)))
         : validated;
-      resetAndRegisterRemoteModelMetadata(remoteMeta, { onlyNewEntries: isOlderDatedFeed });
+      resetAndRegisterRemoteModelMetadata(remoteMeta, {
+        onlyNewEntries: isOlderDatedFeed,
+        authoritativeSnapshot: !isOlderDatedFeed,
+      });
       await atomicJson(remotePricingCachePath, {
         version: 1,
         syncedAt: new Date(now).toISOString(),
         sourceUrl: targetUrl,
         feedVersion,
-        ...(remoteMeta.aliases ? { aliases: remoteMeta.aliases } : {}),
+        ...(feedUpdatedAt ? { feedUpdatedAt } : {}),
+        sha256,
+        ...(remoteMeta.aliases !== undefined ? { aliases: remoteMeta.aliases } : {}),
         ...(remoteMeta.activeModels ? { activeModels: remoteMeta.activeModels } : {}),
+        ...(remoteMeta.feedModels ? { feedModels: remoteMeta.feedModels } : {}),
         ...(remoteMeta.models ? { models: remoteMeta.models } : {}),
         prices: persistedPrices,
       });
@@ -307,12 +531,18 @@ export async function executeRemotePricingSync(options: {
       state.lastSyncError = null;
       state.lastSyncedSourceUrl = targetUrl;
       state.lastSyncedVersion = feedVersion;
-      await atomicJson(pricingSyncStatePath, {
-        lastCheckAt: now,
-        lastCheckSuccess: true,
-        lastSyncError: null,
-      }).catch(() => {});
-      return { synced: true, count: Object.keys(validated).length, sourceUrl: targetUrl, version: feedVersion };
+      state.lastSyncedUpdatedAt = feedUpdatedAt;
+      state.lastSyncedEtag = fetched.etag ?? '';
+      state.lastSyncedSha256 = sha256;
+      await persistPricingSyncStatus(pricingSyncStatePath, state);
+      return {
+        synced: true,
+        unchanged: false,
+        count: Object.keys(validated).length,
+        sourceUrl: targetUrl,
+        version: feedVersion,
+        updatedAt: feedUpdatedAt,
+      };
     } catch (err: any) {
       lastError = err;
       continue;
@@ -327,11 +557,7 @@ export async function executeRemotePricingSync(options: {
   state.lastSyncSuccess = false;
   state.lastCheckSuccess = false;
   state.lastSyncError = lastError?.message ?? String(lastError);
-  await atomicJson(pricingSyncStatePath, {
-    lastCheckAt: now,
-    lastCheckSuccess: false,
-    lastSyncError: state.lastSyncError,
-  }).catch(() => {});
+  await persistPricingSyncStatus(pricingSyncStatePath, state);
   return { synced: false, error: state.lastSyncError ?? undefined };
 }
 

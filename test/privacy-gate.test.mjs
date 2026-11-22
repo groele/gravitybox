@@ -155,7 +155,11 @@ test('隐私门禁 --staged 模式：仅检查暂存区快照，不误检未暂�
   }
 });
 
-test('仓库现状隐私门禁：当前代码库不得存在非白名单邮箱或敏感标识', async () => {
+const skipRepoPrivacyTest = process.env.GRAVITYBOX_SKIP_REPO_PRIVACY_TEST === '1'
+  ? 'verify.mjs 本轮已独立执行全仓隐私门禁，跳过单元阶段重复扫描'
+  : false;
+
+test('仓库现状隐私门禁：当前代码库不得存在非白名单邮箱或敏感标识', { skip: skipRepoPrivacyTest }, async () => {
   const result = await runPrivacyCheck({ repoRoot, staged: false });
   assert.ok(result.scannedCount > 50, '应扫描完整仓库文件');
   assert.deepEqual(result.issues, []);

@@ -8,6 +8,10 @@ import { getAppAsarPath, isOwnedByCurrentUser } from './platform.js';
 import type { AccountsManager, LiveLanguageServerStatus } from './accounts.js';
 import type { UsageStatsManager } from './usage.js';
 import {
+  registerObservedIdeModels,
+  type ObservedIdeModelEntry,
+} from './model-catalog.js';
+import {
   normalizeCatalogTierLabel,
   resolvePricingCatalogSnapshot,
   type PricingCatalogModelInput,
@@ -23,14 +27,80 @@ export interface LiveIdeModelSnapshotEntry {
   displayName: string | null;
   modelOrAlias: string | null;
   disabled: boolean;
+  maxTokens?: number | null;
+  maxOutputTokens?: number | null;
+  modelProvider?: string | null;
+  isInternal?: boolean;
+  deprecated?: boolean;
+  nonChatSpecialized?: boolean;
+  inModelSelector?: boolean | null;
 }
 
 export interface LiveIdeModelsSnapshot {
-  schema: 1;
+  schema: 1 | 2;
   appVersion: string;
   tier: string;
   observedAt: number;
   models: LiveIdeModelSnapshotEntry[];
+}
+
+function sanitizeOptionalTokenInt(raw: unknown): number | undefined {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined;
+  const rounded = Math.trunc(raw);
+  if (!Number.isSafeInteger(rounded) || rounded <= 0 || rounded > 10_000_000) return undefined;
+  return rounded;
+}
+
+function sanitizeOptionalString(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && trimmed.length <= 128 ? trimmed : undefined;
+}
+
+export function toObservedIdeModelEntries(
+  models: readonly (PricingCatalogModelInput | LiveIdeModelSnapshotEntry)[] | null | undefined
+): ObservedIdeModelEntry[] {
+  if (!Array.isArray(models) || models.length === 0) return [];
+  const entries: ObservedIdeModelEntry[] = [];
+  for (const raw of models.slice(0, MAX_LIVE_IDE_SNAPSHOT_MODELS)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const m = raw as unknown as Record<string, unknown>;
+    if (m.stale === true || m.quota_source === 'carried') continue;
+    const modelId = String(m.model_id ?? m.id ?? m.name ?? '').trim();
+    const modelOrAlias = sanitizeOptionalString(m.model_or_alias ?? m.modelOrAlias) ?? null;
+    if (!modelId && !modelOrAlias) continue;
+    const displayName = sanitizeOptionalString(m.display_name ?? m.displayName) ?? null;
+    const maxTokens = sanitizeOptionalTokenInt(m.max_tokens ?? m.maxTokens) ?? null;
+    const maxOutputTokens = sanitizeOptionalTokenInt(m.max_output_tokens ?? m.maxOutputTokens) ?? null;
+    const modelProvider = sanitizeOptionalString(m.model_provider ?? m.modelProvider) ?? null;
+    const rawIsInternal = m.is_internal ?? m.isInternal;
+    const rawDeprecated = m.deprecated;
+    const rawNonChat = m.non_chat_specialized ?? m.nonChatSpecialized;
+    const rawInSelector = m.in_model_selector ?? m.inModelSelector;
+    entries.push({
+      modelId: modelId || modelOrAlias!,
+      displayName,
+      modelOrAlias,
+      maxTokens,
+      maxOutputTokens,
+      modelProvider,
+      ...(typeof rawIsInternal === 'boolean' ? { isInternal: rawIsInternal } : {}),
+      ...(typeof rawDeprecated === 'boolean' ? { deprecated: rawDeprecated } : {}),
+      ...(typeof rawNonChat === 'boolean' ? { nonChatSpecialized: rawNonChat } : {}),
+      ...(typeof rawInSelector === 'boolean' || rawInSelector === null ? { inModelSelector: rawInSelector } : {}),
+    });
+  }
+  return entries;
+}
+
+export function registerObservedModelsFromSource(
+  models: readonly (PricingCatalogModelInput | LiveIdeModelSnapshotEntry)[] | null | undefined
+): number {
+  const entries = toObservedIdeModelEntries(models);
+  if (entries.length > 0) {
+    registerObservedIdeModels(entries);
+  }
+  return entries.length;
 }
 
 export async function readInstalledAppBundleVersion(appPath: string): Promise<string> {
@@ -95,8 +165,9 @@ export function sanitizeLiveIdeModelsSnapshot(
   const rawModels = live?.quota?.models;
   if (!Array.isArray(rawModels) || rawModels.length === 0) return null;
   const models: LiveIdeModelSnapshotEntry[] = [];
-  for (const m of rawModels.slice(0, MAX_LIVE_IDE_SNAPSHOT_MODELS)) {
-    if (!m || typeof m !== 'object') continue;
+  for (const raw of rawModels.slice(0, MAX_LIVE_IDE_SNAPSHOT_MODELS)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const m = raw as unknown as Record<string, unknown>;
     if (m.stale === true || m.quota_source === 'carried') continue;
     const id = String(m.model_id ?? m.name ?? '').trim();
     if (!id) continue;
@@ -107,7 +178,27 @@ export function sanitizeLiveIdeModelsSnapshot(
       ? m.model_or_alias.trim()
       : null;
     const disabled = m.disabled === true || /(?:^|[-_])disabled$/i.test(id);
-    models.push({ id, displayName, modelOrAlias, disabled });
+    const maxTokens = sanitizeOptionalTokenInt(m.max_tokens ?? m.maxTokens);
+    const maxOutputTokens = sanitizeOptionalTokenInt(m.max_output_tokens ?? m.maxOutputTokens);
+    const modelProvider = sanitizeOptionalString(m.model_provider ?? m.modelProvider);
+    const isInternal = m.is_internal === true || m.isInternal === true;
+    const deprecated = m.deprecated === true;
+    const nonChatSpecialized = m.non_chat_specialized === true || m.nonChatSpecialized === true;
+    const rawInSelector = m.in_model_selector ?? m.inModelSelector;
+    const inModelSelector = typeof rawInSelector === 'boolean' ? rawInSelector : undefined;
+    models.push({
+      id,
+      displayName,
+      modelOrAlias,
+      disabled,
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
+      ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+      ...(modelProvider !== undefined ? { modelProvider } : {}),
+      ...(isInternal ? { isInternal: true } : {}),
+      ...(deprecated ? { deprecated: true } : {}),
+      ...(nonChatSpecialized ? { nonChatSpecialized: true } : {}),
+      ...(inModelSelector !== undefined ? { inModelSelector } : {}),
+    });
   }
   if (models.length === 0) return null;
   const tier = normalizeCatalogTierLabel(live?.tier || live?.quota?.subscription_tier || '');
@@ -116,7 +207,7 @@ export function sanitizeLiveIdeModelsSnapshot(
     ? rawObserved
     : Math.floor(Date.now() / 1000);
   return {
-    schema: 1,
+    schema: 2,
     appVersion: String(appVersion || '').trim(),
     tier,
     observedAt,
@@ -135,25 +226,41 @@ export async function readValidLiveIdeModelsSnapshot(
     return null;
   }
   const data = await readOptionalJson<LiveIdeModelsSnapshot>(snapshotPath, 'live-ide-models.json');
-  if (!data || typeof data !== 'object' || data.schema !== 1) return null;
+  if (!data || typeof data !== 'object' || (data.schema !== 1 && data.schema !== 2)) return null;
   const snapVer = typeof data.appVersion === 'string' ? data.appVersion.trim() : '';
   if (!snapVer || snapVer !== cleanInstalled) return null;
   if (!Array.isArray(data.models) || data.models.length === 0) return null;
   const models: LiveIdeModelSnapshotEntry[] = [];
-  for (const m of data.models.slice(0, MAX_LIVE_IDE_SNAPSHOT_MODELS)) {
-    if (!m || typeof m !== 'object') continue;
+  for (const raw of data.models.slice(0, MAX_LIVE_IDE_SNAPSHOT_MODELS)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const m = raw as unknown as Record<string, unknown>;
     const id = typeof m.id === 'string' ? m.id.trim() : '';
     if (!id) continue;
+    const maxTokens = sanitizeOptionalTokenInt(m.maxTokens ?? m.max_tokens);
+    const maxOutputTokens = sanitizeOptionalTokenInt(m.maxOutputTokens ?? m.max_output_tokens);
+    const modelProvider = sanitizeOptionalString(m.modelProvider ?? m.model_provider);
+    const isInternal = m.isInternal === true || m.is_internal === true;
+    const deprecated = m.deprecated === true;
+    const nonChatSpecialized = m.nonChatSpecialized === true || m.non_chat_specialized === true;
+    const rawInSelector = m.inModelSelector ?? m.in_model_selector;
+    const inModelSelector = typeof rawInSelector === 'boolean' ? rawInSelector : undefined;
     models.push({
       id,
       displayName: typeof m.displayName === 'string' && m.displayName.trim() ? m.displayName.trim() : null,
       modelOrAlias: typeof m.modelOrAlias === 'string' && m.modelOrAlias.trim() ? m.modelOrAlias.trim() : null,
       disabled: m.disabled === true || /(?:^|[-_])disabled$/i.test(id),
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
+      ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+      ...(modelProvider !== undefined ? { modelProvider } : {}),
+      ...(isInternal ? { isInternal: true } : {}),
+      ...(deprecated ? { deprecated: true } : {}),
+      ...(nonChatSpecialized ? { nonChatSpecialized: true } : {}),
+      ...(inModelSelector !== undefined ? { inModelSelector } : {}),
     });
   }
   if (models.length === 0) return null;
   return {
-    schema: 1,
+    schema: data.schema === 1 ? 1 : 2,
     appVersion: snapVer,
     tier: normalizeCatalogTierLabel(data.tier),
     observedAt: typeof data.observedAt === 'number' && Number.isFinite(data.observedAt) ? data.observedAt : 0,
@@ -214,6 +321,20 @@ export async function buildPricingCatalogPayloadSnapshot(params: {
       source: acc.quota.source ?? 'cloud',
       models: acc.quota.models as PricingCatalogModelInput[],
     });
+  }
+
+  // Register observed IDE/Cloud models (pool -> activeAccount -> snapshot -> live so freshest wins)
+  for (const pool of poolAccountsInput) {
+    registerObservedModelsFromSource(pool.models);
+  }
+  if (activeAccountInput?.models) {
+    registerObservedModelsFromSource(activeAccountInput.models);
+  }
+  if (snapshot?.models) {
+    registerObservedModelsFromSource(snapshot.models);
+  }
+  if (liveModels.length > 0) {
+    registerObservedModelsFromSource(liveModels as PricingCatalogModelInput[]);
   }
 
   const payload = resolvePricingCatalogSnapshot({

@@ -12,6 +12,7 @@ export interface ActivePaneSession {
   sessionRevision: number;
   metricsSequence: number;
   modelId: string;
+  modelCapacity?: number;
   foregroundStreaming: boolean;
   isStreaming: boolean;
   activityPhase: HudActivityPhase;
@@ -37,6 +38,8 @@ export class CdpHudBridge implements ICdpHudBridge {
     { cdp: CDP; getContextId: () => number | undefined }
   >();
   private readonly activePanes = new Map<string, ActivePaneSession>();
+  private readonly inFlightPaneRefreshes = new Set<string>();
+  private readonly inFlightPaneRefreshCounts = new Map<string, number>();
   private readonly clientEventHandlers = new Set<(event: HudClientEvent) => void>();
   private pollTimer: NodeJS.Timeout | null = null;
   private pollInFlight = false;
@@ -188,6 +191,19 @@ export class CdpHudBridge implements ICdpHudBridge {
       : 'generating';
 
     const nowMs = Date.now();
+    const parsedModelId =
+      (typeof parsed.modelId === 'string' && parsed.modelId.trim()) ||
+      sameConv?.modelId ||
+      '';
+    const modelChanged = Boolean(sameConv && parsedModelId && parsedModelId !== sameConv.modelId);
+    const parsedModelCapacity =
+      typeof parsed.modelCapacity === 'number' &&
+      Number.isSafeInteger(parsed.modelCapacity) &&
+      parsed.modelCapacity > 0
+        ? parsed.modelCapacity
+        : modelChanged
+        ? undefined
+        : sameConv?.modelCapacity;
     const session: ActivePaneSession = {
       targetId,
       paneSlotId,
@@ -195,10 +211,8 @@ export class CdpHudBridge implements ICdpHudBridge {
       conversationId,
       sessionRevision: nextRevision,
       metricsSequence: sameConv?.metricsSequence ?? 0,
-      modelId:
-        (typeof parsed.modelId === 'string' && parsed.modelId.trim()) ||
-        sameConv?.modelId ||
-        '',
+      modelId: parsedModelId,
+      ...(parsedModelCapacity !== undefined ? { modelCapacity: parsedModelCapacity } : {}),
       foregroundStreaming,
       isStreaming: resolvedStreaming,
       activityPhase: resolvedPhase,
@@ -232,93 +246,111 @@ export class CdpHudBridge implements ICdpHudBridge {
     const session = this.activePanes.get(paneKey);
     if (!session) return;
 
-    const nextSeq = ++this.sequenceCounter;
-    const metrics = await this.engine.getConversationMetrics({
-      conversationId: session.conversationId,
-      paneSlotId: session.paneSlotId,
-      sessionRevision: session.sessionRevision,
-      metricsSequence: nextSeq,
-      modelId: session.modelId,
-      isStreaming: session.foregroundStreaming,
-      activityPhase: session.activityPhase,
-      isSubagentRunning: session.isSubagentRunning,
-      runningSubagentCount: session.runningSubagentCount,
-      childConversationIds: session.childConversationIds,
-    });
-
-    // 若异步查询期间会话已被切换或移除，或已有更新序号的度量推入，丢弃陈旧结果
-    const latestSession = this.activePanes.get(paneKey);
-    if (
-      !latestSession ||
-      latestSession !== session ||
-      latestSession.conversationId !== metrics.conversationId ||
-      latestSession.sessionRevision > metrics.sessionRevision ||
-      latestSession.metricsSequence > nextSeq
-    ) {
+    // 周期轮询 (forcePush=false) 若该分栏已有在途刷新则去重跳过；
+    // 显式事件触发 (forcePush=true) 立即推进并在提交时通过序号与会话一致性校验过滤旧包。
+    if (!forcePush && this.inFlightPaneRefreshes.has(paneKey)) {
       return;
     }
+    this.inFlightPaneRefreshes.add(paneKey);
+    this.inFlightPaneRefreshCounts.set(paneKey, (this.inFlightPaneRefreshCounts.get(paneKey) ?? 0) + 1);
+    try {
+      const nextSeq = ++this.sequenceCounter;
+      const metrics = await this.engine.getConversationMetrics({
+        conversationId: session.conversationId,
+        paneSlotId: session.paneSlotId,
+        sessionRevision: session.sessionRevision,
+        metricsSequence: nextSeq,
+        modelId: session.modelId,
+        modelCapacity: session.modelCapacity,
+        isStreaming: session.foregroundStreaming,
+        activityPhase: session.activityPhase,
+        isSubagentRunning: session.isSubagentRunning,
+        runningSubagentCount: session.runningSubagentCount,
+        childConversationIds: session.childConversationIds,
+      });
 
-    const sessionForFingerprint = metrics.isStreaming
-      ? {
-          ...metrics.session,
-          currentTurnDurationSeconds: 0,
-          currentTurnDurationFormatted: '',
-          currentTurnDurationFormattedEn: '',
-          currentTurnDurationCompactZh: '',
-          currentTurnDurationCompactEn: '',
-          currentTurnModelDurationSeconds: 0,
-          currentTurnToolDurationSeconds: 0,
-          inFlightModelDurationSeconds: 0,
-          inFlightToolDurationSeconds: 0,
-          hasTurnDurationAnchor: (metrics.session.currentTurnDurationSeconds ?? 0) > 0,
-          hasInFlightModelAnchor: (metrics.session.inFlightModelDurationSeconds ?? 0) > 0,
-          hasInFlightToolAnchor: (metrics.session.inFlightToolDurationSeconds ?? 0) > 0,
-        }
-      : {
-          ...metrics.session,
-          currentTurnDurationSeconds: Math.round(metrics.session.currentTurnDurationSeconds ?? 0),
-          currentTurnModelDurationSeconds: Math.round(metrics.session.currentTurnModelDurationSeconds ?? 0),
-          currentTurnToolDurationSeconds: Math.round(metrics.session.currentTurnToolDurationSeconds ?? 0),
-          inFlightModelDurationSeconds: Math.round(metrics.session.inFlightModelDurationSeconds ?? 0),
-          inFlightToolDurationSeconds: Math.round(metrics.session.inFlightToolDurationSeconds ?? 0),
-        };
-    const fingerprint = JSON.stringify({
-      session: sessionForFingerprint,
-      tokens: metrics.tokens,
-      context: metrics.context,
-      availability: metrics.availability,
-      observedAt: metrics.isStreaming && metrics.availability === 'ready' ? 0 : metrics.observedAt,
-      failedChildCount: metrics.failedChildCount,
-      isStreaming: metrics.isStreaming,
-      activityPhase: metrics.activityPhase,
-      isSubagentRunning: metrics.isSubagentRunning,
-      runningSubagentCount: metrics.runningSubagentCount,
-    });
-
-    if (!forcePush && latestSession.lastMetricsKey === fingerprint) {
-      latestSession.metricsSequence = Math.max(latestSession.metricsSequence, nextSeq);
-      return;
-    }
-
-    const pushed = await this.pushMetricsToTarget(latestSession.targetId, metrics);
-    if (pushed) {
-      latestSession.metricsSequence = nextSeq;
-      latestSession.lastMetricsKey = fingerprint;
-      latestSession.lastUpdatedAt = Date.now();
-      latestSession.isStreaming = Boolean(latestSession.foregroundStreaming || metrics.isStreaming);
-      latestSession.activityPhase =
-        metrics.activityPhase ?? (latestSession.foregroundStreaming ? 'generating' : 'idle');
-      if (latestSession.foregroundStreaming || metrics.isStreaming || metrics.isSubagentRunning) {
-        latestSession.lastActivityAt = Date.now();
+      // 若异步查询期间会话已被切换或移除，或已有更新序号的度量推入，丢弃陈旧结果
+      const latestSession = this.activePanes.get(paneKey);
+      if (
+        !latestSession ||
+        latestSession !== session ||
+        latestSession.conversationId !== metrics.conversationId ||
+        latestSession.sessionRevision > metrics.sessionRevision ||
+        latestSession.metricsSequence > nextSeq
+      ) {
+        return;
       }
-      if (metrics.availability === 'partial' || metrics.availability === 'cached') {
-        const attempts = latestSession.autoHealAttempts ?? 0;
-        if (attempts < 5) {
-          latestSession.autoHealAttempts = attempts + 1;
+
+      const sessionForFingerprint = metrics.isStreaming
+        ? {
+            ...metrics.session,
+            currentTurnDurationSeconds: 0,
+            currentTurnDurationFormatted: '',
+            currentTurnDurationFormattedEn: '',
+            currentTurnDurationCompactZh: '',
+            currentTurnDurationCompactEn: '',
+            currentTurnModelDurationSeconds: 0,
+            currentTurnToolDurationSeconds: 0,
+            inFlightModelDurationSeconds: 0,
+            inFlightToolDurationSeconds: 0,
+            hasTurnDurationAnchor: (metrics.session.currentTurnDurationSeconds ?? 0) > 0,
+            hasInFlightModelAnchor: (metrics.session.inFlightModelDurationSeconds ?? 0) > 0,
+            hasInFlightToolAnchor: (metrics.session.inFlightToolDurationSeconds ?? 0) > 0,
+          }
+        : {
+            ...metrics.session,
+            currentTurnDurationSeconds: Math.round(metrics.session.currentTurnDurationSeconds ?? 0),
+            currentTurnModelDurationSeconds: Math.round(metrics.session.currentTurnModelDurationSeconds ?? 0),
+            currentTurnToolDurationSeconds: Math.round(metrics.session.currentTurnToolDurationSeconds ?? 0),
+            inFlightModelDurationSeconds: Math.round(metrics.session.inFlightModelDurationSeconds ?? 0),
+            inFlightToolDurationSeconds: Math.round(metrics.session.inFlightToolDurationSeconds ?? 0),
+          };
+      const fingerprint = JSON.stringify({
+        session: sessionForFingerprint,
+        tokens: metrics.tokens,
+        context: metrics.context,
+        availability: metrics.availability,
+        observedAt: metrics.isStreaming && metrics.availability === 'ready' ? 0 : metrics.observedAt,
+        failedChildCount: metrics.failedChildCount,
+        isStreaming: metrics.isStreaming,
+        activityPhase: metrics.activityPhase,
+        isSubagentRunning: metrics.isSubagentRunning,
+        runningSubagentCount: metrics.runningSubagentCount,
+      });
+
+      if (!forcePush && latestSession.lastMetricsKey === fingerprint) {
+        latestSession.metricsSequence = Math.max(latestSession.metricsSequence, nextSeq);
+        return;
+      }
+
+      const pushed = await this.pushMetricsToTarget(latestSession.targetId, metrics);
+      if (pushed) {
+        latestSession.metricsSequence = nextSeq;
+        latestSession.lastMetricsKey = fingerprint;
+        latestSession.lastUpdatedAt = Date.now();
+        latestSession.isStreaming = Boolean(latestSession.foregroundStreaming || metrics.isStreaming);
+        latestSession.activityPhase =
+          metrics.activityPhase ?? (latestSession.foregroundStreaming ? 'generating' : 'idle');
+        if (latestSession.foregroundStreaming || metrics.isStreaming || metrics.isSubagentRunning) {
           latestSession.lastActivityAt = Date.now();
         }
+        if (metrics.availability === 'partial' || metrics.availability === 'cached') {
+          const attempts = latestSession.autoHealAttempts ?? 0;
+          if (attempts < 5) {
+            latestSession.autoHealAttempts = attempts + 1;
+            latestSession.lastActivityAt = Date.now();
+          }
+        } else {
+          latestSession.autoHealAttempts = 0;
+        }
+      }
+    } finally {
+      const nextCount = Math.max(0, (this.inFlightPaneRefreshCounts.get(paneKey) ?? 1) - 1);
+      if (nextCount === 0) {
+        this.inFlightPaneRefreshCounts.delete(paneKey);
+        this.inFlightPaneRefreshes.delete(paneKey);
       } else {
-        latestSession.autoHealAttempts = 0;
+        this.inFlightPaneRefreshCounts.set(paneKey, nextCount);
       }
     }
   }
@@ -398,6 +430,14 @@ export class CdpHudBridge implements ICdpHudBridge {
     );
   }
 
+  /**
+   * 价格基准同步后使 HUD 定价缓存失效，并立即重推所有活跃分栏的度量快照
+   */
+  public async refreshAllForPricingChange(): Promise<void> {
+    this.engine.invalidatePricingCache();
+    await this.refreshAllForLocaleChange();
+  }
+
   public onClientEvent(handler: (event: HudClientEvent) => void): void {
     this.clientEventHandlers.add(handler);
   }
@@ -418,6 +458,8 @@ export class CdpHudBridge implements ICdpHudBridge {
     }
     this.targets.clear();
     this.activePanes.clear();
+    this.inFlightPaneRefreshes.clear();
+    this.inFlightPaneRefreshCounts.clear();
     this.clientEventHandlers.clear();
     this.engine.clearCache();
   }

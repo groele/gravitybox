@@ -24,6 +24,20 @@ enum ModelDisplayName {
         return [:]
     }()
 
+    private static func formatStandaloneGemini(_ strippedValue: String) -> String? {
+        guard let match = standaloneGeminiRegex?.firstMatch(
+            in: strippedValue,
+            range: NSRange(location: 0, length: (strippedValue as NSString).length)
+        ) else {
+            return nil
+        }
+        let ns = strippedValue as NSString
+        let ver = ns.substring(with: match.range(at: 1))
+        let rawSlug = ns.substring(with: match.range(at: 2))
+        let code = rawSlug.split(separator: "-").map { $0.capitalized }.joined(separator: " ")
+        return "Gemini \(ver) \(code)"
+    }
+
     static func name(_ identifier: String) -> String {
         let names = catalogNames
         let trimmed = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -32,8 +46,12 @@ enum ModelDisplayName {
         if let name = names[value] { return name }
         if value.hasPrefix("google/"), let name = names[String(value.dropFirst(7))] { return name }
 
-        // Strip reasoning effort qualifiers in brackets (e.g. "(High)", "(Medium)", "(Low)", "(Extra Low)") while keeping non-effort qualifiers like "(Thinking)"
-        let effortSet: Set<String> = ["high", "medium", "low", "extra low", "extra-low"]
+        // Strip reasoning effort qualifiers in brackets (e.g. "(High)", "(XHigh)", "(Extra)", "(Medium)", "(Low)", "(Extra Low)") while keeping non-effort qualifiers like "(Thinking)" or "(Orchestrator)"
+        let effortSet: Set<String> = [
+            "high", "medium", "low", "extra low", "extra-low",
+            "xhigh", "extra", "extra high", "extra-high",
+            "minimal", "max"
+        ]
         for brackets in [(" (", ")"), ("（", "）"), ("(", ")")] {
             if trimmed.hasSuffix(brackets.1), let openRange = trimmed.range(of: brackets.0, options: .backwards) {
                 let baseRaw = String(trimmed[..<openRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -48,19 +66,25 @@ enum ModelDisplayName {
             }
         }
 
-        // Strip preview/thinking suffixes from known models, while keeping raw response_model variant suffixes (such as -n, -exp-a, -tiered, -trial, -high, -medium, -low) verbatim
+        // Strip preview/thinking/extra suffixes from known models, while keeping raw response_model variant suffixes (such as -n, -exp-a, -tiered, -trial, -high, -medium, -low) verbatim
         let suffixTable: [(String, String?)] = [
+            ("-extra-high-thinking", "Thinking"),
             ("-extra-low-thinking", "Thinking"),
+            ("-xhigh-thinking", "Thinking"),
+            ("-extra-thinking", "Thinking"),
             ("-high-thinking", "Thinking"),
             ("-medium-thinking", "Thinking"),
             ("-low-thinking", "Thinking"),
+            ("-minimal-thinking", "Thinking"),
+            ("-max-thinking", "Thinking"),
             ("-thinking", "Thinking"),
+            ("-extra", nil),
             ("-preview", "Preview")
         ]
         let strippedValue = value.hasPrefix("google/") ? String(value.dropFirst(7)) : value
         for (suffix, label) in suffixTable where strippedValue.hasSuffix(suffix) {
             let baseKey = String(strippedValue.dropLast(suffix.count))
-            if let baseName = names[baseKey] {
+            if let baseName = names[baseKey] ?? formatStandaloneGemini(baseKey) {
                 if let label = label, !label.isEmpty {
                     return "\(baseName) \(label)"
                 }
@@ -69,12 +93,8 @@ enum ModelDisplayName {
         }
 
         // Auto-format clean standalone Gemini 4+ codename models (e.g. gemini-4-carbon, gemini-4-neon)
-        if let match = standaloneGeminiRegex?.firstMatch(in: strippedValue, range: NSRange(location: 0, length: (strippedValue as NSString).length)) {
-            let ns = strippedValue as NSString
-            let ver = ns.substring(with: match.range(at: 1))
-            let rawSlug = ns.substring(with: match.range(at: 2))
-            let code = rawSlug.split(separator: "-").map { $0.capitalized }.joined(separator: " ")
-            return "Gemini \(ver) \(code)"
+        if let formatted = formatStandaloneGemini(strippedValue) {
+            return formatted
         }
         return trimmed
     }
@@ -247,5 +267,160 @@ enum InterfaceText {
             return "$" + grouped
         }
         return String(format: "$%.2f", locale: Locale(identifier: "en_US_POSIX"), value)
+    }
+}
+
+enum ModelUsageFold {
+    private static let thinkingSuffixRegex = try? NSRegularExpression(
+        pattern: "(?:-(?:tiered|extra-high|extra-low|xhigh|extra|high|medium|low|minimal|thinking|max))+$",
+        options: [.caseInsensitive]
+    )
+
+    static func sortByUsage(_ rows: [[String: Any]]) -> [[String: Any]] {
+        rows.enumerated().sorted { lhs, rhs in
+            let lTok = intField(lhs.element, "totalTokens", fallback: intField(lhs.element, "total_tokens"))
+            let rTok = intField(rhs.element, "totalTokens", fallback: intField(rhs.element, "total_tokens"))
+            if lTok != rTok { return lTok > rTok }
+            let lUsd = doubleField(lhs.element, "estimatedUsd", fallback: doubleField(lhs.element, "estimated_usd"))
+            let rUsd = doubleField(rhs.element, "estimatedUsd", fallback: doubleField(rhs.element, "estimated_usd"))
+            if abs(lUsd - rUsd) > 1e-12 { return lUsd > rUsd }
+            let lReq = intField(lhs.element, "requestCount", fallback: intField(lhs.element, "request_count"))
+            let rReq = intField(rhs.element, "requestCount", fallback: intField(rhs.element, "request_count"))
+            if lReq != rReq { return lReq > rReq }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    private static func intField(_ dict: [String: Any], _ key: String, fallback: Int = 0) -> Int {
+        if let n = dict[key] as? NSNumber { return n.intValue }
+        if let s = dict[key] as? String, let v = Int(s) { return v }
+        return fallback
+    }
+
+    private static func doubleField(_ dict: [String: Any], _ key: String, fallback: Double = 0) -> Double {
+        if let n = dict[key] as? NSNumber { return n.doubleValue }
+        if let s = dict[key] as? String, let v = Double(s) { return v }
+        return fallback
+    }
+
+    static func baseModelKey(for rawModel: String) -> String {
+        let trimmed = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed != "未知模型",
+              trimmed.caseInsensitiveCompare("Unknown Model") != .orderedSame,
+              let regex = thinkingSuffixRegex else {
+            return trimmed
+        }
+        let range = NSRange(location: 0, length: (trimmed as NSString).length)
+        let stripped = regex.stringByReplacingMatches(in: trimmed, options: [], range: range, withTemplate: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return stripped.isEmpty ? trimmed : stripped
+    }
+
+    static func foldThinkingVariants(_ rows: [[String: Any]]) -> [[String: Any]] {
+        guard rows.count > 1 else {
+            return rows.map { item in
+                guard let raw = item["model"] as? String else { return item }
+                let folded = baseModelKey(for: raw)
+                guard folded != raw else { return item }
+                var copy = item
+                copy["model"] = folded
+                return copy
+            }
+        }
+        var order: [String] = []
+        var buckets: [String: (row: [String: Any], total: Int, input: Int, output: Int, cached: Int, cacheWrite: Int, req: Int, usd: Double, unpriced: Int, anyPriced: Bool, allPriced: Bool, anyExpired: Bool)] = [:]
+        for item in rows {
+            let raw = (item["model"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let folded = baseModelKey(for: raw)
+            let key = folded.isEmpty ? "__empty__:\(order.count)" : folded.lowercased()
+            let t = intField(item, "totalTokens", fallback: intField(item, "total_tokens"))
+            let inp = intField(item, "promptTokens", fallback: intField(item, "input_tokens"))
+            let outp = intField(item, "candidatesTokens", fallback: intField(item, "output_tokens"))
+            let cac = intField(item, "cachedTokens", fallback: intField(item, "cached_tokens"))
+            let cw = intField(item, "cacheWriteTokens", fallback: intField(item, "cache_write_tokens"))
+            let req = intField(item, "requestCount", fallback: intField(item, "request_count"))
+            let usd = doubleField(item, "estimatedUsd", fallback: doubleField(item, "estimated_usd"))
+            let unpriced = intField(item, "unpricedTokens", fallback: intField(item, "unpriced_tokens"))
+            let itemPartial = (item["partiallyPriced"] as? Bool) ?? false
+            let itemPriced = (item["priced"] as? Bool) ?? (usd > 0 || (unpriced == 0 && t > 0 && item["priced"] == nil))
+            let effectivePriced = itemPriced || itemPartial
+            let itemExpired = (item["pricingStatus"] as? String ?? "") == "expired"
+
+            if var existing = buckets[key] {
+                existing.total += t
+                existing.input += inp
+                existing.output += outp
+                existing.cached += cac
+                existing.cacheWrite += cw
+                existing.req += req
+                existing.usd += usd
+                existing.unpriced += unpriced
+                existing.anyPriced = existing.anyPriced || effectivePriced
+                existing.allPriced = existing.allPriced && itemPriced && !itemPartial
+                existing.anyExpired = existing.anyExpired || itemExpired
+                if raw.caseInsensitiveCompare(folded) == .orderedSame {
+                    existing.row["model"] = raw
+                }
+                if (existing.row["pricingKey"] as? String ?? "").isEmpty,
+                   let pk = item["pricingKey"] as? String, !pk.isEmpty {
+                    existing.row["pricingKey"] = pk
+                }
+                let existingPs = (existing.row["pricingStatus"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if (existingPs.isEmpty || existingPs == "unpriced"),
+                   let ps = item["pricingStatus"] as? String, !ps.isEmpty, ps != "unpriced" {
+                    existing.row["pricingStatus"] = ps
+                }
+                if existing.row["pricingProvenance"] == nil, let prov = item["pricingProvenance"] {
+                    existing.row["pricingProvenance"] = prov
+                }
+                buckets[key] = existing
+            } else {
+                order.append(key)
+                var seed = item
+                if !folded.isEmpty { seed["model"] = folded }
+                buckets[key] = (
+                    row: seed,
+                    total: t,
+                    input: inp,
+                    output: outp,
+                    cached: cac,
+                    cacheWrite: cw,
+                    req: req,
+                    usd: usd,
+                    unpriced: unpriced,
+                    anyPriced: effectivePriced,
+                    allPriced: itemPriced && !itemPartial,
+                    anyExpired: itemExpired
+                )
+            }
+        }
+
+        return order.compactMap { key in
+            guard let b = buckets[key] else { return nil }
+            var out = b.row
+            out["totalTokens"] = b.total
+            out["total_tokens"] = b.total
+            out["promptTokens"] = b.input
+            out["input_tokens"] = b.input
+            out["candidatesTokens"] = b.output
+            out["output_tokens"] = b.output
+            out["cachedTokens"] = b.cached
+            out["cached_tokens"] = b.cached
+            out["cacheWriteTokens"] = b.cacheWrite
+            out["cache_write_tokens"] = b.cacheWrite
+            out["requestCount"] = b.req
+            out["request_count"] = b.req
+            out["estimatedUsd"] = b.usd
+            out["estimated_usd"] = b.usd
+            out["unpricedTokens"] = b.unpriced
+            out["unpriced_tokens"] = b.unpriced
+            let isPartial = b.anyPriced && (!b.allPriced || b.unpriced > 0)
+            let isFullPriced = b.allPriced && b.unpriced == 0
+            out["priced"] = isFullPriced
+            out["partiallyPriced"] = isPartial
+            if b.anyExpired { out["pricingStatus"] = "expired" }
+            return out
+        }
     }
 }

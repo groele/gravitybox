@@ -37,6 +37,91 @@ export interface UsageScanContext {
   getLedgerEvent: (eventKey: string) => LedgerEvent | undefined;
 }
 
+export interface StepLinkCandidate {
+  timestamp: number;
+  usage: Buffer | null;
+  execution: Buffer | null;
+}
+
+interface TokenUsageTuple {
+  input: number;
+  output: number;
+  cacheWrite: number;
+  cached: number;
+}
+
+function extractTokenTuple(usage: Buffer | null): TokenUsageTuple | null {
+  if (!usage || usage.length === 0) return null;
+  const input = ProtobufReader.findVarint(usage, 2) ?? 0;
+  const output = ProtobufReader.findVarint(usage, 3) ?? 0;
+  const cacheWrite = ProtobufReader.findVarint(usage, 4) ?? 0;
+  const cached = ProtobufReader.findVarint(usage, 5) ?? 0;
+  if (
+    !Number.isSafeInteger(input) || input < 0 ||
+    !Number.isSafeInteger(output) || output < 0 ||
+    !Number.isSafeInteger(cacheWrite) || cacheWrite < 0 ||
+    !Number.isSafeInteger(cached) || cached < 0
+  ) {
+    return null;
+  }
+  return { input, output, cacheWrite, cached };
+}
+
+function tokenTuplesEqual(a: TokenUsageTuple | null, b: TokenUsageTuple | null): boolean {
+  return Boolean(
+    a && b &&
+    a.input === b.input &&
+    a.output === b.output &&
+    a.cacheWrite === b.cacheWrite &&
+    a.cached === b.cached
+  );
+}
+
+/**
+ * Resolve a generation timestamp from linked step metadata rows.
+ * Primary: exact single-step execution + raw usage byte equality.
+ * Secondary fallback: when linked contains extra non-matching/zero-timestamp steps or usage protobuf
+ * adds new fields, match uniquely by executionId byte equality + token 4-tuple (f2/f3/f4/f5) equality.
+ */
+export function resolveLinkedStepTimestamp(
+  linked: readonly StepLinkCandidate[],
+  execution: Buffer | null,
+  usage: Buffer | null
+): number {
+  if (!execution || !usage || linked.length === 0) return 0;
+  if (
+    linked.length === 1 &&
+    linked[0]!.timestamp > 0 &&
+    linked[0]!.execution?.equals(execution) &&
+    linked[0]!.usage?.equals(usage)
+  ) {
+    return linked[0]!.timestamp;
+  }
+  // Multi-step exact match fallback (requires a single unambiguous valid step)
+  const exactMatches = linked.filter(
+    (step) => step.timestamp > 0 && step.execution?.equals(execution) && step.usage?.equals(usage)
+  );
+  if (exactMatches.length === 1) {
+    return exactMatches[0]!.timestamp;
+  }
+  if (exactMatches.length > 1) {
+    return 0;
+  }
+  // Protobuf field-evolution fallback: executionId + token 4-tuple (f2/f3/f4/f5) equality (single unambiguous valid step)
+  const targetTuple = extractTokenTuple(usage);
+  if (!targetTuple) return 0;
+  const tupleMatches = linked.filter(
+    (step) =>
+      step.timestamp > 0 &&
+      step.execution?.equals(execution) &&
+      tokenTuplesEqual(extractTokenTuple(step.usage), targetTuple)
+  );
+  if (tupleMatches.length === 1) {
+    return tupleMatches[0]!.timestamp;
+  }
+  return 0;
+}
+
 export async function querySqlite(
   dbPath: string,
   sql: string,
@@ -451,8 +536,9 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
       }
       for (const item of pendingStepLinks) {
         const linked = item.indices.map(idx => stepTimes.get(idx)).filter((step): step is NonNullable<typeof step> => !!step);
-        if (linked.length === 1 && item.execution && linked[0]!.execution?.equals(item.execution) && linked[0]!.usage?.equals(item.usage)) {
-          item.event.timestamp_seconds = linked[0]!.timestamp;
+        const linkedTs = resolveLinkedStepTimestamp(linked, item.execution, item.usage);
+        if (linkedTs > 0) {
+          item.event.timestamp_seconds = linkedTs;
           const obs = ctx.lookupObservedContext(item.event.timestamp_seconds);
           if (obs) {
             item.event.account_id = obs.id;
