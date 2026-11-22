@@ -23,7 +23,7 @@ const PROJECT = 'antigravityUnifiedStateSync.enterprisePreferences';
 const KEYS = [TOKEN, USER, INIT, PROJECT, 'antigravityOnboarding'];
 const quote = (s: string) => `'${s.replaceAll("'", "''")}'`;
 type Rows = Record<string, string>;
-type SavedFile = { path: string; before: string; after: string; afterDigest?: string };
+type SavedFile = { path: string; before: string | null; after: string | null; afterDigest?: string };
 type Journal = {
   version: 1;
   status: string;
@@ -51,6 +51,26 @@ type RollbackRecord = {
 
 function sha256(content: string): string {
   return createHash('sha256').update(content).digest('hex');
+}
+function digestOptional(content: string | null): string {
+  return content === null ? 'NULL_FILE' : sha256(content);
+}
+async function readOptionalText(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+async function writeOrUnlinkText(path: string, content: string | null): Promise<void> {
+  if (content === null) {
+    await unlink(path).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    });
+    return;
+  }
+  await atomicText(path, content);
 }
 function rowsDigest(rows: Rows): string {
   return sha256(JSON.stringify(Object.entries(rows || {}).sort()));
@@ -260,7 +280,11 @@ export class AccountSwitchService {
     try { await this.regular(this.rollbackPath); record = JSON.parse(await readFile(this.rollbackPath, 'utf8')); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'none'; throw error; }
     const dbPath = join(this.options.profile, 'User', 'globalStorage', 'state.vscdb');
-    const allowed = new Set([join(this.options.stateDir, 'accounts.json')]);
+    const allowed = new Set([
+      join(this.options.stateDir, 'accounts.json'),
+      join(this.options.profile, 'app_storage.json'),
+      join(this.options.profile, 'credential-user-scope'),
+    ]);
     if (record.version !== 1 || !['prepared', 'committed'].includes(record.phase) || record.databasePath !== dbPath ||
         !Array.isArray(record.files) || record.files.some(f => !allowed.has(f.path) &&
           !(f.path.startsWith(join(this.options.stateDir, 'accounts') + sep) && /^[a-zA-Z0-9_-]+\.json$/.test(f.path.slice(join(this.options.stateDir, 'accounts').length + 1))))) {
@@ -279,15 +303,18 @@ export class AccountSwitchService {
       if (!isBefore && !isAfter) throw new Error(bt('switch.err.db_external_modified'));
       const committed = isAfter && (!isBefore || record.phase === 'committed' || currentJournal.status === 'rolled-back');
       for (const file of record.files) {
-        await this.regular(file.path);
-        const value = await readFile(file.path, 'utf8');
-        if (value !== file.before && value !== file.after) throw new Error(bt('switch.err.account_file_external'));
+        if (await this.optionalRegular(file.path)) {
+          const value = await readFile(file.path, 'utf8');
+          if (value !== file.before && value !== file.after) throw new Error(bt('switch.err.account_file_external'));
+        } else if (file.before !== null && file.after !== null) {
+          throw new Error(bt('switch.err.account_file_external'));
+        }
       }
       const password = await this.keychain.readPassword('gemini', 'antigravity');
       if (password !== record.keychainBefore && password !== record.keychainAfter) throw new Error(bt('switch.err.keychain_external'));
       for (const file of record.files) {
         const desired = committed ? file.after : file.before;
-        if (await readFile(file.path, 'utf8') !== desired) await atomicText(file.path, desired);
+        if ((await readOptionalText(file.path)) !== desired) await writeOrUnlinkText(file.path, desired);
       }
       const desiredPassword = committed ? record.keychainAfter : record.keychainBefore;
       if (password !== desiredPassword) {
@@ -382,16 +409,16 @@ export class AccountSwitchService {
   }
   private async restoreFiles(files: SavedFile[], keychainBefore: string | null, keychainAfter: string, keychainAfterDigest?: string) {
     for (const file of files) {
-      const value = await readFile(file.path, 'utf8');
+      const value = await readOptionalText(file.path);
       const matchesBefore = value === file.before;
-      const matchesAfter = (file.afterDigest ? sha256(value) === file.afterDigest : false) || value === file.after;
+      const matchesAfter = (file.afterDigest ? digestOptional(value) === file.afterDigest : false) || value === file.after;
       if (!matchesBefore && !matchesAfter) throw new Error(bt('switch.err.files_changed_after'));
     }
     const current = await this.keychain.readPassword('gemini', 'antigravity');
     const matchesKeychainBefore = current === keychainBefore;
     const matchesKeychainAfter = (keychainAfter && keychainAfter !== '[REDACTED]' && current === keychainAfter) || (keychainAfterDigest && current !== null && sha256(current) === keychainAfterDigest);
     if (!matchesKeychainBefore && !matchesKeychainAfter) throw new Error(bt('switch.err.keychain_updated'));
-    for (const file of files) await atomicText(file.path, file.before);
+    for (const file of files) await writeOrUnlinkText(file.path, file.before);
     if (keychainBefore === null) await this.keychain.deletePassword('gemini', 'antigravity');
     else await this.keychain.writePassword('gemini', 'antigravity', keychainBefore);
   }
@@ -432,13 +459,59 @@ export class AccountSwitchService {
         const snapshot = async (path: string, value: unknown) => { await this.regular(path); files.push({ path, before: await readFile(path, 'utf8'), after: JSON.stringify(value, null, 2) + '\n' }); };
         await snapshot(join(this.options.stateDir, 'accounts', `${id}.json`), accountNext);
         await snapshot(join(this.options.stateDir, 'accounts.json'), indexNext);
+
+        // Antigravity 2.0 (wcv-hub): 同步更新 app_storage.json 与 credential-user-scope，避免切换后因用户不匹配退回登录页
+        const appStoragePath = join(this.options.profile, 'app_storage.json');
+        const scopePath = join(this.options.profile, 'credential-user-scope');
+        const currentScopeBefore = (await this.optionalRegular(scopePath)) ? await readOptionalText(scopePath) : null;
+        if (await this.optionalRegular(appStoragePath)) {
+          const appStorageBefore = await readFile(appStoragePath, 'utf8');
+          try {
+            const parsedStorage = JSON.parse(appStorageBefore);
+            if (parsedStorage && typeof parsedStorage === 'object' && !Array.isArray(parsedStorage)) {
+              const prevEmail = typeof parsedStorage['agy.onboarding.lastLoginUsername'] === 'string'
+                ? parsedStorage['agy.onboarding.lastLoginUsername'].trim().toLowerCase()
+                : '';
+              const outgoingId = index.current_account_id;
+              if (outgoingId && outgoingId !== id && currentScopeBefore && /^[a-zA-Z0-9_-]{4,64}$/.test(currentScopeBefore.trim())) {
+                const outgoingAcc = await this.manager.getAccount(outgoingId);
+                if (outgoingAcc && (!prevEmail || prevEmail === outgoingAcc.email.trim().toLowerCase()) && outgoingAcc.credential_user_scope !== currentScopeBefore.trim()) {
+                  await snapshot(join(this.options.stateDir, 'accounts', `${outgoingId}.json`), {
+                    ...outgoingAcc,
+                    credential_user_scope: currentScopeBefore.trim(),
+                  });
+                }
+              }
+              const personal = /@(gmail|outlook|hotmail|qq|163)\.com$/i.test(acc.email);
+              const nextStorage = {
+                ...parsedStorage,
+                'agy.onboarding.lastLoginUsername': acc.email,
+                'agy.onboarding.lastLoginIsGcpTos': Boolean(!personal && acc.token.is_gcp_tos),
+              };
+              files.push({
+                path: appStoragePath,
+                before: appStorageBefore,
+                after: JSON.stringify(nextStorage),
+              });
+            }
+          } catch {}
+        }
+        const targetScope = acc.credential_user_scope && /^[a-zA-Z0-9_-]{4,64}$/.test(acc.credential_user_scope.trim())
+          ? acc.credential_user_scope.trim()
+          : null;
+        if (targetScope !== null) {
+          files.push({ path: scopePath, before: currentScopeBefore, after: targetScope });
+        } else if (currentScopeBefore !== null) {
+          files.push({ path: scopePath, before: currentScopeBefore, after: null });
+        }
+
         const keychainBefore = await this.keychain.readPassword('gemini', 'antigravity');
         // Build the exact intended value with an in-memory adapter; no system write yet.
         let keychainAfter = '';
         await syncAccountToKeychain(acc, { readPassword: async () => null, deletePassword: async () => {}, writePassword: async (_s, _a, value) => { keychainAfter = value; } });
         const afterDigest = rowsDigest(after);
         const keychainAfterDigest = sha256(keychainAfter);
-        const filesWithDigest: SavedFile[] = files.map(f => ({ ...f, afterDigest: sha256(f.after) }));
+        const filesWithDigest: SavedFile[] = files.map(f => ({ ...f, afterDigest: digestOptional(f.after) }));
         journal = { version: 1, status: 'pending', before, after, afterDigest, files: filesWithDigest, keychainBefore, keychainAfter, keychainAfterDigest, at: new Date().toISOString() };
         if (previous) await this.archivePreviousJournal(previous);
         await atomicJson(this.journalPath, journal);
@@ -446,8 +519,8 @@ export class AccountSwitchService {
         if (transaction) await transaction.replace(after);
         await this.keychain.writePassword('gemini', 'antigravity', keychainAfter);
         for (const file of files) {
-          if (await readFile(file.path, 'utf8') !== file.before) throw new Error(bt('switch.err.record_changed_retry'));
-          await atomicText(file.path, file.after);
+          if ((await readOptionalText(file.path)) !== file.before) throw new Error(bt('switch.err.record_changed_retry'));
+          await writeOrUnlinkText(file.path, file.after);
         }
         await this.guardStopped();
         if (transaction) await transaction.finish(true);

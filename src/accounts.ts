@@ -1280,6 +1280,26 @@ export class AccountsManager {
     return { token: extractedToken, email: extractedEmail };
   }
 
+  private async readLocalCredentialUserScope(): Promise<string | null> {
+    try {
+      const raw = (await readFile(join(this.target.profile, 'credential-user-scope'), 'utf8')).trim();
+      return /^[a-zA-Z0-9_-]{4,64}$/.test(raw) ? raw : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async readAppStorageLoginEmail(): Promise<string | null> {
+    try {
+      const raw = await readFile(join(this.target.profile, 'app_storage.json'), 'utf8');
+      const parsed = JSON.parse(raw);
+      const email = parsed?.['agy.onboarding.lastLoginUsername'];
+      return typeof email === 'string' && /^[^\s@]+@[^\s@]+$/.test(email.trim()) ? email.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
   private lastLocalTokenSyncAt = new Map<string, number>();
 
   /**
@@ -1312,21 +1332,32 @@ export class AccountsManager {
     const isFresher =
       localExpiry > currentExpiry ||
       (currentStale && local.token.access_token !== account.token?.access_token && localExpiry > nowSec + 30);
-    if (!isFresher) return false;
+    const localScope = await this.readLocalCredentialUserScope();
+    const appStorageEmail = await this.readAppStorageLoginEmail();
+    const scopeMatchesAccount =
+      Boolean(localScope) &&
+      (!appStorageEmail || appStorageEmail.toLowerCase() === account.email.trim().toLowerCase()) &&
+      account.credential_user_scope !== localScope;
+    if (!isFresher && !scopeMatchesAccount) return false;
 
     const previousRefresh = account.token.refresh_token;
-    account.token = {
-      ...account.token,
-      access_token: local.token.access_token,
-      refresh_token: local.token.refresh_token || account.token.refresh_token,
-      expires_in: Math.max(60, localExpiry - nowSec),
-      expiry_timestamp: localExpiry,
-      id_token: local.token.id_token ?? account.token.id_token,
-      project_id: local.token.project_id ?? account.token.project_id,
-    };
-    if (account.quota_refresh_error_code === 'missing_oauth_client' || account.quota_refresh_error_code === 'refresh_failed') {
-      account.quota_refresh_error = null;
-      account.quota_refresh_error_code = null;
+    if (isFresher) {
+      account.token = {
+        ...account.token,
+        access_token: local.token.access_token,
+        refresh_token: local.token.refresh_token || account.token.refresh_token,
+        expires_in: Math.max(60, localExpiry - nowSec),
+        expiry_timestamp: localExpiry,
+        id_token: local.token.id_token ?? account.token.id_token,
+        project_id: local.token.project_id ?? account.token.project_id,
+      };
+      if (account.quota_refresh_error_code === 'missing_oauth_client' || account.quota_refresh_error_code === 'refresh_failed') {
+        account.quota_refresh_error = null;
+        account.quota_refresh_error_code = null;
+      }
+    }
+    if (scopeMatchesAccount && localScope) {
+      account.credential_user_scope = localScope;
     }
     if (options?.persist !== false) {
       await this.saveRefreshedAccount(account, previousRefresh).catch(() => {});
@@ -1381,6 +1412,14 @@ export class AccountsManager {
       isGcpTos: extractedToken.is_gcp_tos,
       idToken: extractedToken.id_token || undefined,
     });
+    if (!isSandboxHome) {
+      const localScope = await this.readLocalCredentialUserScope();
+      const appStorageEmail = await this.readAppStorageLoginEmail();
+      if (localScope && (!appStorageEmail || appStorageEmail.toLowerCase() === email.toLowerCase()) && account.credential_user_scope !== localScope) {
+        account.credential_user_scope = localScope;
+        await this.saveAccount(account);
+      }
+    }
 
     if (liveQuota) {
       if (account.quota) {

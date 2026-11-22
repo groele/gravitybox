@@ -191,4 +191,35 @@ test('Switch allows expired access_token with valid refresh_token when OAuth cli
   revoked.quota_refresh_error = bt('account_cloud.err.refresh_failed');
   await mgr.saveAccount(revoked);
   await assert.rejects(svc.switchAccount(revoked.id), new RegExp(bt('switch.err.refresh_credentials_first')));
+
+  // 3) Antigravity 2.0 (wcv-hub): switchAccount updates app_storage.json and credential-user-scope
+  const { readFile } = await import('node:fs/promises');
+  await writeFile(join(profileDir, 'app_storage.json'), JSON.stringify({
+    'agy.onboarding.lastLoginUsername': acc.email,
+    'agy.onboarding.lastLoginIsGcpTos': false,
+    zoomLevel: 1,
+  }), 'utf8');
+  await writeFile(join(profileDir, 'credential-user-scope'), 'u1111111111111111', 'utf8');
+
+  const second = await mgr.upsertAccount({
+    email: 'second@example.invalid',
+    name: 'Second',
+    accessToken: 'valid-access-2',
+    refreshToken: '1//valid-refresh-2',
+    expiresIn: 3600,
+  });
+  await svc.switchAccount(second.id);
+
+  const storageAfterFirstSwitch = JSON.parse(await readFile(join(profileDir, 'app_storage.json'), 'utf8'));
+  assert.equal(storageAfterFirstSwitch['agy.onboarding.lastLoginUsername'], 'second@example.invalid');
+  assert.equal(storageAfterFirstSwitch.zoomLevel, 1);
+  // Stale scope from previous account must be removed when target has no saved scope yet
+  await assert.rejects(readFile(join(profileDir, 'credential-user-scope'), 'utf8'));
+  // Outgoing account's scope must have been preserved before switching away
+  const firstReloaded = await mgr.getAccount(acc.id);
+  assert.equal(firstReloaded?.credential_user_scope, 'u1111111111111111');
+
+  // Switching back restores the first account's saved credential-user-scope
+  await svc.switchAccount(acc.id);
+  assert.equal(await readFile(join(profileDir, 'credential-user-scope'), 'utf8'), 'u1111111111111111');
 });

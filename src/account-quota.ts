@@ -378,6 +378,7 @@ export interface Account {
   created_at: number;
   last_used: number;
   custom_label?: string | null;
+  credential_user_scope?: string | null;
 }
 
 export type AccountErrorCode =
