@@ -1424,7 +1424,7 @@ async function run() {
           }
           if (command === 'account_switch') {
             const targetId = String(parsed.id || '');
-            if (parsed.autoRefreshToken === true && targetId) {
+            if (parsed.autoRefreshToken === true && targetId && hasLocalOAuthClientConfigured()) {
               const existing = await accountsManager.getAccount(targetId);
               if (existing && !existing.disabled && !existing.validation_blocked && existing.token?.refresh_token) {
                 const nowSec = Date.now() / 1000;

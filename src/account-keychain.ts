@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { promisify } from 'node:util';
 import { bt } from './i18n.js';
 import { IS_WINDOWS, winCredDelete, winCredRead, winCredWrite } from './platform.js';
@@ -156,12 +157,13 @@ export function buildGoOauthPayload(acc: KeychainSyncAccount): string {
       expires_in: expiresIn,
       expiry_timestamp: Number.isFinite(expirySec) && expirySec > 0 ? expirySec : 0,
       email: acc.email,
-      project_id: acc.token.project_id,
-      is_gcp_tos: acc.token.is_gcp_tos,
-      id_token: acc.token.id_token,
+      ...(acc.token.project_id ? { project_id: acc.token.project_id } : {}),
+      ...(acc.token.is_gcp_tos !== undefined ? { is_gcp_tos: acc.token.is_gcp_tos } : {}),
+      ...(acc.token.id_token ? { id_token: acc.token.id_token } : {}),
     },
     ...(acc.token.is_gcp_tos ? {} : { auth_method: 'consumer' }),
     id_token_email: acc.email,
+    writer_id: randomBytes(32).toString('base64url'),
   });
 }
 
